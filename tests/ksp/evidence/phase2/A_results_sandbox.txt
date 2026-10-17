@@ -1,0 +1,31 @@
+18:00:41 INFO  [start] script=sandbox far=True
+18:01:28 PASS  [load] module True stats True caps unlimited True
+18:01:29 PASS  [apply.KeroloxGG] Kerolox/GasGenerator: maxThrust 900.0/900.0 Isp0 314.2/314.2 Isp1 283.6/283.6 props LiquidFuel:0.9+Oxidizer:1.1 (True) mass 0.482/0.482 t thrustTransform at exit True warnings []
+18:01:31 PASS  [dv.KeroloxGG] stock dV app: thrust 900.0 kN Isp 314.2/283.6 s dV 3770 m/s
+18:01:31 INFO  [mesh.KeroloxGG] meshes peChamber:2255, peKit:391, peBell:5830; colliders 3 convex True; build 3.8 ms; Ø1.01 L1.64 m
+18:01:33 PASS  [apply.KeroloxSC] Kerolox/StagedCombustion: maxThrust 2000.0/2000.0 Isp0 336.5/336.5 Isp1 309.6/309.6 props LiquidFuel:0.9+Oxidizer:1.1 (True) mass 1.368/1.368 t thrustTransform at exit True warnings []
+18:01:35 PASS  [dv.KeroloxSC] stock dV app: thrust 2000.0 kN Isp 336.5/309.6 s dV 2545 m/s
+18:01:35 INFO  [mesh.KeroloxSC] meshes peChamber:2665, peKit:391, peBell:6890; colliders 3 convex True; build 3.8 ms; Ø1.42 L2.26 m
+18:01:37 PASS  [apply.KeroloxPF] Kerolox/PressureFed: maxThrust 30.0/30.0 Isp0 331.6/331.6 Isp1 175.1/175.1 props LiquidFuel:0.9+Oxidizer:1.1 (True) mass 0.222/0.222 t thrustTransform at exit True warnings [flow separates in the nozzle at sea level]
+18:01:39 PASS  [dv.KeroloxPF] stock dV app: thrust 30.0 kN Isp 331.6/175.1 s dV 4878 m/s
+18:01:39 INFO  [mesh.KeroloxPF] meshes peChamber:1804, peKit:374, peBell:4664; colliders 3 convex True; build 3.8 ms; Ø0.82 L1.43 m
+18:01:41 PASS  [apply.MethaloxFFSC] Methalox/FullFlowStaged: maxThrust 2300.0/2300.0 Isp0 354.9/354.9 Isp1 333.7/333.7 props LqdMethane:3+Oxidizer:1 (True) mass 1.587/1.587 t thrustTransform at exit True warnings []
+18:01:43 PASS  [dv.MethaloxFFSC] stock dV app: thrust 2300.0 kN Isp 354.9/333.7 s dV 2466 m/s
+18:01:43 INFO  [mesh.MethaloxFFSC] meshes peChamber:2665, peKit:578, peBell:6890; colliders 3 convex True; build 3.8 ms; Ø1.31 L2.07 m
+18:01:46 PASS  [apply.HydroloxSC] Hydrolox/StagedCombustion: maxThrust 2200.0/2200.0 Isp0 452.8/452.8 Isp1 372.3/372.3 props LqdHydrogen:15+Oxidizer:1 (True) mass 2.361/2.361 t thrustTransform at exit True warnings []
+18:01:48 PASS  [dv.HydroloxSC] stock dV app: thrust 2200.0 kN Isp 452.8/372.3 s dV 2452 m/s
+18:01:48 INFO  [mesh.HydroloxSC] meshes peChamber:2665, peKit:391, peBell:6890; colliders 3 convex True; build 3.8 ms; Ø2.22 L3.32 m
+18:01:50 PASS  [apply.HydroloxExp] Hydrolox/Expander: maxThrust 110.0/110.0 Isp0 466.0/466.0 Isp1 294.2/294.2 props LqdHydrogen:15+Oxidizer:1 (True) mass 0.172/0.172 t thrustTransform at exit True warnings [flow separates in the nozzle at sea level]
+18:01:52 PASS  [dv.HydroloxExp] stock dV app: thrust 110.0 kN Isp 466.0/294.2 s dV 7187 m/s
+18:01:52 INFO  [mesh.HydroloxExp] meshes peChamber:2665, peKit:102, peBell:6955; colliders 3 convex True; build 3.8 ms; Ø2.00 L3.12 m
+18:01:54 PASS  [throttle] 0.26s burst: 4 mesh rebuilds, 1 slow rebuilds
+18:01:55 PASS  [designer.open] designer window open
+18:01:55 PASS  [library.save] Saved: ProcEngine - Test Kestrel; parts 1; design back 890/59
+18:01:55 PASS  [library.load] stock LoadSubassembly: parts 1
+18:02:02 PASS  [nodes] gap 0.00000 -> 0.00000, decoupler pushed 2.052 m, back to start drift 0.000000 m
+18:02:16 PASS  [flight.stats] flight STATS identical to editor: Isp 311.448272430618/311.448272430618
+18:02:16 PASS  [apply.flight] Kerolox/GasGenerator: maxThrust 300.0/300.0 Isp0 311.4/311.4 Isp1 282.6/282.6 props LiquidFuel:0.9+Oxidizer:1.1 (True) mass 0.176/0.176 t thrustTransform at exit True warnings []
+18:02:16 INFO  [mesh.flight] meshes peChamber:1271, peKit:391, peBell:3286; colliders 3 convex True; build 2.5 ms; Ø0.57 L1.06 m
+18:02:16 INFO  [waterfall] waterfall-kerolox-lower-1 x0.57 (11 effects)
+18:02:18 PASS  [flight.burn] finalThrust 273.3 kN (SL 272.2); waterfall waterfall-kerolox-lower-1 x0.57 (11 effects)
+18:02:19 INFO  [end] 21 passed, 0 failed

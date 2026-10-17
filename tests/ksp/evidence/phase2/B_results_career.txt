@@ -1,0 +1,5 @@
+18:07:43 INFO  [start] script=career far=False
+18:08:27 PASS  [career.start] caps: cycles PressureFed propellants Kerolox Pc<=25 eps<=30 F<=250 level Early; violations [cycle GasGenerator not researched; Pc 60 bar > 25; bell nozzles not researched (conical only)]
+18:08:29 PASS  [career.designerNoSilentEdit] opening the designer left the out-of-caps design alone: Pc 60/60, cycle GasGenerator
+18:08:29 PASS  [career.researched] after research: cycles PressureFed,GasGenerator,Expander propellants Kerolox,Hydrolox Pc<=90 eps<=100 F<=2500 level Mid bell True
+18:08:29 INFO  [end] 3 passed, 0 failed

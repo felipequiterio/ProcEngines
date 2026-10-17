@@ -4,3 +4,6 @@ ksp_test_B/GameData: + Waterfall (copied from ksp_mp), + ProcEngineSpike
 ksp_test_A/B settings.cfg: FULLSCREEN = False during the runs; restored afterwards
 saves created: ksp_test_A/saves/pespike, ksp_test_B/saves/pespike, ksp_test_B/saves/pespike_career
 LMPServer/Universe: backed up to _backup_2026-10-17_procengines before the LMP test and restored from it afterwards; the post-test universe is kept in _universe_after_procengines_test_2026-10-17
+Phase 2 (2026-10-17): + GameData/ProcEngines and GameData/ProcEnginesTests (test driver, inactive without PluginData/autotest.txt) in both copies;
+saves procengines_sandbox (A) and procengines_career (B); LMPServer/Universe backed up to _backup_2026-10-17_procengines_phase2 and restored
+after the LMP test (post-test universe in _universe_after_procengines_phase2). tests/ksp/run.sh switches FULLSCREEN off only during a run.

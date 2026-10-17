@@ -75,6 +75,9 @@ namespace ProcEngines.Model
             foreach (CurveKey k in s.AtmosphereCurve)
                 c.Add("key", F(k.Pressure) + " " + F(k.Isp) + " " + F(k.Tangent) + " " + F(k.Tangent));
             n.Nodes.Add(c);
+            var m = new CfgNode("MASS");
+            foreach (var kv in s.MassBreakdown) m.Add(kv.Key, F(kv.Value));
+            n.Nodes.Add(m);
             return n;
         }
 
@@ -99,6 +102,8 @@ namespace ProcEngines.Model
                 if (p.Length > 2) k.Tangent = CfgNode.ParseDouble(p[2]);
                 s.AtmosphereCurve.Add(k);
             }
+            CfgNode mass = n.Node("MASS");
+            if (mass != null) foreach (var kv in mass.Values) s.MassBreakdown[kv.Key] = CfgNode.ParseDouble(kv.Value);
             return s.AtmosphereCurve.Count >= 2 ? s : null;
         }
 

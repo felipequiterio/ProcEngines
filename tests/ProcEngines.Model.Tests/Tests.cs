@@ -272,7 +272,8 @@ namespace ProcEngines.Model.Tests
                 Thread.CurrentThread.CurrentCulture = old;
                 Assert(d2.ThrustVac == d.ThrustVac && d2.Pc == d.Pc && d2.Of == d.Of && d2.RadiativeExtension && d2.Cycle == d.Cycle && d2.Tech == "Late", "design round trip");
                 Assert(s2 != null && s2.IspVac == s.IspVac && s2.Mass == s.Mass && s2.ExitRadius == s.ExitRadius && s2.AtmosphereCurve.Count == s.AtmosphereCurve.Count
-                       && s2.AtmosphereCurve.Zip(s.AtmosphereCurve, (x, y) => x.Isp == y.Isp && x.Tangent == y.Tangent).All(b => b), "stats round trip bit-exact");
+                       && s2.AtmosphereCurve.Zip(s.AtmosphereCurve, (x, y) => x.Isp == y.Isp && x.Tangent == y.Tangent).All(b => b)
+                       && s2.MassBreakdown.Count == s.MassBreakdown.Count && s2.MassBreakdown["turbomachinery"] == s.MassBreakdown["turbomachinery"], "stats round trip bit-exact");
                 Assert(double.IsNaN(Serialization.LoadDesign(Serialization.SaveDesign(new EngineDesign())).Of), "default mixture ratio survives as NaN");
                 var partial = Serialization.SaveStats(s); partial.Values.RemoveAt(3);
                 Assert(Serialization.LoadStats(partial) == null, "incomplete STATS -> null (recompute)");
