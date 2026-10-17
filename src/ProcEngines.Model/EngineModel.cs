@@ -185,7 +185,7 @@ namespace ProcEngines.Model
             mb["nozzle"] = sf * sizeFactor * (bal.NozzleRegen * aRegen + bal.NozzleRadiative * aRad);
             double propTurbo = bal.TurbomachineryByPropellant.TryGetValue(prop.Name, out double pt) ? pt : prop.TurbomachineryFactor;
             mb["turbomachinery"] = cyc.HasPumps ? sf * cyc.TurbomachineryFactor * propTurbo * bal.Turbomachinery * Math.Pow(Math.Max(s.PumpPower, 1), bal.TurbomachineryExponent) : 0;
-            mb["pressurant"] = cyc.PressurantFactor * bal.Pressurant * mdot * bal.PressurantBurnTime * pc;
+            mb["pressurant"] = cyc.PressurantFactor * sf * PressurantMass(prop, of, pc, mdot, bal);
             mb["gimbal"] = bal.GimbalMass * s.ThrustVac * d.GimbalRange;
             double sum = 0;
             foreach (double v in mb.Values) sum += v;
@@ -199,6 +199,17 @@ namespace ProcEngines.Model
             s.ThrottleMin = cyc.ThrottleMin;
             s.Ignitions = cyc.Ignitions;
             return s;
+        }
+
+        /// <summary>Helium + composite bottles (kg) to expel one rated burn's propellant volume at tank pressure.</summary>
+        public static double PressurantMass(Propellant prop, double of, double pcBar, double mdot, Balance bal)
+        {
+            double volume = mdot * bal.PressurantBurnTime / prop.BulkDensity(of);                    // m^3 of propellant
+            double pTank = (bal.PressurantTankFactor * pcBar + bal.PressurantTankMargin) * 1e5;      // Pa
+            double pv = bal.PressurantExpansion * pTank * volume;                                     // J of stored p*V
+            double bottles = pv / bal.PressurantBottlePerformance;
+            double helium = pv / (2077.1 * bal.PressurantGasTemp);
+            return bottles + helium;
         }
 
         /// <summary>Main-chamber thrust (N) at ambient pressure pa (bar). If the wall pressure drops below the separation

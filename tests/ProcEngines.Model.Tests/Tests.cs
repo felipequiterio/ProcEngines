@@ -217,6 +217,22 @@ namespace ProcEngines.Model.Tests
             Assert(pf > 0 && EngineModel.Compute(D(cycle: "PressureFed", pc: 15, f: 50), data).MassBreakdown["pressurant"] > 0, "pressure-fed carries pressurant mass");
         }
 
+        public static void PressureFedIsHeavierButViable(ModelData data)
+        {
+            // Real pressure-fed engines without their stage's pressurization: AJ10-190 TWR ~23, AJ10-118K ~40, Kestrel ~60.
+            // Ours carries its own helium for a 150 s burn, so expect roughly half of that, never single digits.
+            foreach (var (f, pc) in new[] { (30.0, 10.0), (78.0, 21.0), (250.0, 25.0) })
+            {
+                EngineStats s = EngineModel.Compute(D("Kerolox", "PressureFed", f, pc, 40), data);
+                double press = s.MassBreakdown["pressurant"];
+                Assert(s.TwrVac > 12 && s.TwrVac < 60, $"pressure-fed {f} kN at {pc} bar: TWR {s.TwrVac:F1} (mass {s.Mass * 1000:F0} kg, pressurant {press:F0} kg)");
+                Assert(press > 0.1 * s.Mass * 1000 && press < 0.7 * s.Mass * 1000, $"pressurant is a real but not dominant share: {press:F0} of {s.Mass * 1000:F0} kg");
+            }
+            // hydrogen's low density needs far more helium per kg of propellant
+            double hk = EngineModel.PressurantMass(data.Propellants["Hydrolox"], 5.5, 20, 10, data.Balance), kk = EngineModel.PressurantMass(data.Propellants["Kerolox"], 2.4, 20, 10, data.Balance);
+            Assert(hk > 2.5 * kk, $"hydrolox pressurant {hk:F0} kg >> kerolox {kk:F0} kg for the same flow");
+        }
+
         // ------------------------------------------------------------------ robustness
 
         public static void RandomDesignsAreFiniteAndDeterministic(ModelData data)

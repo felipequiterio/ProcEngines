@@ -1,5 +1,8 @@
-18:07:43 INFO  [start] script=career far=False
-18:08:27 PASS  [career.start] caps: cycles PressureFed propellants Kerolox Pc<=25 eps<=30 F<=250 level Early; violations [cycle GasGenerator not researched; Pc 60 bar > 25; bell nozzles not researched (conical only)]
-18:08:29 PASS  [career.designerNoSilentEdit] opening the designer left the out-of-caps design alone: Pc 60/60, cycle GasGenerator
-18:08:29 PASS  [career.researched] after research: cycles PressureFed,GasGenerator,Expander propellants Kerolox,Hydrolox Pc<=90 eps<=100 F<=2500 level Mid bell True
-18:08:29 INFO  [end] 3 passed, 0 failed
+18:14:08 INFO  [start] script=career far=False
+18:14:57 PASS  [career.start] caps: cycles PressureFed propellants Kerolox Pc<=25 eps<=30 F<=250 level Early; violations [cycle GasGenerator not researched; Pc 60 bar > 25; bell nozzles not researched (conical only)]
+18:14:59 PASS  [career.designerNoSilentEdit] opening the designer left the out-of-caps design alone: Pc 60/60, cycle GasGenerator
+18:15:02 PASS  [career.launchBlocked] pre-flight dialog 'Engine design exceeds researched technology' shown, still in EDITOR; message: These procedural engines use technology you haven't researched yet. Change them in the Engine designer, or research the nodes first. |  | New engine: cycle GasGenerator not researched; Pc 60 bar > 25; bell nozzles not researched (conical only)
+18:15:14 PASS  [career.flightLocked] locked True [cycle GasGenerator not researched; Pc 60 bar > 25; bell nozzles not researched (conical only)], ignited False, thrust 0.0
+18:15:25 PASS  [career.nowLaunchable] default design after research: pre-flight test passes True, module violations []
+18:15:25 PASS  [career.researched] after research: cycles PressureFed,GasGenerator,Expander propellants Kerolox,Hydrolox Pc<=90 eps<=100 F<=2500 level Mid bell True
+18:15:25 INFO  [end] 6 passed, 0 failed

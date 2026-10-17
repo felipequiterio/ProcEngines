@@ -40,6 +40,14 @@ namespace ProcEngines.Model.Tests
                     sw.Restart(); ModelData.LoadFolder(DataDir()); Console.WriteLine($"load data: {sw.Elapsed.TotalMilliseconds:F0} ms");
                     return 0;
                 }
+                case "pressurefed":
+                    foreach (var (f, pc) in new[] { (30.0, 10.0), (78.0, 21.0), (250.0, 25.0) })
+                        foreach (string prop in new[] { "Kerolox", "Hydrolox" })
+                        {
+                            EngineStats s = EngineModel.Compute(new EngineDesign { Propellant = prop, Cycle = "PressureFed", ThrustVac = f, Pc = pc, Eps = 40 }, data);
+                            Console.WriteLine($"{prop} {f} kN Pc {pc}: mass {s.Mass * 1000:F0} kg (pressurant {s.MassBreakdown["pressurant"]:F0}), TWR {s.TwrVac:F1}, Isp {s.IspVac:F0}");
+                        }
+                    return 0;
                 case "expander":
                     foreach (string prop in new[] { "Hydrolox", "Methalox" })
                         foreach (double f in new[] { 50.0, 100, 180, 300, 500, 1000 })

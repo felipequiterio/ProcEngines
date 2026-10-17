@@ -449,13 +449,49 @@ namespace ProcEngines.KspTests
             yield return new WaitForSecondsRealtime(1.5f);
             yield return Shot("designer_start");
             Check("career.designerNoSilentEdit", m.Design.Pc == pcBefore && m.Design.Cycle == cycleBefore, $"opening the designer left the out-of-caps design alone: Pc {m.Design.Pc}/{pcBefore}, cycle {m.Design.Cycle}");
+            DesignerWindow.Open(null);
+
+            // editor launch with a design over the caps: our blocking pre-flight test must stop it
+            EditorLogic.fetch.launchVessel();
+            yield return new WaitForSecondsRealtime(2f);
+            PopupDialog block = FindObjectsOfType<PopupDialog>().FirstOrDefault(d => d.dialogToDisplay?.title == "Engine design exceeds researched technology");
+            yield return Shot("launch_blocked");
+            Check("career.launchBlocked", block != null && HighLogic.LoadedScene == GameScenes.EDITOR,
+                $"pre-flight dialog '{block?.dialogToDisplay?.title}' shown, still in {HighLogic.LoadedScene}; message: {block?.dialogToDisplay?.message?.Replace("\n", " | ")}");
+            if (block != null) block.Dismiss();
+            yield return new WaitForSecondsRealtime(1f);
+
+            // a path that skips the editor checks (FlightDriver = KSC launch / LMP / KCT): the engine must be locked in flight
+            string lockPath = Path.Combine(KSPUtil.ApplicationRootPath, "saves", HighLogic.SaveFolder, "Ships", "VAB", "PE_Locked.craft");
+            EditorLogic.fetch.ship.SaveShip().Save(lockPath);
+            FlightDriver.StartWithNewLaunch(lockPath, "Squad/Flags/default", "LaunchPad", new VesselCrewManifest());
+            yield return WaitScene(GameScenes.FLIGHT);
+            float tl = Time.realtimeSinceStartup;
+            while ((FlightGlobals.ActiveVessel == null || FlightGlobals.ActiveVessel.packed) && Time.realtimeSinceStartup - tl < 60) yield return null;
+            yield return new WaitForSecondsRealtime(4f);
+            ModuleProcEngine fm = Engine(FlightGlobals.ActiveVessel.parts);
+            var fe = fm.part.FindModuleImplementing<ModuleEnginesFX>();
+            FlightInputHandler.state.mainThrottle = 1f;
+            fe.Activate();
+            yield return new WaitForSecondsRealtime(1.5f);
+            yield return Shot("flight_locked");
+            Check("career.flightLocked", fm.TechLocked && !fe.EngineIgnited && fe.finalThrust == 0,
+                $"locked {fm.TechLocked} [{string.Join("; ", fm.FlightViolations)}], ignited {fe.EngineIgnited}, thrust {fe.finalThrust:F1}");
+            FlightInputHandler.state.mainThrottle = 0f;
+            yield return EnterEditor();
+            yield return LoadCraft(WriteCraft("PE_Career2", Stack(false)));
+            m = Engine(EditorLogic.fetch.ship.parts);
+            yield return new WaitForSecondsRealtime(1.5f);
+
             // research a few nodes, re-evaluate
             foreach (string node in new[] { "basicRocketry", "generalRocketry", "advRocketry", "propulsionSystems" })
                 ResearchAndDevelopment.Instance.UnlockProtoTechNode(new ProtoTechNode { techID = node, state = RDTech.State.Available, scienceCost = 0, partsPurchased = new List<AvailablePart>() });
             TechCaps c2 = KspData.CurrentCaps();
+            yield return new WaitForSecondsRealtime(3f);   // module re-checks caps every 2 s
+            var passTest = new ProcEngineTechTest(EditorLogic.fetch.ship);
+            Check("career.nowLaunchable", passTest.Test() && m.Violations.Count == 0, $"default design after research: pre-flight test passes {passTest.Test()}, module violations [{string.Join("; ", m.Violations)}]");
             Check("career.researched", c2.Cycles.SetEquals(new[] { "PressureFed", "GasGenerator", "Expander" }) && c2.Propellants.Contains("Hydrolox") && c2.RaoBell && c2.TechLevel == "Mid" && c2.MaxPc == 90,
                 $"after research: cycles {string.Join(",", c2.Cycles)} propellants {string.Join(",", c2.Propellants)} Pc<={c2.MaxPc} eps<={c2.MaxEps} F<={c2.MaxThrust} level {c2.TechLevel} bell {c2.RaoBell}");
-            DesignerWindow.Open(null);
         }
     }
 }

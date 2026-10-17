@@ -78,8 +78,14 @@ namespace ProcEngines.Model
         public double NozzleSizeExponent = 0.3;      // areal density grows as (exit radius / 1 m)^exponent (thicker walls, stiffeners)
         public double Turbomachinery = 0.9;          // kg per kW^exponent
         public double TurbomachineryExponent = 0.65;
-        public double Pressurant = 0.004;            // kg per (kg/s * s * bar), pressure-fed helium + bottles
-        public double PressurantBurnTime = 300;      // s, rated burn used to size the pressurant
+        // Pressure-fed pressurization carried on the engine (KSP tanks can't change mass): helium in composite
+        // bottles, sized to expel the propellant of one rated burn at tank pressure = factor * Pc + margin.
+        public double PressurantBurnTime = 150;      // s, rated burn the helium is sized for
+        public double PressurantTankFactor = 1.5;    // tank pressure / Pc (injector + cooling drop)
+        public double PressurantTankMargin = 2;      // bar on top
+        public double PressurantExpansion = 1.3;     // helium volume factor (bottle blow-down, ullage cooling)
+        public double PressurantBottlePerformance = 1.2e5;   // J/kg: p*V per kg of composite bottle (COPV)
+        public double PressurantGasTemp = 250;       // K, stored helium
         public double GimbalMass = 0.004;            // kg per (kN * deg)
         public double MiscFraction = 0.08;           // valves, lines, structure
         public double MiscConstant = 5;              // kg

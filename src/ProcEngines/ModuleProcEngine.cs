@@ -37,6 +37,9 @@ namespace ProcEngines
         public List<string> Violations { get; private set; } = new List<string>();
         public bool StatsStale { get; private set; }
         public string WaterfallStatus = "";
+        /// <summary>Flight: the design exceeds the researched tech (launched past the editor's pre-flight check); the engine won't run.</summary>
+        public bool TechLocked { get; private set; }
+        public List<string> FlightViolations { get; private set; } = new List<string>();
         public int MeshRebuilds, SlowRebuilds;
         public double LastBuildMs;
         public event Action DesignApplied;
@@ -141,6 +144,12 @@ namespace ProcEngines
 
         void Update()
         {
+            if (HighLogic.LoadedSceneIsFlight && TechLocked)
+            {
+                var e = part.Modules.OfType<ModuleEnginesFX>().FirstOrDefault();
+                if (e != null && (e.EngineIgnited || e.getIgnitionState)) e.Shutdown();
+                return;
+            }
             if (!HighLogic.LoadedSceneIsEditor || Design == null) return;
             float now = Time.realtimeSinceStartup;
             if (nodesPending) { nodesPending = false; SetNodes(true); }
@@ -224,6 +233,23 @@ namespace ProcEngines
         {
             while (vessel == null || vessel.packed || !FlightGlobals.ready) yield return null;
             yield return null;
+            // Designs over the researched tech can reach flight through paths that skip the editor's pre-flight check
+            // (KSC launch dialog, LMP, KCT): lock the engine. Tech only grows, so a legally launched design stays legal.
+            TechCaps caps = null;
+            for (float t0 = Time.realtimeSinceStartup; (caps = KspData.CurrentCaps()) == null && Time.realtimeSinceStartup - t0 < 10f;) yield return null;
+            if (caps != null && !caps.Unlimited)
+            {
+                FlightViolations = caps.Violations(Design);
+                if (FlightViolations.Count > 0)
+                {
+                    TechLocked = true;
+                    var e = part.Modules.OfType<ModuleEnginesFX>().FirstOrDefault();
+                    if (e != null) { e.Shutdown(); e.Events["Activate"].guiActive = false; }
+                    summary = "<color=#ff6060>LOCKED: design exceeds researched tech</color>";
+                    ScreenMessages.PostScreenMessage($"{designName}: engine locked, the design exceeds researched technology ({string.Join("; ", FlightViolations)})", 8f, ScreenMessageStyle.UPPER_CENTER);
+                    Debug.Log($"[ProcEngines] {designName} locked in flight: {string.Join("; ", FlightViolations)}");
+                }
+            }
             Integrations.NotifyAero(part);
             Plume plume = Data.PlumeFor(Design.Propellant, Plume.RoleFor(Stats));
             if (plume != null)

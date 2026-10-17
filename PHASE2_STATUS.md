@@ -4,7 +4,7 @@ Date: 2026-10-17. Phase 2 of [DESIGN.md](DESIGN.md) §14 ("MVP in game"). Reposi
 
 **Status: the MVP loop works in KSP 1.12.5, and every automated check passes.** Design a kerolox, methalox or hydrolox engine (pressure-fed, gas generator, expander, staged combustion or full-flow) in the editor, see its curve, save it to the library, fly it, and have the other LunaMultiplayer player get the identical engine.
 
-What's not finished is listed at the end. The biggest gap: tech violations show in red but don't yet block launch.
+What's not finished is listed at the end. The two gaps found at first (launching over-cap designs, too-heavy pressure-fed engines) are fixed; see "Follow-ups done".
 
 ## What was built
 
@@ -34,26 +34,38 @@ What's not finished is listed at the end. The biggest gap: tech violations show 
   - Nozzle-to-decoupler gap stays 0 while the nozzle grows 2 m, with zero drift after going back.
   - Flight STATS are bit-identical to the editor's.
   - In flight: engine fields correct, Waterfall `waterfall-kerolox-lower-1` scaled to the exit diameter (11 effects), and the live burn gives 273 kN against 272 kN predicted at sea level.
-- **Career, ksp_test_B: 3/3 pass.**
+- **Career, ksp_test_B: 6/6 pass.**
   - Start node only: pressure-fed kerolox, Pc ≤ 25 bar, ε ≤ 30, F ≤ 250 kN, Early tech. The default design shows its three violations.
   - Opening the designer doesn't silently rewrite an out-of-caps design. This was a bug, caught by a screenshot and fixed.
-  - After researching basicRocketry, generalRocketry, advRocketry and propulsionSystems, the caps update to GG + expander, hydrolox, bell nozzles, Pc ≤ 90 and Mid tech.
+  - Launching that design from the VAB shows the blocking pre-flight dialog and stays in the editor.
+  - Launching it by a path that skips the editor checks (`FlightDriver.StartWithNewLaunch`, like the KSC launch dialog or LMP) locks the engine: it won't ignite and produces 0 kN.
+  - After researching basicRocketry, generalRocketry, advRocketry and propulsionSystems, the caps update to GG + expander, hydrolox, bell nozzles, Pc ≤ 90 and Mid tech. The same default design then passes the pre-flight test.
 - **LunaMultiplayer, two clients on the local server: pass.**
   - TesterA designed and launched a pressure-fed kerolox engine.
   - TesterB's ProtoVessel carries identical DESIGN/STATS.
   - TesterB's loaded engine is identical: thrust, Isp, fuel flow, exit diameter, node position, bell and kit vertex counts and bounds, mass and propellants.
   - The server universe was backed up and restored.
 
-Screenshots: `shots/A_sandbox_designer.png` (designer window), `A_sandbox_editor_*.png` (one per combination), `A_sandbox_stack.png`, `A_sandbox_flight_burn.png`, `B_career_designer_start.png`, `B_lmpB_lmpB_flight.png`.
+Screenshots: `shots/A_sandbox_designer.png` (designer window), `A_sandbox_editor_*.png` (one per combination), `A_sandbox_stack.png`, `A_sandbox_flight_burn.png`, `B_career_designer_start.png`, `B_career_launch_blocked.png`, `B_career_flight_locked.png`, `B_lmpB_lmpB_flight.png`.
+
+## Follow-ups done
+
+1. **Over-cap designs can't be launched.**
+   - `src/ProcEngines/LaunchGuard.cs` adds a blocking stock pre-flight test, `ProcEngineTechTest`. A Harmony postfix on `EditorLogic.GetStockPreFlightCheck` puts it first, so it shows before the stock warnings. It has no "launch anyway" option, and the dialog lists each engine with its violations.
+   - The KSC launch dialog, LMP and KCT never run the stock checks, so `ModuleProcEngine` also checks in flight. An over-cap design (career or science) is locked: the engine shuts down, can't be activated, and a screen message says why. Tech only grows, so an engine that was legal at launch stays legal.
+   - Harmony (`000_Harmony`, already in the pack) is now a dependency.
+2. **Pressure-fed rebalanced.**
+   - The on-engine pressurant is now sized physically: composite helium bottles that expel one rated burn (150 s) of propellant at tank pressure 1.5·Pc + 2 bar, using a COPV p·V/m of 120 kJ/kg, plus the helium itself.
+   - A 78 kN, 21 bar kerolox engine drops from 849 kg (TWR 9) to **354 kg (TWR 22.5)**. 30 kN: TWR 18.6; 250 kN: TWR 21.3.
+   - Hydrolox needs about 2.5× the helium for the same flow, because of its low density (TWR 13–15). That is realistic.
+   - New unit test: pressure-fed TWR between 12 and 60, and pressurant between 10 % and 70 % of engine mass. 25/25 unit tests pass.
 
 ## Not done yet (Phase 2 follow-ups)
 
-1. **Tech violations don't block launch.** They show in red in the part menu and the designer, but a violating design can still be launched. Options: a stock pre-flight check, or locking the engine in flight when the design is over the caps.
-2. **Balance: pressure-fed engines are very heavy.** The on-engine pressurant term sizes helium for a 300 s burn: a 78 kN, 21 bar engine weighs 0.85 t, and its helium spheres are 2.6 m across. Decide on burn time, or on putting pressurant in the tanks (DESIGN §5.5, PHASE1_RESULTS change 5).
-3. **Visuals.** Kit pieces are plain primitives and can hide under a tank from some angles. No GG exhaust plume, no heat glow, no TexturesUnlimited path (Phase 3). The plume `referenceDiameter` values are first guesses.
-4. **Untested in game.** Symmetry counterparts (the code path exists), stock undo after a design change, surface-attached children on the chamber (not handled), KER and MechJeb with the real module (checked with the spike), and the parts-list icon.
-5. **Not installed in ksp_mp.** The real pack needs its ~9-minute ModuleManager patch. GPTT node IDs are mapped in `Tech.cfg` but untested in a GPTT career.
-6. **Designer.** IMGUI MVP. The UGUI window and in-scene drag handles are Phase 3 (§7.2).
+1. **Visuals.** Kit pieces are plain primitives and can hide under a tank from some angles. No GG exhaust plume, no heat glow, no TexturesUnlimited path (Phase 3). The plume `referenceDiameter` values are first guesses.
+2. **Untested in game.** Symmetry counterparts (the code path exists), stock undo after a design change, surface-attached children on the chamber (not handled), KER and MechJeb with the real module (checked with the spike), and the parts-list icon.
+3. **Not installed in ksp_mp.** The real pack needs its ~9-minute ModuleManager patch. GPTT node IDs are mapped in `Tech.cfg` but untested in a GPTT career.
+4. **Designer.** IMGUI MVP. The UGUI window and in-scene drag handles are Phase 3 (§7.2).
 
 ## Test-copy and server changes
 
