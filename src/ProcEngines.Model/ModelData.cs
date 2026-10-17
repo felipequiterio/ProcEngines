@@ -111,6 +111,41 @@ namespace ProcEngines.Model
         }
     }
 
+    /// <summary>KSP resources an engine burns for a propellant (PROCENG_RESOURCES), in tank units ratio.</summary>
+    public sealed class ResourceSet
+    {
+        public string Propellant;
+        public readonly List<KeyValuePair<string, double>> Resources = new List<KeyValuePair<string, double>>();
+        public string GaugeResource;
+
+        public static ResourceSet Load(CfgNode n)
+        {
+            var r = new ResourceSet { Propellant = n.Get("propellant") };
+            foreach (CfgNode p in n.NodesNamed("PROPELLANT"))
+            {
+                r.Resources.Add(new KeyValuePair<string, double>(p.Get("name"), p.Double("ratio", 1)));
+                if (p.Get("DrawGauge") == "True") r.GaugeResource = p.Get("name");
+            }
+            return r;
+        }
+    }
+
+    /// <summary>A Waterfall template choice (PROCENG_PLUME, DESIGN.md 9).</summary>
+    public sealed class Plume
+    {
+        public string Propellant, Role, Template;        // role: lower (sea level) / upper (vacuum)
+        public double ReferenceDiameter = 1, LengthScale = 1;
+
+        public static Plume Load(CfgNode n) => new Plume
+        {
+            Propellant = n.Get("propellant"), Role = n.Get("role") ?? "lower", Template = n.Get("template"),
+            ReferenceDiameter = n.Double("referenceDiameter", 1), LengthScale = n.Double("lengthScale", 1),
+        };
+
+        /// <summary>Upper-stage plume when the nozzle exit pressure is below about 0.4 atm (DESIGN.md 9).</summary>
+        public static string RoleFor(EngineStats s) => s.ExitPressure < 0.4 ? "upper" : "lower";
+    }
+
     /// <summary>Everything the model needs, loaded once.</summary>
     public sealed class ModelData
     {
@@ -118,12 +153,27 @@ namespace ProcEngines.Model
         public readonly Dictionary<string, Cycle> Cycles = new Dictionary<string, Cycle>();
         public readonly Dictionary<string, TechLevel> TechLevels = new Dictionary<string, TechLevel>();
         public Balance Balance = new Balance();
+        public readonly List<TechEntry> Tech = new List<TechEntry>();
+        public readonly Dictionary<string, ResourceSet> Resources = new Dictionary<string, ResourceSet>();
+        public readonly List<Plume> Plumes = new List<Plume>();
+        public readonly List<string> TechLevelOrder = new List<string>();
+
+        public Plume PlumeFor(string propellant, string role) =>
+            Plumes.FirstOrDefault(p => p.Propellant == propellant && p.Role == role) ?? Plumes.FirstOrDefault(p => p.Propellant == propellant);
 
         public void AddNodes(CfgNode root)
         {
             foreach (CfgNode n in root.NodesNamed("PROCENG_PROPELLANT")) { var p = Propellant.Load(n); Propellants[p.Name] = p; }
             foreach (CfgNode n in root.NodesNamed("PROCENG_CYCLE")) { var c = Cycle.Load(n); Cycles[c.Name] = c; }
-            foreach (CfgNode n in root.NodesNamed("PROCENG_TECHLEVEL")) { var t = TechLevel.Load(n); TechLevels[t.Name] = t; }
+            foreach (CfgNode n in root.NodesNamed("PROCENG_TECHLEVEL"))
+            {
+                var t = TechLevel.Load(n);
+                TechLevels[t.Name] = t;
+                if (!TechLevelOrder.Contains(t.Name)) TechLevelOrder.Add(t.Name);   // file order = low to high
+            }
+            foreach (CfgNode n in root.NodesNamed("PROCENG_TECH")) Tech.Add(TechEntry.Load(n));
+            foreach (CfgNode n in root.NodesNamed("PROCENG_RESOURCES")) { var r = ResourceSet.Load(n); Resources[r.Propellant] = r; }
+            foreach (CfgNode n in root.NodesNamed("PROCENG_PLUME")) Plumes.Add(Plume.Load(n));
             foreach (CfgNode n in root.NodesNamed("PROCENG_BALANCE")) Balance = Balance.Load(n);
         }
 

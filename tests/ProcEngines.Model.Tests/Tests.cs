@@ -255,6 +255,68 @@ namespace ProcEngines.Model.Tests
             finally { Thread.CurrentThread.CurrentCulture = old; }
         }
 
+        // ------------------------------------------------------------------ persistence and tech
+
+        public static void DesignAndStatsRoundTripBitExactUnderAnyCulture(ModelData data)
+        {
+            CultureInfo old = Thread.CurrentThread.CurrentCulture;
+            try
+            {
+                var d = new EngineDesign { Propellant = "Methalox", Cycle = "FullFlowStaged", ThrustVac = 2257.123456789, Pc = 299.9, Eps = 33.3, Of = 3.61, LengthFraction = 0.85, RadiativeExtension = true, GimbalRange = 4.5, Tech = "Late" };
+                EngineStats s = EngineModel.Compute(d, data);
+                Thread.CurrentThread.CurrentCulture = new CultureInfo("de-DE");
+                string dText = Serialization.SaveDesign(d).Values.Select(v => v.Value).Aggregate((a, b) => a + " " + b);
+                Assert(!dText.Contains(","), "no comma decimals under de-DE: " + dText);
+                EngineDesign d2 = Serialization.LoadDesign(Serialization.SaveDesign(d));
+                EngineStats s2 = Serialization.LoadStats(Serialization.SaveStats(s));
+                Thread.CurrentThread.CurrentCulture = old;
+                Assert(d2.ThrustVac == d.ThrustVac && d2.Pc == d.Pc && d2.Of == d.Of && d2.RadiativeExtension && d2.Cycle == d.Cycle && d2.Tech == "Late", "design round trip");
+                Assert(s2 != null && s2.IspVac == s.IspVac && s2.Mass == s.Mass && s2.ExitRadius == s.ExitRadius && s2.AtmosphereCurve.Count == s.AtmosphereCurve.Count
+                       && s2.AtmosphereCurve.Zip(s.AtmosphereCurve, (x, y) => x.Isp == y.Isp && x.Tangent == y.Tangent).All(b => b), "stats round trip bit-exact");
+                Assert(double.IsNaN(Serialization.LoadDesign(Serialization.SaveDesign(new EngineDesign())).Of), "default mixture ratio survives as NaN");
+                var partial = Serialization.SaveStats(s); partial.Values.RemoveAt(3);
+                Assert(Serialization.LoadStats(partial) == null, "incomplete STATS -> null (recompute)");
+            }
+            finally { Thread.CurrentThread.CurrentCulture = old; }
+        }
+
+        public static void TechCapsAreAUnionOfResearchedNodes(ModelData data)
+        {
+            Assert(data.Tech.Count > 10 && data.TechLevelOrder.SequenceEqual(new[] { "Early", "Mid", "Late" }), "Tech.cfg and tech levels loaded");
+            var researched = new HashSet<string> { "start", "basicRocketry", "propulsionSystems" };
+            TechCaps c = TechCaps.Evaluate(data.Tech, researched.Contains, data.TechLevelOrder);
+            Assert(c.Cycles.SetEquals(new[] { "PressureFed", "GasGenerator", "Expander" }), "cycles: " + string.Join(",", c.Cycles));
+            Assert(c.Propellants.SetEquals(new[] { "Kerolox", "Hydrolox" }), "propellants");
+            Assert(c.MaxPc == 60 && c.MaxEps == 100 && c.MaxThrust == 800 && c.TechLevel == "Early" && !c.RaoBell, $"caps {c.MaxPc}/{c.MaxEps}/{c.MaxThrust}/{c.TechLevel}");
+            var ok = new EngineDesign { Propellant = "Kerolox", Cycle = "GasGenerator", Pc = 55, Eps = 20, ThrustVac = 500, Conical = true };
+            Assert(c.Violations(ok).Count == 0, "allowed design: " + string.Join("; ", c.Violations(ok)));
+            var bad = new EngineDesign { Propellant = "Methalox", Cycle = "StagedCombustion", Pc = 200, Eps = 200, ThrustVac = 5000 };
+            Assert(c.Violations(bad).Count == 6, "6 violations: " + string.Join("; ", c.Violations(bad)));
+            Assert(TechCaps.Sandbox(data.TechLevelOrder).Violations(bad).Count == 0 && TechCaps.Sandbox(data.TechLevelOrder).TechLevel == "Late", "sandbox unlimited");
+            TechCaps none = TechCaps.Evaluate(data.Tech, _ => false, data.TechLevelOrder);
+            Assert(none.Cycles.Count == 0 && none.MaxThrust == TechCaps.DefaultThrustMax, "nothing researched");
+        }
+
+        public static void DataFilesHaveOneValuePerLine(ModelData _)
+        {
+            // KSP's ConfigNode parser reads "a = b c = d" as one value; every data file must use one value per line.
+            foreach (string f in System.IO.Directory.GetFiles(Program.DataDir(), "*.cfg"))
+                foreach (string line in System.IO.File.ReadAllLines(f))
+                {
+                    string code = line.Split(new[] { "//" }, StringSplitOptions.None)[0];
+                    Assert(code.Count(ch => ch == '=') <= 1 && !(code.Contains("=") && code.Contains("{")), $"{System.IO.Path.GetFileName(f)}: '{line.Trim()}'");
+                }
+        }
+
+        public static void ResourcesAndPlumesCoverEveryChemicalPropellant(ModelData data)
+        {
+            foreach (string p in new[] { "Kerolox", "Methalox", "Hydrolox" })
+            {
+                Assert(data.Resources.ContainsKey(p) && data.Resources[p].Resources.Count == 2 && data.Resources[p].GaugeResource != null, "resources for " + p);
+                Assert(data.PlumeFor(p, "lower") != null && data.PlumeFor(p, "upper") != null, "plumes for " + p);
+            }
+        }
+
         // ------------------------------------------------------------------ calibration against real engines
 
         public static void ReferenceEnginesIsp(ModelData data)
