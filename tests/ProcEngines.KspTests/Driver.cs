@@ -269,7 +269,16 @@ namespace ProcEngines.KspTests
             DesignerWindow.Open(m);
             yield return new WaitForSecondsRealtime(1f);
             Check("designer.open", DesignerWindow.IsOpen, "designer window open");
+            float h0 = DesignerWindow.WindowRect.height;
+            for (int i = 0; i < 60; i++) yield return null;   // the old window grew a little every frame
+            float h1 = DesignerWindow.WindowRect.height;
+            Check("designer.size", h1 == h0 && h1 > 200 && h1 <= Screen.height - 100 && DesignerWindow.WindowRect.yMax <= Screen.height,
+                $"window {DesignerWindow.WindowRect} stays {h0} -> {h1} px high on a {Screen.width}x{Screen.height} screen");
             yield return Shot("designer");
+            DesignerWindow.ScrollTo(10000);
+            yield return null; yield return null;
+            yield return Shot("designer_scrolled");
+            DesignerWindow.ScrollTo(0);
 
             // drag handles: drag along rays through known points on each handle's axis
             EngineHandles hs = EngineHandles.Instance;
@@ -312,7 +321,16 @@ namespace ProcEngines.KspTests
             Check("library.load", loaded != null && loaded.parts.Count == 1 && loaded.parts[0].FindModuleImplementing<ModuleProcEngine>()?.Design?.ThrustVac == m.Design.ThrustVac,
                 $"stock LoadSubassembly: parts {loaded?.parts.Count}");
             if (loaded != null) foreach (Part p in loaded.parts) Destroy(p.gameObject);
-            DesignerWindow.Open(null);
+            // close paths: the part-menu button toggles, Close() closes
+            m.OpenDesigner();
+            yield return null;
+            bool closedByToggle = !DesignerWindow.IsOpen;
+            m.OpenDesigner();
+            yield return null;
+            bool reopened = DesignerWindow.IsOpen;
+            DesignerWindow.Close();
+            yield return null;
+            Check("designer.close", closedByToggle && reopened && !DesignerWindow.IsOpen, $"toggle closed {closedByToggle}, toggle reopened {reopened}, Close() closed {!DesignerWindow.IsOpen}");
 
             // nodes: engine above a decoupler, nozzle grows
             yield return LoadCraft(WriteCraft("PE_Stack", Stack(true)));

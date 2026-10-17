@@ -339,7 +339,7 @@ namespace ProcEngines
         }
 
         [KSPEvent(guiActiveEditor = true, guiName = "Engine designer")]
-        public void OpenDesigner() => DesignerWindow.Open(this);
+        public void OpenDesigner() => DesignerWindow.Toggle(this);
 
         public float GetModuleMass(float defaultMass, ModifierStagingSituation sit) => Stats == null ? 0 : (float)Stats.Mass - defaultMass;
         public ModifierChangeWhen GetModuleMassChangeWhen() => ModifierChangeWhen.FIXED;

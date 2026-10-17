@@ -32,6 +32,20 @@ Template-vertex-deformed kit pieces, the TexturesUnlimited path and LOD are not 
 | Waterfall (`Integrations.cs`, `Plumes.cfg`) | Several templates per engine: the main plume on `thrustTransform`, plus the GG exhaust plume on `peGGExhaust` (`waterfall-kerolox-exhaust-1`, `methalox-vernier-1`, `hydrolox-upper-1`). <br>• **Calibrated `referenceDiameter`** with the new `plumes` rig: each template at scale 1 on a 1.00 m exit, side view at sea level, measuring plume width at the exit plane against the nozzle. <br>• Results: kerolox-lower-1 **0.43**, kerolox-upper-1 **0.40**, methalox-lower-raptor-1 **1.18**, methalox-upper-1 **0.85**, hydrolox-lower-1 **1.07**, hydrolox-upper-1 **1.0**. The exhaust templates are tiny ducts: 0.12 / 0.08 / 1.0. <br>• Before this, kerolox plumes were drawn at ~40 % of the nozzle width. |
 | Drag handles (`EngineHandles.cs`) | Three screen-space handles on the engine open in the designer: **exit rim** (radius → area ratio), **nozzle tip** (length → bell length fraction) and **chamber side** (radius → thrust, since the chamber radius scales as √F at fixed Pc). <br>• Dragging projects the mouse ray onto the handle's axis, frozen at drag start so the axis doesn't move under the cursor. <br>• Editor input is locked while hovering or dragging, and a value label shows while active. <br>• Changes go through `SetDesign`, so the two-speed pipeline, symmetry and undo apply. <br>• Tested by dragging along rays through known points: exit ×1.5 gives area ratio ×2.250, chamber ×1.2 gives thrust ×1.440, and the bell length lands at 0.900 exactly. |
 
+## Designer window rework (after user feedback)
+
+- **Fixed the window that grew forever.** The scroll view's height was derived from the window height, and `GUILayout.Window` grew the window to fit it every frame. The window is now a fixed height (min(760, screen − 100) px), kept on screen, and the content scrolls inside it. Test: the height is unchanged after 60 frames.
+- **Closing:** a ✕ in the title bar, the Close button, Esc (when not typing), and the part-menu "Engine designer" button, which now toggles. The window also closes when the part is removed. Test: toggle closes, toggle reopens, Close() closes.
+- **Layout:**
+  - Sections: Propellant and cycle, Chamber, Nozzle, Performance, Isp plot, Messages.
+  - Every slider has a typed number field next to it, applied as you type and clamped to the allowed range.
+  - Tooltips on everything; locked choices explain why they're locked.
+  - Two-column performance readout, adding sea-level TWR, exit pressure and cost.
+  - A status badge: OK / warnings / not launchable.
+  - Footer always visible: Save to library, Close, and the tooltip or tip line.
+- **Isp plot:** scaled to the curve's range (it used to start at 0 Isp, so the curve looked flat), with Isp labels top and bottom, pressure labels, and a sea-level line. Only redrawn when the stats change.
+- Screenshots: `shots/sandbox_designer.png`, `shots/sandbox_designer_scrolled.png`. Sandbox run: 24/24.
+
 ## Evidence
 
 [tests/ksp/evidence/phase3/](tests/ksp/evidence/phase3/): results files, and screenshots:
