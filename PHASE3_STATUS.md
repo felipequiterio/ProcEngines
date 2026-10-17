@@ -46,6 +46,45 @@ Template-vertex-deformed kit pieces, the TexturesUnlimited path and LOD are not 
 - **Isp plot:** scaled to the curve's range (it used to start at 0 Isp, so the curve looked flat), with Isp labels top and bottom, pressure labels, and a sea-level line. Only redrawn when the stats change.
 - Screenshots: `shots/sandbox_designer.png`, `shots/sandbox_designer_scrolled.png`. Sandbox run: 24/24.
 
+## Engine detail pass (code-only geometry, textures, glow)
+
+First step of the model-improvement plan. Everything is still generated in code; authored Blender pieces come next.
+
+- **Geometry (`EngineGeometry.cs`):**
+  - **Top of the engine:** the mount plate now has a bolted rim and an open underside. Below it, an open thrust-frame bay holds a **gimbal block**: bolted flanges, neck and spherical bearing. The engine is about 0.24 × the chamber radius taller; stats lengths are unchanged.
+  - **Injector dome:** now domed, with a **bolted injector flange** where it meets the chamber.
+  - **Chamber:** two **stiffener bands** on long chambers.
+- **Bell:**
+  - **Hat bands** (stiffening rings) on long regen sections.
+  - The **coolant manifold** is now part of the gimballed bell, so it moves with it. It sits at the joint, or just above the exit on an all-regen bell.
+  - A **bolted joint flange** between the regen section and the radiative extension.
+  - A thin **exit ring** on extensions.
+  - The **inside of the extension** is now the extension material, so it glows with it. The regen inside stays sooty.
+  - Bolts are a texture: one bolt head per U repeat on flange rims, ~1.6× as wide as high (bolt count from the rim circumference).
+- **Mesh (`MeshBuilder`):**
+  - Lathe and primitives share one builder with explicit tangents (+U, w = −1). The normal-map convention is documented in `EngineMaterials`: bump nx = +(u−uc), ny = −(v−vc).
+  - By this convention the old tube normal map had nx reversed, which would light the tubes as grooves. Fixed by derivation, not measured in game.
+- **Kit (`KitBuilder.cs`):**
+  - **Lines:** bolted end flanges, and **bellows** with collars where lines cross onto the gimballed bell and on the pump inlet ducts, which now run up to the tank interface. Liquid-hydrogen lines wear gold **MLI foil**.
+  - **Actuators** have a clevis, gland and rod-end bearing.
+  - **Strut feet**, a pump housing flange, COPV mounting bands, and valves with actuator bosses.
+  - The **GG exhaust duct** uses heat-tinted steel and glows dull red while running.
+- **Textures (`EngineMaterials.cs`), still generated in code:**
+  - **Regen tubes:** 8 tubes per tile with per-tube shade variation and braze fillets. Heat tint runs along the tubes: bare metal → straw → bronze → purple → blue toward the throat. Kerolox engines are tinted more copper.
+  - **Steel:** brushed and mottled.
+  - **Bolt heads:** separate albedo and normal maps for flange rims.
+  - **Nozzle inside:** soot tinted by propellant (heavy for kerosene, light for methane, clean metal for hydrogen).
+  - **Niobium:** with its silicide coating.
+  - **Carbon-carbon:** 2/2 twill at a fixed 0.4 m tile, so the weave no longer scales with the engine.
+  - **Foil and heat-tinted duct steel.**
+  - Tileable value noise. All textures together take well under 1 MB.
+- **Glow (`ModuleProcEngine.UpdateGlow`):**
+  - **Along the extension:** the extension material's `_Emissive` is a ramp, brightest and yellowest at the joint, dimmer and redder toward the exit. A per-engine `_Emissive_ST` in the per-material block stretches the ramp over the extension's length (the KSP emissive shader honours it, checked in game).
+  - **Brightness curve** retuned so hot metal reads in daylight without washing out.
+  - **GG duct:** glows at ~1100 K at full throttle.
+  - **When cooled:** the per-material blocks are cleared, so KSP's renderer-wide block (part highlight) applies again.
+- **Tests:** the `visual` script adds a close-up (camera on the bell) and an **after-shutdown** shot: plume out, metal still hot. It also checks the emissive ST. Shots are `visual_detail_*` and `visual_afterglow_*`.
+
 ## Evidence
 
 [tests/ksp/evidence/phase3/](tests/ksp/evidence/phase3/): results files, and screenshots:

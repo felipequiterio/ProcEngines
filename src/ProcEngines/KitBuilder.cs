@@ -5,10 +5,12 @@ using UnityEngine;
 
 namespace ProcEngines
 {
-    /// <summary>Accumulates primitive pieces into one mesh with a few submeshes.</summary>
+    /// <summary>Accumulates lathe surfaces and primitive pieces into one mesh with a few submeshes. Tangents follow
+    /// increasing U with w = -1 everywhere (see EngineMaterials for the normal-map convention).</summary>
     public sealed class MeshBuilder
     {
         readonly List<Vector3> v = new List<Vector3>(), n = new List<Vector3>();
+        readonly List<Vector4> tg = new List<Vector4>();
         readonly List<Vector2> uv = new List<Vector2>();
         readonly List<int>[] tris;
 
@@ -21,19 +23,77 @@ namespace ProcEngines
             b = Vector3.Cross(dir, a);
         }
 
-        /// <summary>Generic swept ring strip: rings[i] centre, radius, frame axes.</summary>
-        void Sweep(IList<Vector3> centres, IList<float> radii, IList<Vector3> ax, IList<Vector3> bx, int sides, int mat, bool capStart, bool capEnd)
+        void AddTris(List<int> t, int mat)
+        {
+            EngineGeometry.FixWinding(v, n, t);
+            tris[Math.Min(mat, tris.Length - 1)].AddRange(t);
+        }
+
+        /// <summary>Revolve profile segments around Y. Normals come from the profile tangent (central differences
+        /// along each smooth segment; joints between segments are creases). U repeats UTiles times around (seam
+        /// vertex duplicated), V runs along the arc length.</summary>
+        public void Lathe(List<ProfileSegment> segments, int ringSegments, float yOffset)
+        {
+            int ring = ringSegments + 1;
+            foreach (ProfileSegment segment in segments)
+            {
+                List<Vector2> seg = segment.Points;
+                if (seg.Count < 2) continue;
+                float acc = 0;
+                int baseIndex = v.Count;
+                for (int i = 0; i < seg.Count; i++)
+                {
+                    if (i > 0) acc += (seg[i] - seg[i - 1]).magnitude;
+                    Vector2 tan = seg[Math.Min(i + 1, seg.Count - 1)] - seg[Math.Max(i - 1, 0)];
+                    if (tan.sqrMagnitude < 1e-12f) tan = new Vector2(0, -1);
+                    tan.Normalize();
+                    var n2 = new Vector2(-tan.y, tan.x);   // outward for a profile running outward/downward
+                    if (segment.Inward) n2 = -n2;
+                    for (int j = 0; j < ring; j++)
+                    {
+                        float phi = 2 * Mathf.PI * j / ringSegments, c = Mathf.Cos(phi), sn = Mathf.Sin(phi);
+                        v.Add(new Vector3(seg[i].x * c, seg[i].y - yOffset, seg[i].x * sn));
+                        n.Add(new Vector3(n2.x * c, n2.y, n2.x * sn));
+                        tg.Add(new Vector4(-sn, 0, c, -1));
+                        uv.Add(new Vector2(segment.UTiles * j / ringSegments, segment.VOffset + acc / segment.VLength));
+                    }
+                }
+                var t = new List<int>();
+                for (int i = 0; i < seg.Count - 1; i++)
+                {
+                    if ((seg[i + 1] - seg[i]).sqrMagnitude < 1e-12f) continue;
+                    for (int j = 0; j < ringSegments; j++)
+                    {
+                        int a = baseIndex + i * ring + j, b = a + 1, cI = a + ring, dI = cI + 1;
+                        t.Add(a); t.Add(b); t.Add(cI);
+                        t.Add(b); t.Add(dI); t.Add(cI);
+                    }
+                }
+                AddTris(t, segment.Material);
+            }
+        }
+
+        /// <summary>Generic swept ring strip: rings[i] centre, radius, frame axes (a x b = forward). `slopes` (dr/ds)
+        /// tilts the normals of a rippled surface (bellows). V is arc length in circumferences (square texels).</summary>
+        void Sweep(IList<Vector3> centres, IList<float> radii, IList<Vector3> ax, IList<Vector3> bx, int sides, int mat, bool capStart, bool capEnd, IList<float> slopes = null)
         {
             int start = v.Count, ring = sides + 1;
+            float circ = 2 * Mathf.PI * Mathf.Max(radii[0], 1e-3f), s = 0;
             for (int i = 0; i < centres.Count; i++)
+            {
+                if (i > 0) s += (centres[i] - centres[i - 1]).magnitude;
+                Vector3 fwd = Vector3.Cross(ax[i], bx[i]);
                 for (int j = 0; j <= sides; j++)
                 {
-                    float phi = 2 * Mathf.PI * j / sides;
-                    Vector3 dir = ax[i] * Mathf.Cos(phi) + bx[i] * Mathf.Sin(phi);
+                    float phi = 2 * Mathf.PI * j / sides, c = Mathf.Cos(phi), sn = Mathf.Sin(phi);
+                    Vector3 dir = ax[i] * c + bx[i] * sn;
+                    Vector3 tu = -ax[i] * sn + bx[i] * c;
                     v.Add(centres[i] + dir * radii[i]);
-                    n.Add(dir);
-                    uv.Add(new Vector2((float)j / sides, i));
+                    n.Add(slopes == null ? dir : (dir - fwd * slopes[i]).normalized);
+                    tg.Add(new Vector4(tu.x, tu.y, tu.z, -1));
+                    uv.Add(new Vector2((float)j / sides, s / circ));
                 }
+            }
             var t = new List<int>();
             for (int i = 0; i < centres.Count - 1; i++)
                 for (int j = 0; j < sides; j++)
@@ -41,8 +101,7 @@ namespace ProcEngines
                     int a = start + i * ring + j, b = a + 1, c = a + ring, d = c + 1;
                     t.Add(a); t.Add(c); t.Add(b); t.Add(b); t.Add(c); t.Add(d);
                 }
-            EngineGeometry.FixWinding(v, n, t);
-            tris[mat].AddRange(t);
+            AddTris(t, mat);
             if (capStart) Cap(centres[0], centres[0] - centres[1], radii[0], ax[0], bx[0], sides, mat);
             if (capEnd) Cap(centres[centres.Count - 1], centres[centres.Count - 1] - centres[centres.Count - 2], radii[radii.Count - 1], ax[ax.Count - 1], bx[bx.Count - 1], sides, mat);
         }
@@ -51,16 +110,16 @@ namespace ProcEngines
         {
             outward.Normalize();
             int start = v.Count;
-            v.Add(c); n.Add(outward); uv.Add(new Vector2(0.5f, 0.5f));
+            v.Add(c); n.Add(outward); tg.Add(new Vector4(a.x, a.y, a.z, -1)); uv.Add(new Vector2(0.5f, 0.5f));
             for (int j = 0; j <= sides; j++)
             {
                 float phi = 2 * Mathf.PI * j / sides;
-                v.Add(c + (a * Mathf.Cos(phi) + b * Mathf.Sin(phi)) * r); n.Add(outward); uv.Add(new Vector2(Mathf.Cos(phi), Mathf.Sin(phi)));
+                v.Add(c + (a * Mathf.Cos(phi) + b * Mathf.Sin(phi)) * r); n.Add(outward); tg.Add(new Vector4(a.x, a.y, a.z, -1));
+                uv.Add(new Vector2(0.5f + 0.5f * Mathf.Cos(phi), 0.5f + 0.5f * Mathf.Sin(phi)));
             }
             var t = new List<int>();
             for (int j = 0; j < sides; j++) { t.Add(start); t.Add(start + 1 + j); t.Add(start + 2 + j); }
-            EngineGeometry.FixWinding(v, n, t);
-            tris[mat].AddRange(t);
+            AddTris(t, mat);
         }
 
         public void Frustum(Vector3 p0, Vector3 p1, float r0, float r1, int mat, int sides = 14, bool caps = true)
@@ -95,34 +154,82 @@ namespace ProcEngines
                 Vector3 radial = a * Mathf.Cos(th) + b * Mathf.Sin(th);
                 cs.Add(c + radial * R); rs.Add(r); ax.Add(radial); bx.Add(axis.normalized);
             }
-            int start = v.Count;
             Sweep(cs, rs, ax, bx, sides, mat, false, false);
         }
 
-        /// <summary>Tube along a smoothed path (Catmull-Rom through the points), parallel-transported frames.</summary>
-        public void Tube(IList<Vector3> pts, float r, int mat, int perSpan = 6, int sides = 10)
+        /// <summary>Pipe along a smoothed path (Catmull-Rom through the points, resampled by arc length, parallel-
+        /// transported frames). Optional bolted flanges at both ends and a convoluted bellows section (fractions of
+        /// the length) with collars at its ends.</summary>
+        public void Tube(IList<Vector3> pts, float r, int mat, int sides = 10, int flangeMat = -1, float bellowsFrom = -1, float bellowsTo = -1)
         {
-            var path = new List<Vector3>();
+            var dense = new List<Vector3>();
             for (int i = 0; i < pts.Count - 1; i++)
             {
                 Vector3 p0 = pts[Math.Max(i - 1, 0)], p1 = pts[i], p2 = pts[i + 1], p3 = pts[Math.Min(i + 2, pts.Count - 1)];
-                for (int k = 0; k < perSpan; k++)
+                for (int k = 0; k < 12; k++)
                 {
-                    float t = (float)k / perSpan, t2 = t * t, t3 = t2 * t;
-                    path.Add(0.5f * (2 * p1 + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 + (-p0 + 3 * p1 - 3 * p2 + p3) * t3));
+                    float t = k / 12f, t2 = t * t, t3 = t2 * t;
+                    dense.Add(0.5f * (2 * p1 + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 + (-p0 + 3 * p1 - 3 * p2 + p3) * t3));
                 }
             }
-            path.Add(pts[pts.Count - 1]);
-            var ax = new List<Vector3>(); var bx = new List<Vector3>(); var rs = new List<float>();
+            dense.Add(pts[pts.Count - 1]);
+            var cum = new List<float> { 0 };
+            for (int i = 1; i < dense.Count; i++) cum.Add(cum[i - 1] + (dense[i] - dense[i - 1]).magnitude);
+            float len = cum[cum.Count - 1];
+            if (len < 1e-4f) return;
+            bool bellows = bellowsTo > bellowsFrom && bellowsFrom >= 0;
+            float b0 = bellowsFrom * len, b1 = bellowsTo * len;
+            float coarse = Mathf.Max(r * 1.2f, len / 48), fine = r * 0.15f, pitch = r * 0.6f;
+
+            // resample: coarse along plain pipe, fine through the bellows
+            var path = new List<Vector3>(); var ss = new List<float>();
+            float s = 0; int seg = 0;
+            while (true)
+            {
+                while (seg < cum.Count - 2 && cum[seg + 1] < s) seg++;
+                float f = Mathf.Approximately(cum[seg + 1], cum[seg]) ? 0 : (s - cum[seg]) / (cum[seg + 1] - cum[seg]);
+                path.Add(Vector3.Lerp(dense[seg], dense[seg + 1], Mathf.Clamp01(f)));
+                ss.Add(s);
+                if (s >= len) break;
+                bool inBellows = bellows && s >= b0 - fine && s < b1;
+                float step = inBellows ? fine : coarse;
+                if (bellows && s < b0 && s + step > b0) step = b0 - s;   // land exactly on the bellows start
+                s = Mathf.Min(s + Mathf.Max(step, 1e-4f), len);
+            }
+            if (path.Count < 2) return;
+
+            var ax = new List<Vector3>(); var bx = new List<Vector3>(); var rs = new List<float>(); var slopes = new List<float>();
             Basis(path[1] - path[0], out Vector3 a, out Vector3 b);
             for (int i = 0; i < path.Count; i++)
             {
                 Vector3 tan = (path[Math.Min(i + 1, path.Count - 1)] - path[Math.Max(i - 1, 0)]).normalized;
                 a = (a - Vector3.Dot(a, tan) * tan).normalized;   // parallel transport
                 b = Vector3.Cross(tan, a);
-                ax.Add(a); bx.Add(b); rs.Add(r);
+                ax.Add(a); bx.Add(b);
+                if (bellows && ss[i] >= b0 && ss[i] <= b1)
+                {
+                    float ph = 2 * Mathf.PI * (ss[i] - b0) / pitch;
+                    rs.Add(r * (1.16f + 0.08f * Mathf.Cos(ph)));
+                    slopes.Add(-0.08f * r * Mathf.Sin(ph) * 2 * Mathf.PI / pitch);
+                }
+                else { rs.Add(r); slopes.Add(0); }
             }
-            Sweep(path, rs, ax, bx, sides, mat, true, true);
+            Sweep(path, rs, ax, bx, sides, mat, true, true, slopes);
+
+            if (flangeMat >= 0)
+            {
+                Vector3 t0 = (path[1] - path[0]).normalized, t1 = (path[path.Count - 1] - path[path.Count - 2]).normalized;
+                Cylinder(path[0], path[0] + t0 * r * 0.45f, r * 1.45f, flangeMat, sides + 2);
+                Cylinder(path[path.Count - 1] - t1 * r * 0.45f, path[path.Count - 1], r * 1.45f, flangeMat, sides + 2);
+                if (bellows)
+                    foreach (float sc in new[] { b0, b1 })
+                    {
+                        int i = ss.FindIndex(x => x >= sc - 1e-5f);
+                        if (i < 0) continue;
+                        Vector3 tc = (path[Math.Min(i + 1, path.Count - 1)] - path[Math.Max(i - 1, 0)]).normalized;
+                        Cylinder(path[i] - tc * r * 0.18f, path[i] + tc * r * 0.18f, r * 1.3f, flangeMat, sides + 2);
+                    }
+            }
         }
 
         public void Box(Vector3 c, Vector3 size, int mat)
@@ -137,21 +244,22 @@ namespace ProcEngines
             mesh.indexFormat = v.Count > 65000 ? UnityEngine.Rendering.IndexFormat.UInt32 : UnityEngine.Rendering.IndexFormat.UInt16;
             mesh.SetVertices(v);
             mesh.SetNormals(n);
+            mesh.SetTangents(tg);
             mesh.SetUVs(0, uv);
             mesh.subMeshCount = tris.Length;
             for (int i = 0; i < tris.Length; i++) mesh.SetTriangles(tris[i], i);
             mesh.RecalculateBounds();
-            mesh.RecalculateTangents();
         }
     }
 
     /// <summary>
     /// Kit-bashed turbomachinery, plumbing and structure per cycle (DESIGN.md 8.5), from primitives (visual only, no
     /// colliders). Pieces scale with the turbopump / pressurant mass and the propellant flow; positions avoid the bell.
+    /// The regen coolant manifold is part of the gimballed bell (EngineGeometry); the fuel line ends at it.
     /// </summary>
     public static class KitBuilder
     {
-        public const int MatStructure = 0, MatMachine = 1, MatLines = 2;
+        public const int MatStructure = 0, MatMachine = 1, MatLines = 2, MatHot = 3, MatFoil = 4, Materials = 5;
 
         public sealed class Result
         {
@@ -162,72 +270,100 @@ namespace ProcEngines
 
         static Vector3 Around(float deg, float radius, float y) => new Vector3(radius * Mathf.Cos(deg * Mathf.Deg2Rad), y, radius * Mathf.Sin(deg * Mathf.Deg2Rad));
 
+        /// <summary>Propellant line sizes: constant flow velocity (15 m/s), d ~ sqrt(mdot / rho).</summary>
+        public static void LineRadii(EngineDesign d, EngineStats s, ModelData data, out float fuelR, out float oxR)
+        {
+            float rc = (float)s.ChamberRadius;
+            double of = s.Of;
+            ProcEngines.Model.Propellant prop = null;
+            data?.Propellants.TryGetValue(d.Propellant, out prop);
+            double fuelDensity = prop?.FuelDensity ?? 800, oxDensity = prop?.OxDensity ?? 1141;
+            double mdotFuel = s.MassFlow / (1 + of), mdotOx = s.MassFlow - mdotFuel;
+            float LineR(double mdot, double rho) => Mathf.Clamp(Mathf.Sqrt((float)(mdot / (rho * 15) / Math.PI)), 0.006f, 0.25f * rc + 0.01f);
+            fuelR = LineR(mdotFuel, fuelDensity);
+            oxR = LineR(mdotOx, oxDensity);
+        }
+
         public static Result Build(Mesh mesh, EngineDesign d, EngineStats s, EngineGeometry g, ModelData data)
         {
-            var mb = new MeshBuilder(3);
+            var mb = new MeshBuilder(Materials);
             var res = new Result();
-            float rc = g.ChamberRadius, rt = g.ThroatRadius;
+            float rc = g.ChamberRadius;
             double turboKg = s.MassBreakdown.TryGetValue("turbomachinery", out double tk) ? tk : 0;
             double pressKg = s.MassBreakdown.TryGetValue("pressurant", out double pk) ? pk : 0;
             float yUnder = -g.MountHeight;
             float bellLen = g.YThroat - g.YExit;
+            LineRadii(d, s, data, out float fuelR, out float oxR);
+            // liquid hydrogen lines wear multi-layer insulation
+            int fuelMat = d.Propellant == "Hydrolox" ? MatFoil : MatLines;
 
-            // propellant line sizes: constant flow velocity, d ~ sqrt(mdot / rho)
-            double of = s.Of;
-            data.Propellants.TryGetValue(d.Propellant, out ProcEngines.Model.Propellant prop);
-            double fuelDensity = prop?.FuelDensity ?? 800, oxDensity = prop?.OxDensity ?? 1141;
-            double mdotFuel = s.MassFlow / (1 + of), mdotOx = s.MassFlow - mdotFuel;
-            float LineR(double mdot, double rho) => Mathf.Clamp(Mathf.Sqrt((float)(mdot / (rho * 15) / Math.PI)), 0.006f, 0.25f * rc + 0.01f);
-            float fuelR = LineR(mdotFuel, fuelDensity), oxR = LineR(mdotOx, oxDensity);
-
-            // thrust frame: four struts from the mount plate rim to the top of the chamber
+            // thrust frame: four struts from the mount plate rim to the shoulder of the injector dome
             for (int k = 0; k < 4; k++)
             {
                 float ang = 45 + 90 * k;
-                mb.Cylinder(Around(ang, g.MountRadius * 0.92f, yUnder), Around(ang, rc * 0.95f, g.YInjector + 0.15f * g.DomeHeight), Mathf.Max(0.035f * rc, 0.004f), MatStructure, 8);
+                Vector3 top = Around(ang, g.MountRadius * 0.92f, yUnder), bot = Around(ang, rc * 0.95f, g.YInjector + 0.15f * g.DomeHeight);
+                float sr = Mathf.Max(0.035f * rc, 0.004f);
+                mb.Cylinder(top, bot, sr, MatStructure, 8);
+                mb.Sphere(bot, sr * 1.6f, MatStructure, 8);
             }
-            // gimbal actuators (piston + rod) from the mount to the bell, 90 degrees apart
+            // gimbal actuators: clevis, cylinder with a gland, rod, rod-end bearing; 90 degrees apart
             float yAct = g.YThroat - 0.3f * bellLen;
             foreach (float ang in new[] { 135f, 225f })
             {
                 Vector3 top = Around(ang, g.MountRadius * 0.85f, yUnder);
                 Vector3 bot = Around(ang, g.BellRadiusAt(yAct) + 0.02f * rc + 0.005f, yAct);
+                Vector3 dir = (bot - top).normalized;
                 Vector3 mid = Vector3.Lerp(top, bot, 0.55f);
                 float ra = Mathf.Max(0.06f * rc, 0.006f);
-                mb.Cylinder(top, mid, ra, MatMachine, 10);
-                mb.Cylinder(mid, bot, ra * 0.45f, MatStructure, 8);
+                mb.Sphere(top + dir * ra * 0.6f, ra * 1.1f, MatStructure, 10);
+                mb.Cylinder(top + dir * ra * 0.6f, mid, ra, MatMachine, 12);
+                mb.Cylinder(mid - dir * ra * 0.25f, mid + dir * ra * 0.05f, ra * 1.18f, MatStructure, 12);
+                mb.Cylinder(mid, bot, ra * 0.42f, MatLines, 8);
+                mb.Sphere(bot, ra * 0.7f, MatStructure, 10);
             }
 
             // turbopump envelope from its mass (dense machinery, ~5 t/m^3 including the housing), never wider than the chamber
             float rp = Mathf.Clamp(Mathf.Pow((float)(turboKg / (5000 * 2 * Mathf.PI)), 1f / 3f), 0.02f, Mathf.Max(0.9f * rc, 0.03f));
             Vector3 Dome(float ang, float frac) => Around(ang, rc * frac, g.YInjector + 0.4f * g.DomeHeight);
-            float yMan = Mathf.Max(g.RegenEndY, g.YExit) + 0.02f * bellLen;
-            float manR = g.BellRadiusAt(yMan) + fuelR;
+            float yMan = g.ManifoldY, manR = g.ManifoldRadius;
+
+            // everything stays below the mount plate, so nothing pokes into the part stacked on top; a plain pump
+            // hangs below its inlet duct
+            Vector3 PumpC(float ang, float scale, bool preburner) => Around(ang, rc + rp * scale * 1.25f, yUnder - rp * scale * (preburner ? 2.35f : 1.7f));
 
             void Pump(float ang, float scale, bool preburner, bool fuelToManifold, bool oxToDome)
             {
                 float r = rp * scale;
                 float pr = rc + r * 1.25f;
-                // everything stays below the mount plate, so nothing pokes into the part stacked on top
-                Vector3 c = Around(ang, pr, yUnder - r * (preburner ? 2.35f : 1.0f));
+                Vector3 c = PumpC(ang, scale, preburner);
                 mb.Cylinder(c - Vector3.up * r, c + Vector3.up * r * 0.9f, r * 0.75f, MatMachine);            // housing
                 mb.Torus(c + Vector3.up * r * 0.2f, Vector3.up, r * 0.78f, r * 0.32f, MatMachine);            // volute
+                mb.Torus(c - Vector3.up * r * 0.55f, Vector3.up, r * 0.76f, r * 0.06f, MatStructure, 20, 6);  // housing flange
                 mb.Cylinder(c - Vector3.up * r * 1.35f, c - Vector3.up * r * 0.95f, r * 0.9f, MatStructure);  // turbine
+                // inlet duct up to the tank interface, with a bellows to take up gimbal and thermal motion
+                if (!preburner)
+                {
+                    float inR = Mathf.Max(fuelR, oxR) * 1.15f;
+                    mb.Tube(new[] { c + Vector3.up * r * 0.9f, new Vector3(c.x, yUnder - 0.004f, c.z) }, inR, oxToDome ? MatLines : fuelMat, 12, MatStructure, 0.3f, 0.7f);
+                }
                 if (preburner)
                 {
                     Vector3 pb = c + Vector3.up * (r * 0.9f);
                     mb.Cylinder(pb, pb + Vector3.up * r * 0.9f, r * 0.45f, MatMachine);
                     mb.Sphere(pb + Vector3.up * r * 0.9f, r * 0.45f, MatMachine);
+                    mb.Torus(pb + Vector3.up * r * 0.1f, Vector3.up, r * 0.46f, r * 0.05f, MatStructure, 20, 6);
                     // hot-gas duct into the injector dome
-                    mb.Tube(new[] { pb + Vector3.up * r * 1.2f, Vector3.Lerp(pb, Dome(ang, 0.2f), 0.5f) + Vector3.up * r * 0.6f, Dome(ang, 0.2f) }, r * 0.28f, MatMachine);
+                    mb.Tube(new[] { pb + Vector3.up * r * 1.2f, Vector3.Lerp(pb, Dome(ang, 0.2f), 0.5f) + Vector3.up * r * 0.6f, Dome(ang, 0.2f) }, r * 0.28f, MatMachine, 12, MatStructure);
                 }
                 if (oxToDome)
-                    mb.Tube(new[] { c + Around(ang + 90, r * 0.75f, r * 0.2f), Around(ang + 30, rc * 1.05f, c.y + r * 0.2f), Dome(ang + 30, 0.7f) }, oxR, MatLines);
+                    mb.Tube(new[] { c + Around(ang + 90, r * 0.75f, r * 0.2f), Around(ang + 30, rc * 1.05f, c.y + r * 0.2f), Dome(ang + 30, 0.7f) }, oxR, MatLines, 10, MatStructure);
                 if (fuelToManifold)
                 {
                     Vector3 start = c + Around(ang - 90, r * 0.75f, r * 0.2f);
                     float yMid = g.YChamberBottom;
-                    mb.Tube(new[] { start, Around(ang - 25, pr, yMid), Around(ang - 25, g.BellRadiusAt(g.YThroat - 0.5f * (g.YThroat - yMan)) + fuelR * 2, g.YThroat - 0.5f * (g.YThroat - yMan)), Around(ang - 25, manR, yMan) }, fuelR, MatLines);
+                    float yHalf = g.YThroat - 0.5f * (g.YThroat - yMan);
+                    // the line crosses onto the gimballed bell: a bellows section takes up the motion
+                    mb.Tube(new[] { start, Around(ang - 25, pr, yMid), Around(ang - 25, g.BellRadiusAt(yHalf) + fuelR * 2, yHalf), Around(ang - 25, manR, yMan) }, fuelR, fuelMat, 10, MatStructure, 0.18f, 0.3f);
                 }
             }
 
@@ -236,18 +372,22 @@ namespace ProcEngines
                 case "PressureFed":
                 {
                     // composite helium bottles (COPV), sized from the pressurant mass at ~400 kg/m^3 effective, plus valves
-                    int n = pressKg > 300 ? 4 : 2;
-                    float rb = Mathf.Clamp(Mathf.Pow((float)(pressKg / n / (400 * 4.19f)), 1f / 3f), 0.02f, Mathf.Max(1.2f * rc, 0.03f));
-                    for (int k = 0; k < n; k++)
+                    int nb = pressKg > 300 ? 4 : 2;
+                    float rb = Mathf.Clamp(Mathf.Pow((float)(pressKg / nb / (400 * 4.19f)), 1f / 3f), 0.02f, Mathf.Max(1.2f * rc, 0.03f));
+                    for (int k = 0; k < nb; k++)
                     {
-                        float ang = 360f * k / n;
-                        mb.Sphere(Around(ang, rc + rb * 1.15f, yUnder - rb * 1.1f), rb, MatMachine);
+                        float ang = 360f * k / nb;
+                        Vector3 bc = Around(ang, rc + rb * 1.15f, yUnder - rb * 1.1f);
+                        mb.Sphere(bc, rb, MatMachine, 18);
+                        mb.Torus(bc, Vector3.up, rb * 1.0f, rb * 0.04f, MatStructure, 24, 6);   // mounting band
                     }
                     foreach (float ang in new[] { 90f, 270f })
                     {
                         Vector3 valve = Around(ang, rc * 0.85f, yUnder - 0.3f * g.DomeHeight);
-                        mb.Box(valve, Vector3.one * Mathf.Max(oxR * 2.5f, 0.01f), MatMachine);
-                        mb.Tube(new[] { valve + Vector3.up * 0.01f, Dome(ang, 0.6f) }, ang < 180 ? fuelR : oxR, MatLines);
+                        float vr = Mathf.Max(oxR * 1.25f, 0.005f);
+                        mb.Sphere(valve, vr, MatMachine, 12);
+                        mb.Cylinder(valve, valve + Around(ang, vr * 1.6f, 0), vr * 0.45f, MatStructure, 8);   // actuator boss
+                        mb.Tube(new[] { valve + Vector3.up * 0.01f, Dome(ang, 0.6f) }, ang < 180 ? fuelR : oxR, MatLines, 10, MatStructure);
                     }
                     break;
                 }
@@ -256,15 +396,18 @@ namespace ProcEngines
                     Pump(0, 1, false, true, true);
                     // gas generator beside the pump, exhaust duct down past the bell ending in a small nozzle
                     float r = rp;
-                    Vector3 pumpC = Around(0, rc + r * 1.25f, yUnder - r * 1.0f);
-                    mb.Sphere(Around(28, rc + r * 0.9f, yUnder - r * 0.45f), r * 0.38f, MatMachine);
+                    Vector3 pumpC = PumpC(0, 1, false);
+                    Vector3 gg = Around(28, rc + r * 0.9f, pumpC.y + r * 0.55f);
+                    mb.Sphere(gg, r * 0.38f, MatMachine);
+                    mb.Cylinder(gg - Vector3.up * r * 0.5f, gg - Vector3.up * r * 0.25f, r * 0.2f, MatMachine, 10);
                     float yEx = g.YThroat - 0.45f * bellLen;
                     float ductR = Mathf.Max(r * 0.32f, 0.01f);
                     float clear = g.BellRadiusAt(yEx) + ductR * 1.6f;
                     Vector3 exitTop = Around(-35, clear, yEx);
                     Vector3 exitBottom = exitTop - Vector3.up * ductR * 2.2f;
-                    mb.Tube(new[] { pumpC - Vector3.up * r * 1.35f, Around(-20, rc + r * 1.25f, g.YChamberBottom), Around(-30, g.BellRadiusAt(g.YThroat - 0.2f * bellLen) + ductR * 1.6f, g.YThroat - 0.2f * bellLen), exitTop }, ductR, MatMachine);
-                    mb.Frustum(exitTop, exitBottom, ductR, ductR * 1.7f, MatMachine, 12, false);
+                    // uncooled turbine exhaust: heat-tinted, and it glows dull red while running (MatHot)
+                    mb.Tube(new[] { pumpC - Vector3.up * r * 1.35f, Around(-20, rc + r * 1.25f, g.YChamberBottom), Around(-30, g.BellRadiusAt(g.YThroat - 0.2f * bellLen) + ductR * 1.6f, g.YThroat - 0.2f * bellLen), exitTop }, ductR, MatHot, 12, MatStructure);
+                    mb.Frustum(exitTop, exitBottom, ductR, ductR * 1.7f, MatHot, 14, false);
                     res.HasExhaust = true;
                     res.ExhaustPosition = exitBottom;
                     res.ExhaustRadius = ductR * 1.7f;
@@ -273,10 +416,13 @@ namespace ProcEngines
                 case "Expander":
                 {
                     Pump(0, 1, false, false, true);
-                    // heated hydrogen: regen manifold up to the turbine
+                    // heated hydrogen: regen manifold up to the turbine (warm gas: plain line, no insulation)
                     float r = rp;
-                    Vector3 pumpC = Around(0, rc + r * 1.25f, yUnder - r * 1.0f);
-                    mb.Tube(new[] { Around(-25, manR, yMan), Around(-25, g.BellRadiusAt(g.YThroat - 0.5f * (g.YThroat - yMan)) + fuelR * 2, g.YThroat - 0.5f * (g.YThroat - yMan)), Around(-15, rc + r * 1.25f, g.YChamberBottom), pumpC - Vector3.up * r * 1.35f }, fuelR, MatLines);
+                    Vector3 pumpC = PumpC(0, 1, false);
+                    float yHalf = g.YThroat - 0.5f * (g.YThroat - yMan);
+                    mb.Tube(new[] { Around(-25, manR, yMan), Around(-25, g.BellRadiusAt(yHalf) + fuelR * 2, yHalf), Around(-15, rc + r * 1.25f, g.YChamberBottom), pumpC - Vector3.up * r * 1.35f }, fuelR, MatLines, 10, MatStructure, 0.7f, 0.82f);
+                    // cold hydrogen from the pump to the manifold, insulated
+                    mb.Tube(new[] { pumpC + Around(-90, r * 0.75f, r * 0.2f), Around(-60, rc + r * 1.3f, g.YChamberBottom), Around(-55, g.BellRadiusAt(yHalf) + fuelR * 2, yHalf), Around(-50, manR, yMan) }, fuelR, MatFoil, 10, MatStructure, 0.18f, 0.3f);
                     break;
                 }
                 case "StagedCombustion":
@@ -287,8 +433,6 @@ namespace ProcEngines
                     Pump(180, 0.8f, true, false, true);
                     break;
             }
-            // regen coolant inlet manifold around the bell (all pumped/pressure-fed regen engines)
-            mb.Torus(new Vector3(0, yMan, 0), Vector3.up, manR, fuelR * 1.1f, MatLines, 32, 8);
 
             mb.Build(mesh);
             return res;

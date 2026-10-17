@@ -405,6 +405,14 @@ namespace ProcEngines.KspTests
             yield return new WaitForSecondsRealtime(1f);
         }
 
+        /// <summary>Orbit a transform (the bell) instead of the part origin, which sits at the top of the engine.</summary>
+        void CameraOn(Transform t, float distance, float pitchDeg, float hdgDeg)
+        {
+            var mi = typeof(FlightCamera).GetMethod("SetTargetTransform", new[] { typeof(Transform) });
+            mi?.Invoke(mi.IsStatic ? null : FlightCamera.fetch, new object[] { t });
+            Camera(distance, pitchDeg, hdgDeg);
+        }
+
         void Camera(float distance, float pitchDeg, float hdgDeg, Part target = null)
         {
             FlightCamera c = FlightCamera.fetch;
@@ -445,6 +453,11 @@ namespace ProcEngines.KspTests
                 Camera(size * 2.0f, -6, 35, m.part);
                 yield return new WaitForSecondsRealtime(1.5f);
                 yield return Shot("cold_" + tag);
+                Transform bellT = m.part.transform.Find("model/peRoot/peGimbal");
+                CameraOn(bellT, size * 1.1f, 4, 60);
+                yield return new WaitForSecondsRealtime(1f);
+                yield return Shot("detail_" + tag);
+                Camera(size * 2.0f, -6, 35, m.part);
                 var e = m.part.FindModuleImplementing<ModuleEnginesFX>();
                 FlightInputHandler.state.mainThrottle = 1f;
                 e.Activate();
@@ -452,14 +465,22 @@ namespace ProcEngines.KspTests
                 Camera(size * 3.5f, -4, 35, m.part);
                 yield return new WaitForSecondsRealtime(1f);
                 yield return Shot("hot_" + tag);
-                GameEvents.onShowUI.Fire();
                 MeshRenderer bellR = m.part.transform.Find("model/peRoot/peGimbal/peBell").GetComponent<MeshRenderer>();
                 var blk = new MaterialPropertyBlock();
                 bellR.GetPropertyBlock(blk, EngineGeometry.MatRadiative);
                 Color applied = blk.GetColor("_EmissiveColor");
-                Check("visual." + tag, e.EngineIgnited && e.finalThrust > 0 && m.WaterfallStatus.Contains("effects") && (!d.RadiativeExtension || applied.maxColorComponent > 0.2f),
-                    $"burning {e.finalThrust:F0} kN, glow {m.GlowTemperature:F0} K, extension block emissive {applied} (extension {d.RadiativeExtension}), waterfall {m.WaterfallStatus}");
+                Vector4 st = blk.GetVector("_Emissive_ST");
+                bool burning = e.EngineIgnited && e.finalThrust > 0;
+                float thrust = e.finalThrust;
+                // shut down: the plume goes out within a second, the metal stays hot for several
+                e.Shutdown();
                 FlightInputHandler.state.mainThrottle = 0f;
+                CameraOn(bellT, size * 1.3f, -8, 35);
+                yield return new WaitForSecondsRealtime(1.5f);
+                yield return Shot("afterglow_" + tag);
+                GameEvents.onShowUI.Fire();
+                Check("visual." + tag, burning && m.WaterfallStatus.Contains("effects") && (!d.RadiativeExtension || (applied.maxColorComponent > 0.2f && st.y > 0 && st.y < 1)),
+                    $"burning {thrust:F0} kN, glow {m.GlowTemperature:F0} K, extension block emissive {applied} ST {st} (extension {d.RadiativeExtension}), duct {m.DuctGlowColor}, waterfall {m.WaterfallStatus}");
             }
         }
 
