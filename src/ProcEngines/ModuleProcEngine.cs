@@ -16,7 +16,7 @@ namespace ProcEngines
     /// </summary>
     public class ModuleProcEngine : PartModule, IPartMassModifier, IPartCostModifier
     {
-        public const string RootName = "peRoot", GimbalName = "peGimbal", ThrustName = "thrustTransform";
+        public const string RootName = "peRoot", GimbalName = "peGimbal", ThrustName = "thrustTransform", ExhaustName = "peGGExhaust";
 
         // Prefab defaults (part cfg); the live design is held in `design`.
         [KSPField] public string propellant = "Kerolox";
@@ -44,13 +44,19 @@ namespace ProcEngines
         public double LastBuildMs;
         public event Action DesignApplied;
 
-        Transform root, gimbalT, thrustT;
+        Transform root, gimbalT, thrustT, exhaustT;
         MeshFilter staticMF, bellMF, kitMF;
+        string radiativeTech;
+        float glow;
+        MaterialPropertyBlock glowBlock;
+        static readonly int EmissiveColorId = Shader.PropertyToID("_EmissiveColor");
+        public KitBuilder.Result Kit { get; private set; }
+        public float GlowTemperature { get; private set; }
+        public Color GlowColor { get; private set; }
         readonly List<MeshCollider> colliders = new List<MeshCollider>();
         EngineGeometry geometry;
         bool designDirty, meshDirty, slowDirty, ownMeshes, nodesPending;
         float lastChange, lastMesh, lastCapsCheck;
-        static Material steel, copper, niobium, soot;
 
         ModelData Data => KspData.Data;
 
@@ -144,10 +150,11 @@ namespace ProcEngines
 
         void Update()
         {
-            if (HighLogic.LoadedSceneIsFlight && TechLocked)
+            if (HighLogic.LoadedSceneIsFlight)
             {
                 var e = part.Modules.OfType<ModuleEnginesFX>().FirstOrDefault();
-                if (e != null && (e.EngineIgnited || e.getIgnitionState)) e.Shutdown();
+                if (TechLocked && e != null && (e.EngineIgnited || e.getIgnitionState)) e.Shutdown();
+                UpdateGlow(e);
                 return;
             }
             if (!HighLogic.LoadedSceneIsEditor || Design == null) return;
@@ -251,9 +258,35 @@ namespace ProcEngines
                 }
             }
             Integrations.NotifyAero(part);
+            var specs = new List<Integrations.PlumeSpec>();
             Plume plume = Data.PlumeFor(Design.Propellant, Plume.RoleFor(Stats));
             if (plume != null)
-                yield return StartCoroutine(Integrations.ApplyWaterfall(this, plume.Template, (float)(Stats.ExitDiameter / plume.ReferenceDiameter), (float)plume.LengthScale, s => WaterfallStatus = s));
+                specs.Add(new Integrations.PlumeSpec { Template = plume.Template, ParentTransform = ThrustName, Scale = (float)(Stats.ExitDiameter / plume.ReferenceDiameter), LengthScale = (float)plume.LengthScale });
+            Plume exhaust = Data.Plumes.FirstOrDefault(p => p.Propellant == Design.Propellant && p.Role == "exhaust");
+            if (exhaust != null && Kit != null && Kit.HasExhaust)
+                specs.Add(new Integrations.PlumeSpec { Template = exhaust.Template, ParentTransform = ExhaustName, Scale = 2 * Kit.ExhaustRadius / (float)exhaust.ReferenceDiameter, LengthScale = (float)exhaust.LengthScale });
+            if (specs.Count > 0)
+                yield return StartCoroutine(Integrations.ApplyWaterfall(this, specs, s => WaterfallStatus = s));
+        }
+
+        /// <summary>Heat glow on the radiatively cooled extension (DESIGN.md 8.4): a first-order lag on throttle drives
+        /// an approximate wall temperature (niobium ~1700 K, carbon-carbon ~2000 K at full thrust) and its blackbody colour.</summary>
+        void UpdateGlow(ModuleEnginesFX e)
+        {
+            if (e == null || bellMF == null) return;
+            float target = e.EngineIgnited ? e.currentThrottle : 0;
+            if (target == 0 && glow == 0) return;
+            float rate = target > glow ? 0.5f : 0.15f;   // heats in ~2 s, cools in ~7 s
+            glow = Mathf.MoveTowards(glow, target, rate * TimeWarp.deltaTime);
+            bool cc = radiativeTech == "Late";
+            GlowTemperature = 300 + glow * (cc ? 1700 : 1400);
+            GlowColor = EngineMaterials.Glow(GlowTemperature, cc);
+            // Start from KSP's renderer-wide block (highlight rim, opacity) so the per-material block keeps them.
+            var mr = bellMF.GetComponent<MeshRenderer>();
+            if (glowBlock == null) glowBlock = new MaterialPropertyBlock();
+            mr.GetPropertyBlock(glowBlock);
+            glowBlock.SetColor(EmissiveColorId, GlowColor);
+            mr.SetPropertyBlock(glowBlock, EngineGeometry.MatRadiative);
         }
 
         // ------------------------------------------------------------------ engine
@@ -331,13 +364,15 @@ namespace ProcEngines
             {
                 root = new GameObject(RootName).transform;
                 root.SetParent(model, false);
-                staticMF = MakeRenderer(root, "peChamber", 1);
-                kitMF = MakeRenderer(root, "peKit", 1);
+                staticMF = MakeRenderer(root, "peChamber", EngineMaterials.Static());
+                kitMF = MakeRenderer(root, "peKit", EngineMaterials.Kit());
+                exhaustT = new GameObject(ExhaustName).transform;
+                exhaustT.SetParent(root, false);
                 // Gimbal pivot oriented like a stock gimbal transform (+Z down the exhaust); the bell counter-rotates.
                 gimbalT = new GameObject(GimbalName).transform;
                 gimbalT.SetParent(root, false);
                 gimbalT.localRotation = Quaternion.Euler(90f, 0f, 0f);
-                bellMF = MakeRenderer(gimbalT, "peBell", 3);
+                bellMF = MakeRenderer(gimbalT, "peBell", EngineMaterials.Bell("Mid"));
                 bellMF.transform.localRotation = Quaternion.Euler(-90f, 0f, 0f);
                 thrustT = new GameObject(ThrustName).transform;
                 thrustT.SetParent(gimbalT, false);
@@ -354,6 +389,7 @@ namespace ProcEngines
             {
                 staticMF = root.Find("peChamber").GetComponent<MeshFilter>();
                 kitMF = root.Find("peKit").GetComponent<MeshFilter>();
+                exhaustT = root.Find(ExhaustName);
                 gimbalT = root.Find(GimbalName);
                 bellMF = gimbalT.Find("peBell").GetComponent<MeshFilter>();
                 thrustT = gimbalT.Find(ThrustName);
@@ -378,23 +414,23 @@ namespace ProcEngines
             if (part.collider == null) part.collider = colliders[0];
         }
 
-        MeshFilter MakeRenderer(Transform parent, string name, int materials)
+        MeshFilter MakeRenderer(Transform parent, string name, Material[] materials)
         {
             var go = new GameObject(name);
             go.transform.SetParent(parent, false);
             var mf = go.AddComponent<MeshFilter>();
             mf.sharedMesh = new Mesh { name = name };
-            var mr = go.AddComponent<MeshRenderer>();
-            if (steel == null)
-            {
-                Shader sh = Shader.Find("KSP/Specular") ?? Shader.Find("Standard");
-                steel = new Material(sh) { color = new Color(0.56f, 0.57f, 0.6f) };
-                copper = new Material(sh) { color = new Color(0.62f, 0.42f, 0.28f) };
-                niobium = new Material(sh) { color = new Color(0.32f, 0.33f, 0.36f) };
-                soot = new Material(sh) { color = new Color(0.07f, 0.06f, 0.06f) };
-            }
-            mr.sharedMaterials = materials == 3 ? new[] { copper, niobium, soot } : new[] { steel };
+            go.AddComponent<MeshRenderer>().sharedMaterials = materials;
             return mf;
+        }
+
+        /// <summary>The extension material (niobium or carbon-carbon) depends on the tech level.</summary>
+        void UpdateBellMaterials()
+        {
+            string tech = Design.Tech ?? "Mid";
+            if (radiativeTech == tech) return;
+            bellMF.GetComponent<MeshRenderer>().sharedMaterials = EngineMaterials.Bell(tech);
+            radiativeTech = tech;
         }
 
         public void RebuildMesh()
@@ -402,12 +438,15 @@ namespace ProcEngines
             if (Stats == null) return;
             TechLevel tech = Data.TechLevels.TryGetValue(Design.Tech ?? "Mid", out TechLevel t) ? t : null;
             geometry = EngineGeometry.Build(Design, Stats, tech);
-            int seg = Mathf.Clamp(Mathf.CeilToInt(2 * Mathf.PI * geometry.MaxRadius / 0.06f), 16, 64);
-            EngineGeometry.Lathe(staticMF.sharedMesh, geometry.StaticSegments, null, 1, seg, 0f);
-            EngineGeometry.Lathe(bellMF.sharedMesh, geometry.BellSegments, geometry.BellSegmentMaterial, 3, seg, geometry.YThroat);
-            EngineGeometry.BuildKit(kitMF.sharedMesh, Design, Stats, geometry);
+            int seg = Mathf.Clamp(Mathf.CeilToInt(2 * Mathf.PI * geometry.MaxRadius / 0.05f), 24, 72);
+            EngineGeometry.Lathe(staticMF.sharedMesh, geometry.Static, 2, seg, 0f);
+            EngineGeometry.Lathe(bellMF.sharedMesh, geometry.Bell, 3, seg, geometry.YThroat);
+            Kit = KitBuilder.Build(kitMF.sharedMesh, Design, Stats, geometry, Data);
+            if (HighLogic.LoadedScene != GameScenes.LOADING) UpdateBellMaterials();
             gimbalT.localPosition = new Vector3(0, geometry.YThroat, 0);
             thrustT.localPosition = new Vector3(0, 0, geometry.YThroat - geometry.YExit);
+            exhaustT.localPosition = Kit.HasExhaust ? Kit.ExhaustPosition : new Vector3(0, geometry.YExit, 0);
+            exhaustT.localRotation = Quaternion.LookRotation(Vector3.down, Vector3.forward);   // +Z down the exhaust, like thrustTransform
             MeshRebuilds++;
         }
 

@@ -5,18 +5,51 @@ using UnityEngine;
 
 namespace ProcEngines
 {
+    /// <summary>One smooth surface of revolution: an (r, y) polyline with its material and UV tiling.</summary>
+    public sealed class ProfileSegment
+    {
+        public List<Vector2> Points;
+        public int Material;
+        public float UTiles = 1;     // texture repeats around the circumference: whole number of cooling tubes
+        public float VLength = 1;    // metres of arc length per texture repeat along the profile
+
+        public ProfileSegment(List<Vector2> pts, int material, float uTiles = 1, float vLength = 1)
+        {
+            Points = pts; Material = material; UTiles = uTiles; VLength = Mathf.Max(vLength, 1e-3f);
+        }
+    }
+
     /// <summary>
-    /// Builds the engine's meshes from DESIGN + STATS. Part frame: +Y up, origin at the mount top (= top node,
+    /// Builds the engine's surfaces from DESIGN + STATS. Part frame: +Y up, origin at the mount top (= top node,
     /// which therefore never moves). Deterministic: every LMP client builds the same mesh from the same node.
     /// </summary>
     public sealed class EngineGeometry
     {
-        public float YInjector, YThroat, YExit, MountRadius, MaxRadius;
-        public readonly List<List<Vector2>> StaticSegments = new List<List<Vector2>>();   // (r, y) polylines; each one a smooth surface
-        public readonly List<List<Vector2>> BellSegments = new List<List<Vector2>>();
-        public readonly List<int> BellSegmentMaterial = new List<int>();   // 0 regen, 1 radiative extension, 2 inner/soot
-        public float RegenEndY;
+        // static mesh materials
+        public const int MatSteel = 0, MatCopper = 1;
+        // bell mesh materials
+        public const int MatRegen = 0, MatRadiative = 1, MatSoot = 2;
+
+        public float YInjector, YThroat, YExit, YChamberBottom, MountRadius, MountHeight, DomeHeight, MaxRadius, ChamberRadius, ThroatRadius;
+        public readonly List<ProfileSegment> Static = new List<ProfileSegment>();
+        public readonly List<ProfileSegment> Bell = new List<ProfileSegment>();
+        public readonly List<Vector2> BellOuter = new List<Vector2>();   // throat to exit, outer wall (r, y), for kit clearance
+        public float RegenEndY, RegenEndRadius;
+        public int TubeCount;
         public Vector2 ColliderChamberTop, ColliderChamberBottom, ColliderMid, ColliderExit, ColliderThroat;   // (r, y)
+
+        /// <summary>Outer bell radius at height y (0 above the throat).</summary>
+        public float BellRadiusAt(float y)
+        {
+            for (int i = 1; i < BellOuter.Count; i++)
+                if (BellOuter[i].y <= y)
+                {
+                    Vector2 a = BellOuter[i - 1], b = BellOuter[i];
+                    float t = Mathf.Approximately(a.y, b.y) ? 1 : (y - a.y) / (b.y - a.y);
+                    return Mathf.Lerp(a.x, b.x, Mathf.Clamp01(t));
+                }
+            return BellOuter.Count > 0 ? BellOuter[BellOuter.Count - 1].x : 0;
+        }
 
         public static EngineGeometry Build(EngineDesign d, EngineStats s, TechLevel tech)
         {
@@ -25,27 +58,34 @@ namespace ProcEngines
             float mountR = Mathf.Max(0.7f * rc, 1.2f * rt);
             float mountH = 0.12f * rc + 0.02f;
             float domeH = 0.35f * rc;
-            g.MountRadius = mountR;
+            g.MountRadius = mountR; g.MountHeight = mountH; g.DomeHeight = domeH; g.ChamberRadius = rc; g.ThroatRadius = rt;
             float yInj = -(mountH + domeH);
             g.YInjector = yInj;
+            float steelV = Mathf.Max(0.25f, 2 * Mathf.PI * rc / 4);
 
-            // mount plate (top face, side) and injector dome down to the chamber
-            g.StaticSegments.Add(Line(0, 0, mountR, 0, 4));
-            g.StaticSegments.Add(Line(mountR, 0, mountR, -mountH, 2));
-            g.StaticSegments.Add(Line(mountR, -mountH, Mathf.Max(mountR, 0.5f * rc), -mountH, 2));
-            var dome = new List<Vector2>();
+            // mount plate (top face, side, underside) and injector dome down to the chamber
+            g.Static.Add(new ProfileSegment(Line(0, 0, mountR, 0, 4), MatSteel, 4, steelV));
+            g.Static.Add(new ProfileSegment(Line(mountR, 0, mountR, -mountH, 2), MatSteel, 8, steelV));
             float r0 = Mathf.Max(mountR, 0.5f * rc);
+            g.Static.Add(new ProfileSegment(Line(mountR, -mountH, r0, -mountH, 2), MatSteel, 8, steelV));
+            var dome = new List<Vector2>();
             for (int i = 0; i <= 10; i++)
             {
                 float t = i / 10f * Mathf.PI / 2;
                 dome.Add(new Vector2(r0 + (rc - r0) * Mathf.Sin(t), -mountH - domeH * (1 - Mathf.Cos(t))));
             }
-            g.StaticSegments.Add(dome);
-            // chamber cylinder
+            g.Static.Add(new ProfileSegment(dome, MatSteel, 8, steelV));
+
+            // whole number of cooling tubes, constant along the length (they taper with the wall), DESIGN.md 8.4
+            g.TubeCount = Mathf.Clamp(Mathf.RoundToInt(2 * Mathf.PI * rc / 0.035f) * 2, 24, 240);
+            float tubeV = 1000f;   // tubes run along the flow: no repeat along V
+
+            // chamber cylinder: steel jacket over the regen liner
             float yConvStart = yInj - lc;
-            g.StaticSegments.Add(Line(rc, yInj, rc, yConvStart, 4));
-            // convergent: 30-degree cone, then a 1.5 Rt arc into the throat (nozzle frame x along the flow)
-            float xArc = -0.75f * rt, rArc = 2.5f * rt - 1.5f * rt * Mathf.Sin(60 * Mathf.Deg2Rad);
+            g.YChamberBottom = yConvStart;
+            g.Static.Add(new ProfileSegment(Line(rc, yInj, rc, yConvStart, 4), MatSteel, 8, steelV));
+            // convergent: 30-degree cone, then a 1.5 Rt arc into the throat (copper regen section)
+            float rArc = 2.5f * rt - 1.5f * rt * Mathf.Sin(60 * Mathf.Deg2Rad);
             float coneLen = Mathf.Max(rc - rArc, 0) / Mathf.Tan(30 * Mathf.Deg2Rad);
             float yThroat = yConvStart - coneLen - 0.75f * rt;
             g.YThroat = yThroat;
@@ -55,7 +95,7 @@ namespace ProcEngines
                 float th = (-120f + 30f * i / 12f) * Mathf.Deg2Rad;
                 conv.Add(new Vector2(2.5f * rt + 1.5f * rt * Mathf.Sin(th), yThroat - 1.5f * rt * Mathf.Cos(th)));
             }
-            g.StaticSegments.Add(conv);
+            g.Static.Add(new ProfileSegment(conv, MatCopper, g.TubeCount, tubeV));
 
             // bell: Rao contour in Rt units (x from the throat), split at the regen limit
             var contour = new NozzleContour(d.Eps, d.LengthFraction, d.Conical);
@@ -65,30 +105,31 @@ namespace ProcEngines
             foreach (WallPoint w in contour.Wall)
             {
                 var p = new Vector2((float)w.R * rt, yThroat - (float)w.X * rt);
+                g.BellOuter.Add(p);
                 if (w.R * w.R <= regenEps + 1e-6) regen.Add(p);
                 else { if (rad.Count == 0 && regen.Count > 0) rad.Add(regen[regen.Count - 1]); rad.Add(p); }
             }
-            g.BellSegments.Add(regen); g.BellSegmentMaterial.Add(0);
-            if (rad.Count > 1) { g.BellSegments.Add(rad); g.BellSegmentMaterial.Add(1); }
+            g.Bell.Add(new ProfileSegment(regen, MatRegen, g.TubeCount, tubeV));
+            float radV = Mathf.Max(0.3f, (float)(2 * Math.PI * rt * Math.Sqrt(d.Eps)) / 6);
+            if (rad.Count > 1) g.Bell.Add(new ProfileSegment(rad, MatRadiative, 6, radV));
             g.RegenEndY = regen[regen.Count - 1].y;
-            Vector2 exit = (rad.Count > 1 ? rad : regen)[(rad.Count > 1 ? rad : regen).Count - 1];
+            g.RegenEndRadius = regen[regen.Count - 1].x;
+            Vector2 exit = g.BellOuter[g.BellOuter.Count - 1];
             g.YExit = exit.y;
             float wall = Mathf.Max(0.012f * exit.x, 0.004f);
             // lip and inner wall (soot), back to the throat, then a plug across the throat
-            g.BellSegments.Add(Line(exit.x, exit.y, exit.x - wall, exit.y, 1)); g.BellSegmentMaterial.Add(2);
+            g.Bell.Add(new ProfileSegment(Line(exit.x, exit.y, exit.x - wall, exit.y, 1), MatSoot, 8, 1));
             var inner = new List<Vector2>();
-            var all = new List<Vector2>(regen);
-            if (rad.Count > 1) all.AddRange(rad.GetRange(1, rad.Count - 1));
-            for (int i = all.Count - 1; i >= 0; i--) inner.Add(new Vector2(Mathf.Max(all[i].x - wall, 0.001f), all[i].y));
-            g.BellSegments.Add(inner); g.BellSegmentMaterial.Add(2);
-            g.BellSegments.Add(Line(inner[inner.Count - 1].x, yThroat, 0, yThroat, 1)); g.BellSegmentMaterial.Add(2);
+            for (int i = g.BellOuter.Count - 1; i >= 0; i--) inner.Add(new Vector2(Mathf.Max(g.BellOuter[i].x - wall, 0.001f), g.BellOuter[i].y));
+            g.Bell.Add(new ProfileSegment(inner, MatSoot, 8, Mathf.Max(0.3f, exit.x)));
+            g.Bell.Add(new ProfileSegment(Line(inner[inner.Count - 1].x, yThroat, 0, yThroat, 1), MatSoot, 1, 1));
 
             g.MaxRadius = Mathf.Max(exit.x, rc, mountR);
-            int mid = all.Count / 2;
+            int mid = g.BellOuter.Count / 2;
             g.ColliderChamberTop = new Vector2(Mathf.Max(rc, mountR), 0);
             g.ColliderChamberBottom = conv[conv.Count / 2];
             g.ColliderThroat = new Vector2(rt, yThroat);
-            g.ColliderMid = all[mid];
+            g.ColliderMid = g.BellOuter[mid];
             g.ColliderExit = exit;
             return g;
         }
@@ -102,9 +143,10 @@ namespace ProcEngines
 
         // ------------------------------------------------------------------ lathe
 
-        /// <summary>Revolve polylines around Y into one mesh; one submesh per material index. Normals come from the
-        /// profile tangent (central differences along each smooth segment); segment joints are creases.</summary>
-        public static void Lathe(Mesh mesh, List<List<Vector2>> segments, List<int> materials, int materialCount, int ringSegments, float yOffset)
+        /// <summary>Revolve profile segments around Y into one mesh, one submesh per material. Normals come from the
+        /// profile tangent (central differences along each smooth segment); segment joints are creases. U repeats
+        /// UTiles times around (seam vertex duplicated), V runs along the arc length.</summary>
+        public static void Lathe(Mesh mesh, List<ProfileSegment> segments, int materialCount, int ringSegments, float yOffset)
         {
             var verts = new List<Vector3>();
             var norms = new List<Vector3>();
@@ -113,13 +155,10 @@ namespace ProcEngines
             var tris = new List<int>[materialCount];
             for (int m = 0; m < materialCount; m++) tris[m] = new List<int>();
             int ring = ringSegments + 1;
-            for (int s = 0; s < segments.Count; s++)
+            foreach (ProfileSegment segment in segments)
             {
-                List<Vector2> seg = segments[s];
+                List<Vector2> seg = segment.Points;
                 if (seg.Count < 2) continue;
-                int mat = materials == null ? 0 : materials[s];
-                float total = 0;
-                for (int i = 1; i < seg.Count; i++) total += (seg[i] - seg[i - 1]).magnitude;
                 float acc = 0;
                 int baseIndex = verts.Count;
                 for (int i = 0; i < seg.Count; i++)
@@ -135,7 +174,7 @@ namespace ProcEngines
                         verts.Add(new Vector3(seg[i].x * c, seg[i].y - yOffset, seg[i].x * sn));
                         norms.Add(new Vector3(n2.x * c, n2.y, n2.x * sn));
                         tans.Add(new Vector4(-sn, 0, c, -1));
-                        uvs.Add(new Vector2((float)j / ringSegments, total > 0 ? acc / total : 0));
+                        uvs.Add(new Vector2(segment.UTiles * j / ringSegments, acc / segment.VLength));
                     }
                 }
                 var t = new List<int>();
@@ -150,7 +189,7 @@ namespace ProcEngines
                     }
                 }
                 FixWinding(verts, norms, t);
-                tris[mat].AddRange(t);
+                tris[Math.Min(segment.Material, materialCount - 1)].AddRange(t);
             }
             mesh.Clear();
             mesh.indexFormat = verts.Count > 65000 ? UnityEngine.Rendering.IndexFormat.UInt32 : UnityEngine.Rendering.IndexFormat.UInt16;
@@ -163,7 +202,7 @@ namespace ProcEngines
             mesh.RecalculateBounds();
         }
 
-        static void FixWinding(List<Vector3> v, List<Vector3> n, List<int> tris)
+        public static void FixWinding(List<Vector3> v, List<Vector3> n, List<int> tris)
         {
             int agree = 0, disagree = 0;
             for (int t = 0; t < tris.Count; t += 3)
@@ -199,97 +238,6 @@ namespace ProcEngines
             mesh.vertices = v;
             mesh.triangles = t.ToArray();
             mesh.RecalculateBounds();
-        }
-
-        // ------------------------------------------------------------------ kit pieces (visual only)
-
-        /// <summary>Primitive turbomachinery / pressurant pieces per cycle (DESIGN.md 8.5), combined into one mesh.</summary>
-        public static void BuildKit(Mesh mesh, EngineDesign d, EngineStats s, EngineGeometry g)
-        {
-            var parts = new List<CombineInstance>();
-            float rc = (float)s.ChamberRadius;
-            double turboKg = s.MassBreakdown.TryGetValue("turbomachinery", out double tk) ? tk : 0;
-            double pressKg = s.MassBreakdown.TryGetValue("pressurant", out double pk) ? pk : 0;
-            float yTop = -0.02f;
-            // pump size from turbomachinery mass: a cylinder of length 2r at ~3000 kg/m^3 effective density
-            float Pump(double kg) => Mathf.Clamp(Mathf.Pow((float)(kg / (3000 * 2 * Mathf.PI)), 1f / 3f), 0.03f, 1.5f);
-            void Cyl(float r, float h, Vector3 pos, Quaternion rot) => parts.Add(new CombineInstance { mesh = Cylinder(r, h), transform = Matrix4x4.TRS(pos, rot, Vector3.one) });
-            void Sph(float r, Vector3 pos) => parts.Add(new CombineInstance { mesh = Sphere(r), transform = Matrix4x4.TRS(pos, Quaternion.identity, Vector3.one) });
-            Vector3 Around(float angleDeg, float radius, float y) => new Vector3(radius * Mathf.Cos(angleDeg * Mathf.Deg2Rad), y, radius * Mathf.Sin(angleDeg * Mathf.Deg2Rad));
-
-            switch (d.Cycle)
-            {
-                case "PressureFed":
-                {
-                    float rb = Mathf.Clamp(Mathf.Pow((float)(pressKg / (800 * 4.19f)), 1f / 3f), 0.03f, 1.2f);
-                    Sph(rb, Around(0, rc + rb + 0.01f, yTop - rb));
-                    Sph(rb, Around(180, rc + rb + 0.01f, yTop - rb));
-                    break;
-                }
-                case "GasGenerator":
-                {
-                    float rp = Pump(turboKg);
-                    Vector3 pump = Around(0, rc + rp * 1.1f, yTop - rp * 1.2f);
-                    Cyl(rp, 2 * rp, pump, Quaternion.identity);
-                    Sph(rp * 0.45f, Around(60, rc + rp * 0.5f, yTop - rp * 0.6f));   // gas generator
-                    // turbine exhaust duct down beside the bell (its own small plume lives at its end later)
-                    float ductR = rp * 0.25f, ductLen = Mathf.Max(0.6f * (pump.y - g.YThroat), 0.05f);
-                    Cyl(ductR, ductLen, new Vector3(pump.x + rp * 0.3f, pump.y - rp - ductLen / 2, pump.z), Quaternion.identity);
-                    break;
-                }
-                case "Expander":
-                {
-                    float rp = Pump(turboKg);
-                    Cyl(rp, 2 * rp, Around(0, rc + rp * 1.1f, yTop - rp * 1.2f), Quaternion.identity);
-                    break;
-                }
-                case "StagedCombustion":
-                {
-                    float rp = Pump(turboKg);
-                    Vector3 pump = Around(0, rc + rp * 1.1f, yTop - rp * 1.3f);
-                    Cyl(rp, 2.2f * rp, pump, Quaternion.identity);
-                    Sph(rp * 0.6f, pump + new Vector3(0, rp * 0.9f, 0));          // preburner on top
-                    Cyl(rp * 0.3f, rc + rp, new Vector3(pump.x * 0.5f, yTop - rp * 0.3f, 0), Quaternion.Euler(0, 0, 90));   // hot-gas duct
-                    break;
-                }
-                case "FullFlowStaged":
-                {
-                    float rp = Pump(turboKg / 2);
-                    foreach (float a in new[] { 0f, 180f })
-                    {
-                        Vector3 pump = Around(a, rc + rp * 1.1f, yTop - rp * 1.3f);
-                        Cyl(rp, 2.2f * rp, pump, Quaternion.identity);
-                        Sph(rp * 0.6f, pump + new Vector3(0, rp * 0.9f, 0));
-                    }
-                    break;
-                }
-            }
-            mesh.Clear();
-            if (parts.Count > 0) mesh.CombineMeshes(parts.ToArray(), true, true);
-            foreach (CombineInstance ci in parts) UnityEngine.Object.Destroy(ci.mesh);
-            mesh.RecalculateBounds();
-        }
-
-        static Mesh Cylinder(float r, float h)
-        {
-            var m = new Mesh();
-            var segs = new List<List<Vector2>>
-            {
-                new List<Vector2> { new Vector2(0, h / 2), new Vector2(r, h / 2) },
-                new List<Vector2> { new Vector2(r, h / 2), new Vector2(r, -h / 2) },
-                new List<Vector2> { new Vector2(r, -h / 2), new Vector2(0, -h / 2) },
-            };
-            Lathe(m, segs, null, 1, 16, 0);
-            return m;
-        }
-
-        static Mesh Sphere(float r)
-        {
-            var m = new Mesh();
-            var arc = new List<Vector2>();
-            for (int i = 0; i <= 10; i++) { float t = Mathf.PI * i / 10; arc.Add(new Vector2(r * Mathf.Sin(t), r * Mathf.Cos(t))); }
-            Lathe(m, new List<List<Vector2>> { arc }, null, 1, 16, 0);
-            return m;
         }
     }
 }

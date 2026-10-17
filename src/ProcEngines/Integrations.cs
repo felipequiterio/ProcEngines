@@ -30,25 +30,34 @@ namespace ProcEngines
         /// Waterfall (flight only): once ModuleWaterfallFX has started, OnLoad with a TEMPLATE node replaces the
         /// templates and re-initializes the effects. Position is always written (Waterfall defaults it to 1,1,1).
         /// </summary>
-        public static IEnumerator ApplyWaterfall(PartModule host, string template, float scale, float lengthScale, Action<string> report)
+        public struct PlumeSpec
+        {
+            public string Template, ParentTransform;
+            public float Scale, LengthScale;
+        }
+
+        public static IEnumerator ApplyWaterfall(PartModule host, System.Collections.Generic.IList<PlumeSpec> plumes, Action<string> report)
         {
             PartModule wf = host.part.Modules.Cast<PartModule>().FirstOrDefault(m => m.moduleName == "ModuleWaterfallFX");
-            if (wf == null || string.IsNullOrEmpty(template)) { report?.Invoke("no Waterfall"); yield break; }
+            if (wf == null || plumes.Count == 0) { report?.Invoke("no Waterfall"); yield break; }
             FieldInfo started = wf.GetType().GetField("started", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
             for (int i = 0; i < 300 && started != null && !(bool)started.GetValue(wf); i++) yield return null;
             var n = new ConfigNode("MODULE");
-            ConfigNode t = n.AddNode("TEMPLATE");
-            t.AddValue("templateName", template);
-            t.AddValue("overrideParentTransform", ModuleProcEngine.ThrustName);
-            t.AddValue("position", "0,0,0");
-            t.AddValue("rotation", "0,0,0");
-            string sc = scale.ToString("R", System.Globalization.CultureInfo.InvariantCulture);
-            string sl = (scale * lengthScale).ToString("R", System.Globalization.CultureInfo.InvariantCulture);
-            t.AddValue("scale", sc + "," + sc + "," + sl);
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            foreach (PlumeSpec p in plumes)
+            {
+                ConfigNode t = n.AddNode("TEMPLATE");
+                t.AddValue("templateName", p.Template);
+                t.AddValue("overrideParentTransform", p.ParentTransform);
+                t.AddValue("position", "0,0,0");
+                t.AddValue("rotation", "0,0,0");
+                string sc = p.Scale.ToString("R", inv), sl = (p.Scale * p.LengthScale).ToString("R", inv);
+                t.AddValue("scale", sc + "," + sc + "," + sl);
+            }
             try { wf.OnLoad(n); }
             catch (Exception e) { report?.Invoke("Waterfall OnLoad threw " + e.Message); yield break; }
             var fx = wf.GetType().GetProperty("FX")?.GetValue(wf) as IList;
-            report?.Invoke($"{template} x{scale:F2} ({fx?.Count ?? -1} effects)");
+            report?.Invoke(string.Join(" + ", plumes.Select(p => $"{p.Template} x{p.Scale:F2}")) + $" ({fx?.Count ?? -1} effects)");
         }
     }
 }

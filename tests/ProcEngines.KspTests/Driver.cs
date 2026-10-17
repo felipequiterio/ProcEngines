@@ -48,7 +48,7 @@ namespace ProcEngines.KspTests
         {
             while (HighLogic.LoadedScene != GameScenes.MAINMENU) yield return null;
             yield return new WaitForSecondsRealtime(4f);
-            IEnumerator body = script == "career" ? Career() : script == "lmpA" ? LmpA() : script == "lmpB" ? LmpB() : Sandbox();
+            IEnumerator body = script == "career" ? Career() : script == "lmpA" ? LmpA() : script == "lmpB" ? LmpB() : script == "visual" ? Visual() : script == "plumes" ? Plumes() : Sandbox();
             yield return StartCoroutine(Guard(body));
             Info("end", $"{passes} passed, {fails} failed");
             results.Close();
@@ -271,6 +271,35 @@ namespace ProcEngines.KspTests
             Check("designer.open", DesignerWindow.IsOpen, "designer window open");
             yield return Shot("designer");
 
+            // drag handles: drag along rays through known points on each handle's axis
+            EngineHandles hs = EngineHandles.Instance;
+            Camera ecam = EditorLogic.fetch.editorCamera;
+            Ray RayTo(EngineHandles.Handle h, float value) { Vector3 w = m.part.transform.TransformPoint(h.Origin + h.Axis * value); return new Ray(ecam.transform.position, w - ecam.transform.position); }
+            var handles = EngineHandles.HandlesFor(m);
+            Info("handles", string.Join("; ", handles.Select(h => $"{h.Id} value {h.Value:F3} screen {ecam.WorldToScreenPoint(h.WorldPosition(m.part))}")));
+            EngineDesign before = Serialization.LoadDesign(Serialization.SaveDesign(m.Design));
+            EngineHandles.Handle exitH = handles.First(h => h.Id == "exit");
+            hs.DragTo("exit", RayTo(exitH, exitH.Value * 1.5f));
+            hs.EndDrag();
+            yield return new WaitForSecondsRealtime(1.2f);
+            double epsRatio = m.Design.Eps / before.Eps;
+            handles = EngineHandles.HandlesFor(m);
+            EngineHandles.Handle thrustH = handles.First(h => h.Id == "thrust");
+            EngineDesign mid = Serialization.LoadDesign(Serialization.SaveDesign(m.Design));
+            hs.DragTo("thrust", RayTo(thrustH, thrustH.Value * 1.2f));
+            hs.EndDrag();
+            yield return new WaitForSecondsRealtime(1.2f);
+            double thrustRatio = m.Design.ThrustVac / mid.ThrustVac;
+            handles = EngineHandles.HandlesFor(m);
+            EngineHandles.Handle lenH = handles.First(h => h.Id == "length");
+            double cone = (Math.Sqrt(m.Design.Eps) - 1) * m.Stats.ThroatRadius / Math.Tan(15 * Math.PI / 180);
+            hs.DragTo("length", RayTo(lenH, (float)(0.9 * cone)));
+            hs.EndDrag();
+            yield return new WaitForSecondsRealtime(1.2f);
+            yield return Shot("handles");
+            Check("handles", Math.Abs(epsRatio - 2.25) < 0.02 && Math.Abs(thrustRatio - 1.44) < 0.03 && Math.Abs(m.Design.LengthFraction - 0.9) < 0.01 && m.Design.Pc == before.Pc,
+                $"exit x1.5 -> eps x{epsRatio:F3} (exp 2.25); chamber x1.2 -> thrust x{thrustRatio:F3} (exp 1.44); length -> {m.Design.LengthFraction:F3} (exp 0.90); Pc unchanged {m.Design.Pc}");
+
             // library: save as subassembly, read back
             string msg = DesignLibrary.SaveAsSubassembly(m);
             string path = Path.Combine(KSPUtil.ApplicationRootPath, "saves", HighLogic.SaveFolder, "Subassemblies", DesignLibrary.FileNameFor(m.designName) + ".craft");
@@ -327,6 +356,133 @@ namespace ProcEngines.KspTests
             yield return new WaitForSecondsRealtime(2f);
             Check("flight.burn", e.finalThrust > 0.5f * (float)m.Stats.ThrustSL && m.WaterfallStatus.Contains("effects"), $"finalThrust {e.finalThrust:F1} kN (SL {m.Stats.ThrustSL:F1}); waterfall {m.WaterfallStatus}");
             yield return Shot("flight_burn");
+            FlightInputHandler.state.mainThrottle = 0f;
+        }
+
+        // ------------------------------------------------------------------ visual checks (Phase 3)
+
+        List<CP> BigTankCraft(string probe)
+        {
+            string tank = FirstAvailable("Rockomax64.BW", "Rockomax64_BW", "Rockomax32.BW", "Rockomax32_BW", "fuelTank");
+            return new List<CP>
+            {
+                new CP(probe),
+                new CP(tank) { parent = 0, pNode = "bottom", myNode = "top" },
+                new CP(PartName) { parent = 1, pNode = "bottom", myNode = "top" },
+            };
+        }
+
+        IEnumerator LaunchFrozen(string craftPath)
+        {
+            FlightDriver.StartWithNewLaunch(craftPath, "Squad/Flags/default", "LaunchPad", new VesselCrewManifest());
+            yield return WaitScene(GameScenes.FLIGHT);
+            float t0 = Time.realtimeSinceStartup;
+            while ((FlightGlobals.ActiveVessel == null || FlightGlobals.ActiveVessel.packed) && Time.realtimeSinceStartup - t0 < 60) yield return null;
+            yield return new WaitForSecondsRealtime(3f);
+            // lift the craft clear of the pad and its flame trench, then freeze it
+            Vessel v = FlightGlobals.ActiveVessel;
+            v.SetPosition(v.transform.position + (v.transform.position - v.mainBody.position).normalized * 15f);
+            foreach (Part p in v.parts) if (p.Rigidbody != null) p.Rigidbody.isKinematic = true;
+            CheatOptions.InfinitePropellant = true;   // stock tanks hold no LqdMethane/LqdHydrogen
+            yield return new WaitForSecondsRealtime(1f);
+        }
+
+        void Camera(float distance, float pitchDeg, float hdgDeg, Part target = null)
+        {
+            FlightCamera c = FlightCamera.fetch;
+            if (target != null) FlightCamera.SetTarget(target);
+            c.SetDistance(distance);
+            c.camPitch = pitchDeg * Mathf.Deg2Rad;
+            c.camHdg = hdgDeg * Mathf.Deg2Rad;
+        }
+
+        IEnumerator Visual()
+        {
+            yield return NewGame("procengines_visual", Game.Modes.SANDBOX);
+            yield return EnterEditor();
+            string probe = FirstAvailable("probeCoreOcto", "probeCoreOcto.v2");
+            var combos = new[]
+            {
+                ("KeroloxGG", D("Kerolox", "GasGenerator", 900, 97, 16)),
+                ("KeroloxSC", D("Kerolox", "StagedCombustion", 2000, 250, 37)),
+                ("MethaloxFFSC", D("Methalox", "FullFlowStaged", 2300, 300, 34)),
+                ("HydroloxExpRad", D("Hydrolox", "Expander", 110, 44, 250, true)),
+                ("KeroloxGGVacRad", D("Kerolox", "GasGenerator", 980, 97, 150, true)),
+                ("KeroloxPF", D("Kerolox", "PressureFed", 78, 21, 40)),
+            };
+            foreach (var (tag, d) in combos)
+            {
+                if (HighLogic.LoadedScene != GameScenes.EDITOR) yield return EnterEditor();
+                string path = WriteCraft("PE_Vis_" + tag, BigTankCraft(probe));
+                yield return LoadCraft(path);
+                ModuleProcEngine m = Engine(EditorLogic.fetch.ship.parts);
+                m.SetDesign(d);
+                yield return new WaitForSecondsRealtime(1.5f);
+                Info("visual." + tag, $"kit verts {m.part.transform.Find("model/peRoot/peKit").GetComponent<MeshFilter>().sharedMesh.vertexCount}, exhaust {m.Kit?.HasExhaust}, tubes {m.Stats.ExitDiameter:F2} m exit, materials {EngineMaterials.ShaderReport}");
+                EditorLogic.fetch.ship.SaveShip().Save(path);
+                yield return LaunchFrozen(path);
+                m = Engine(FlightGlobals.ActiveVessel.parts);
+                float size = (float)Math.Max(m.Stats.TotalLength, m.Stats.ExitDiameter);
+                GameEvents.onHideUI.Fire();
+                Camera(size * 2.0f, -6, 35, m.part);
+                yield return new WaitForSecondsRealtime(1.5f);
+                yield return Shot("cold_" + tag);
+                var e = m.part.FindModuleImplementing<ModuleEnginesFX>();
+                FlightInputHandler.state.mainThrottle = 1f;
+                e.Activate();
+                yield return new WaitForSecondsRealtime(5f);
+                Camera(size * 3.5f, -4, 35, m.part);
+                yield return new WaitForSecondsRealtime(1f);
+                yield return Shot("hot_" + tag);
+                GameEvents.onShowUI.Fire();
+                MeshRenderer bellR = m.part.transform.Find("model/peRoot/peGimbal/peBell").GetComponent<MeshRenderer>();
+                var blk = new MaterialPropertyBlock();
+                bellR.GetPropertyBlock(blk, EngineGeometry.MatRadiative);
+                Color applied = blk.GetColor("_EmissiveColor");
+                Check("visual." + tag, e.EngineIgnited && e.finalThrust > 0 && m.WaterfallStatus.Contains("effects") && (!d.RadiativeExtension || applied.maxColorComponent > 0.2f),
+                    $"burning {e.finalThrust:F0} kN, glow {m.GlowTemperature:F0} K, extension block emissive {applied} (extension {d.RadiativeExtension}), waterfall {m.WaterfallStatus}");
+                FlightInputHandler.state.mainThrottle = 0f;
+            }
+        }
+
+        /// <summary>Calibration rig: each Waterfall template at scale 1 on a nozzle with a 1.000 m exit, side view.</summary>
+        IEnumerator Plumes()
+        {
+            yield return NewGame("procengines_plumes", Game.Modes.SANDBOX);
+            yield return EnterEditor();
+            string probe = FirstAvailable("probeCoreOcto", "probeCoreOcto.v2");
+            string path = WriteCraft("PE_Plumes", BigTankCraft(probe));
+            yield return LoadCraft(path);
+            ModuleProcEngine m = Engine(EditorLogic.fetch.ship.parts);
+            // find the thrust that gives a 1.000 m exit at Pc 70, eps 12 (De ~ sqrt(F))
+            double f = 300;
+            for (int i = 0; i < 6; i++)
+            {
+                EngineStats s = EngineModel.Compute(D("Kerolox", "GasGenerator", f, 30, 12), KspData.Data);
+                f *= Math.Pow(1.0 / s.ExitDiameter, 2);
+            }
+            m.SetDesign(D("Kerolox", "GasGenerator", f, 30, 12));
+            yield return new WaitForSecondsRealtime(1.5f);
+            Info("plumes", $"rig engine {f:F1} kN, exit {m.Stats.ExitDiameter:F4} m");
+            EditorLogic.fetch.ship.SaveShip().Save(path);
+            yield return LaunchFrozen(path);
+            m = Engine(FlightGlobals.ActiveVessel.parts);
+            var e = m.part.FindModuleImplementing<ModuleEnginesFX>();
+            FlightInputHandler.state.mainThrottle = 1f;
+            e.Activate();
+            yield return new WaitForSecondsRealtime(2f);
+            foreach (Plume p in KspData.Data.Plumes.Where(x => x.Role != "exhaust").Concat(KspData.Data.Plumes.Where(x => x.Role == "exhaust")))
+            {
+                string status = "";
+                yield return StartCoroutine(Integrations.ApplyWaterfall(m, new List<Integrations.PlumeSpec> { new Integrations.PlumeSpec { Template = p.Template, ParentTransform = ModuleProcEngine.ThrustName, Scale = 1, LengthScale = 1 } }, s => status = s));
+                yield return new WaitForSecondsRealtime(3f);
+                GameEvents.onHideUI.Fire();
+                Camera(5f, 0, 90, m.part);
+                yield return new WaitForSecondsRealtime(1f);
+                yield return Shot($"plume_{p.Propellant}_{p.Role}");
+                GameEvents.onShowUI.Fire();
+                Info("plumes." + p.Template, status);
+            }
             FlightInputHandler.state.mainThrottle = 0f;
         }
 

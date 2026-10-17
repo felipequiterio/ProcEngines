@@ -1,0 +1,57 @@
+# ProcEngines Phase 3: visual pass, status
+
+Date: 2026-10-17. Phase 3 of [DESIGN.md](DESIGN.md) §14. Repository: https://github.com/felipequiterio/ProcEngines (private).
+
+**Status:** the visual pass is done for everything that doesn't need authored art:
+
+- materials and the heat glow;
+- turbomachinery and plumbing kit pieces for every cycle;
+- GG turbine exhaust duct with its own plume;
+- calibrated Waterfall plume sizes;
+- in-scene drag handles.
+
+All checks pass in game:
+
+| Run | Result |
+|---|---|
+| sandbox (ksp_test_A) | 22/22, including the handles |
+| visual (ksp_test_B) | 6/6 |
+| career (ksp_test_B, regression) | 6/6 |
+| unit tests | 25/25 |
+
+Template-vertex-deformed kit pieces, the TexturesUnlimited path and LOD are not done (see the end).
+
+## What changed
+
+| Area | Implementation |
+|---|---|
+| Materials (`EngineMaterials.cs`) | All textures are generated in code: no texture assets, nothing borrowed from other mods. The materials are shared, so identical engines batch. KSP's stock `KSP/Bumped Specular` / `KSP/Emissive/Bumped Specular` shaders. <br>• **Regen copper:** a round-tube normal map plus darker grooves in the albedo, one tube per U repeat, with a **whole number of tubes** baked into the UVs. They run the length of the nozzle, tapering with the wall (DESIGN §8.4). <br>• **Chamber and mount:** brushed steel. <br>• **Radiative extension:** niobium (light grey) below the Late tech level, **carbon-carbon twill** at Late. <br>• **Inner wall:** soot. |
+| Heat glow (`ModuleProcEngine.UpdateGlow`) | The extension's wall temperature follows throttle with a first-order lag: heats in ~2 s, cools in ~7 s; niobium up to ~1700 K, C-C ~2000 K. An approximate blackbody colour is applied through a **per-material property block** on the extension slot. That block starts from KSP's renderer-wide block, so the part highlight still works. <br>• **Finding:** KSP instantiates part materials and keeps its own renderer-wide property block, so writing `_EmissiveColor` on a material, or on a per-part material instance, never shows. The in-game diagnostic proved this; only the per-material block does. DESIGN §8.4 should say so. |
+| Geometry (`EngineGeometry.cs`) | Profile segments now carry a material and UV tiling (`UTiles`/`VLength`). The convergent section is copper regen; the chamber jacket, mount and dome are steel. Ring segment count is scaled to the exit circumference (24–72). |
+| Kit pieces (`KitBuilder.cs`) | Built from primitives (cylinder, frustum, sphere, torus, Catmull-Rom swept tubes with parallel-transported frames) into one mesh with 3 materials (structure, machinery, lines). Visual only, no colliders. <br>• **All cycles:** 4 thrust-frame struts, 2 gimbal actuators (piston + rod), and a regen coolant manifold torus around the bell. <br>• **Gas generator:** turbopump (housing, volute torus, turbine disc), gas generator, oxidizer line to the dome, fuel line down the bell to the manifold, and a **turbine exhaust duct** routed clear of the bell, ending in a small nozzle where the exhaust plume attaches (`peGGExhaust` transform). <br>• **Staged combustion:** pump plus a preburner on top and a hot-gas duct into the dome. <br>• **Full flow:** two pumps and two preburners, 180° apart. <br>• **Expander:** small pump; heated hydrogen goes from the manifold up to the turbine. <br>• **Pressure-fed:** 2 or 4 COPV spheres sized from the pressurant mass, plus valves. <br>• **Sizing:** the pump envelope comes from the turbopump mass at ~5 t/m³, capped at 0.9× chamber radius. Line diameters come from flow at 15 m/s. Everything stays below the mount plate, so nothing intersects the part stacked on top (an early build had preburner domes poking through). Everything derives from the persisted STATS, so all LMP clients build the same kit. |
+| Waterfall (`Integrations.cs`, `Plumes.cfg`) | Several templates per engine: the main plume on `thrustTransform`, plus the GG exhaust plume on `peGGExhaust` (`waterfall-kerolox-exhaust-1`, `methalox-vernier-1`, `hydrolox-upper-1`). <br>• **Calibrated `referenceDiameter`** with the new `plumes` rig: each template at scale 1 on a 1.00 m exit, side view at sea level, measuring plume width at the exit plane against the nozzle. <br>• Results: kerolox-lower-1 **0.43**, kerolox-upper-1 **0.40**, methalox-lower-raptor-1 **1.18**, methalox-upper-1 **0.85**, hydrolox-lower-1 **1.07**, hydrolox-upper-1 **1.0**. The exhaust templates are tiny ducts: 0.12 / 0.08 / 1.0. <br>• Before this, kerolox plumes were drawn at ~40 % of the nozzle width. |
+| Drag handles (`EngineHandles.cs`) | Three screen-space handles on the engine open in the designer: **exit rim** (radius → area ratio), **nozzle tip** (length → bell length fraction) and **chamber side** (radius → thrust, since the chamber radius scales as √F at fixed Pc). <br>• Dragging projects the mouse ray onto the handle's axis, frozen at drag start so the axis doesn't move under the cursor. <br>• Editor input is locked while hovering or dragging, and a value label shows while active. <br>• Changes go through `SetDesign`, so the two-speed pipeline, symmetry and undo apply. <br>• Tested by dragging along rays through known points: exit ×1.5 gives area ratio ×2.250, chamber ×1.2 gives thrust ×1.440, and the bell length lands at 0.900 exactly. |
+
+## Evidence
+
+[tests/ksp/evidence/phase3/](tests/ksp/evidence/phase3/): results files, and screenshots:
+
+- `visual_cold_*` / `visual_hot_*`: six designs cold and burning;
+- `plumes_*`: the calibration rig at scale 1;
+- `sandbox_handles.png`.
+
+New driver scripts in `tests/ProcEngines.KspTests/Driver.cs`:
+
+- **`visual`:** freezes the craft 15 m above the pad, hides the UI, aims the camera at the engine, and turns on infinite propellant, because stock tanks carry no methane or hydrogen.
+- **`plumes`:** the calibration rig.
+
+## Not done (Phase 3 leftovers)
+
+1. **Authored kit pieces with template-vertex deformation** (DESIGN §8.5): this needs Blender assets. The primitive kit covers the MVP.
+2. **TexturesUnlimited PBR path and LOD:** optional.
+3. **The designer is still IMGUI.** The UGUI window from DESIGN §7.1 hasn't been started.
+4. **Visual tuning:**
+   - The C-C glow is fairly subtle in daylight. The brightness factors are in `EngineMaterials.Glow`.
+   - The GG exhaust plume is small; its reference sizes were judged visually.
+   - On large engines, the kit pieces sit just below the tank and can be hard to see from above.
+5. **Not installed in ksp_mp yet**, and nothing changed there.

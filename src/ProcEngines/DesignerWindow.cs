@@ -33,6 +33,7 @@ namespace ProcEngines
         }
 
         public static bool IsOpen => instance != null && instance.target != null;
+        public static ModuleProcEngine Target => instance?.target;
 
         void Awake() { instance = this; }
 

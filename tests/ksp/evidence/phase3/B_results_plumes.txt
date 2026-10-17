@@ -1,0 +1,12 @@
+18:34:07 INFO  [start] script=plumes far=False
+18:34:55 INFO  [plumes] rig engine 351.4 kN, exit 1.0009 m
+18:35:11 INFO  [plumes.waterfall-kerolox-lower-1] waterfall-kerolox-lower-1 x1.00 (11 effects)
+18:35:16 INFO  [plumes.waterfall-kerolox-upper-1] waterfall-kerolox-upper-1 x1.00 (6 effects)
+18:35:20 INFO  [plumes.waterfall-methalox-lower-raptor-1] waterfall-methalox-lower-raptor-1 x1.00 (16 effects)
+18:35:25 INFO  [plumes.waterfall-methalox-upper-1] waterfall-methalox-upper-1 x1.00 (10 effects)
+18:35:29 INFO  [plumes.waterfall-hydrolox-lower-1] waterfall-hydrolox-lower-1 x1.00 (5 effects)
+18:35:34 INFO  [plumes.waterfall-hydrolox-upper-1] waterfall-hydrolox-upper-1 x1.00 (9 effects)
+18:35:38 INFO  [plumes.waterfall-kerolox-exhaust-1] waterfall-kerolox-exhaust-1 x1.00 (4 effects)
+18:35:43 INFO  [plumes.waterfall-methalox-vernier-1] waterfall-methalox-vernier-1 x1.00 (10 effects)
+18:35:48 INFO  [plumes.waterfall-hydrolox-upper-1] waterfall-hydrolox-upper-1 x1.00 (9 effects)
+18:35:48 INFO  [end] 0 passed, 0 failed
