@@ -1,0 +1,11 @@
+<script src="src/physics.js"></script>
+<pre id="o"></pre>
+<script>
+const cases=[['Merlin','Kerolox','GasGenerator',97,16,914,0.8,470,'311/282'],['MVac','Kerolox','GasGenerator',97,165,981,0.8,0,'348'],
+['Raptor2','Methalox','FullFlow',300,34,2450,0.8,1600,'350/327'],['RS-25','Hydrolox','Staged',206,69,2279,0.8,3180,'452/366'],
+['RL10','Hydrolox','Expander',44,84,110,0.8,168,'451'],['Ruth','Kerolox','Electric',30,12,25,0.8,35,''],['Kestrel','Kerolox','PressureFed',9,60,31,0.8,52,'317'],
+['NERVA','NTR-H2','Nuclear',31,100,250,0.8,10000,'840'],['SNRE','NTR-H2','Nuclear',40,300,73,0.8,2500,'875']];
+let s='';for(const c of cases){const e=PE.evaluate({prop:c[1],cycle:c[2],pc:c[3],eps:c[4],thrust:c[5],lf:c[6],tier:-1,fuel:c[0]=='SNRE'?'Cermet':'Graphite'});
+s+=`${c[0].padEnd(8)} Isp ${e.ispVac.toFixed(0)}/${e.ispSL.toFixed(0)} (real ${c[8]}) m ${e.total.toFixed(0)} (real ${c[7]}) De ${e.De.toFixed(2)} L ${e.length.toFixed(2)} Ppump ${(e.PpumpKW/1000).toFixed(2)}MW Pth ${e.Pth.toFixed(0)} sepAlt ${e.sepAltKm.toFixed(1)} `+JSON.stringify(Object.fromEntries(Object.entries(e.mass).map(([k,v])=>[k,Math.round(v)])))+'\n';}
+document.getElementById('o').textContent=s;
+</script>

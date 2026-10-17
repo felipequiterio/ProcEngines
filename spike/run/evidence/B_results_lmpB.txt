@@ -1,0 +1,10 @@
+17:16:03 INFO  [start] script=lmpB culture=en-US ui=en-US far=False
+17:17:27 INFO  [6.lmpB] A reports: design=F=777.7kN Pc=123.4bar eps=45.6 maxThrust=777.7 ispVac=328.022675 isp1=263.210663 maxFuelFlow=0.241761729 De=1.389564 bottomNode=-2.32522464 bellVerts=4480 bellBounds=(1.3884,1.7672,1.3890) mass=0.9569739
+17:17:27 INFO  [lmp] connecting to 127.0.0.1:5525
+17:17:41 INFO  [lmp] in SPACECENTER, mode=CAREER, save=LunaMultiplayer, vessels=4
+17:17:41 INFO  [6.lmpB.proto] MODULE { name = ModuleProcEngineSpike isEnabled = True stagingEnabled = True schemaVersion = 1 modelVersion = 1 EVENTS { } ACTIONS { } DESIGN { thrustVac = 777.7 pc = 123.4 eps = 45.6 useLoad = True } STATS { maxThrust = 777.7 minThrust = 311.080017 ispVac = 328.022675 ispSL = 263.210663 mdot = 241.761734 mass = 0.9569739 cost = 1860.15 rt = 0.102888338 rc = 0.17820783 re = 0.694782 mountR = 0.106924705 mountH = 0.06237274 lc = 0.356415659 xInj = -0.49567 xCone = -0.139254332 xN = 0.020585414 rN = 0.108710438 qx = 0.7106047 qr = 0.5329579 ln = 1.76718187 thetaN = 31.5846233 thetaE = 8.707688 atmosphereCurve { key = 0 328.022675 key = 1 263.210663 key = 5.06114149 0.001 } } UPGRADESAPPLIED { } } 
+17:17:41 PASS  [6.lmp.proto] B's ProtoVessel MODULE DESIGN/STATS identical to A's: True
+17:17:48 INFO  [6.lmpB] design=F=777.7kN Pc=123.4bar eps=45.6 maxThrust=777.7 ispVac=328.022675 isp1=263.210663 maxFuelFlow=0.241761729 De=1.389564 bottomNode=-2.32522464 bellVerts=4480 bellBounds=(1.3884,1.7672,1.3890) mass=0.9569739
+17:17:48 PASS  [6.lmp.loaded] B's loaded engine matches A's exactly: True
+17:17:49 INFO  [shot] E:/Kerbal Space Program Instances/ksp_test_B/KSP_x64_Data/../GameData/ProcEngineSpike/PluginData\shots\lmpB_lmpB_flight.png
+17:17:52 INFO  [end] quitting

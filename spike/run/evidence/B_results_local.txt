@@ -1,0 +1,59 @@
+16:53:48 INFO  [start] script=local culture=en-US ui=en-US far=False
+16:54:29 INFO  [game] pespike SANDBOX started, scene=SPACECENTER
+16:54:33 INFO  [craft] SpikeDV: probeCoreOcto > fuelTank > procEngineSpike
+16:54:36 INFO  [1.editorDefault] render meshes=2 verts=3108 tris=5508 OnStart build=1.70ms; analytic vs RecalculateNormals deviation median=0.13deg max=7.03deg (smooth vertices)
+16:54:36 INFO  [1.editorDefault] colliders: peCollider0 convex=True tris=48 size=(0.2645,0.3331,0.2645); peCollider1 convex=True tris=48 size=(0.4707,0.3778,0.4707); peCollider2 convex=True tris=48 size=(0.6828,0.4137,0.6828)
+16:54:36 PASS  [1.editorDefault] mesh+colliders built synchronously; raycast hit peCollider2 at 0.0000 m from exit plane
+16:54:36 INFO  [1.editorDefault] engine thrustTransforms=1 first=thrustTransform parent=peGimbal worldPos-exit=(0.0000,0.0000,0.0000) fwd·down=1.000; gimbalTransforms=1 (peGimbal)
+16:54:36 INFO  [shot] E:/Kerbal Space Program Instances/ksp_test_B/KSP_x64_Data/../GameData/ProcEngineSpike/PluginData\shots\local_editor_default.png
+16:54:38 PASS  [1.throttle] 40 changes over 0.25s -> engine applies=40, render rebuilds=4 (<=10 Hz), slow rebuilds=1 (debounced)
+16:54:38 INFO  [1.editorDragged] render meshes=2 verts=7215 tris=13056 OnStart build=1.70ms; analytic vs RecalculateNormals deviation median=0.06deg max=3.60deg (smooth vertices)
+16:54:38 INFO  [1.editorDragged] colliders: peCollider0 convex=True tris=48 size=(0.4429,0.5578,0.4429); peCollider1 convex=True tris=48 size=(1.3186,1.1434,1.3186); peCollider2 convex=True tris=48 size=(1.9640,1.4067,1.9640)
+16:54:38 PASS  [1.editorDragged] mesh+colliders built synchronously; raycast hit peCollider2 at 0.0000 m from exit plane
+16:54:38 INFO  [1.editorDragged] engine thrustTransforms=1 first=thrustTransform parent=peGimbal worldPos-exit=(0.0000,0.0000,0.0000) fwd·down=1.000; gimbalTransforms=1 (peGimbal)
+16:54:40 PASS  [2.editorLoad.fields] mode=Load maxThrust=1000.00 (exp 1000.00) minThrust=400.00 Isp0=321.84 (exp 321.84) Isp1=256.07 (exp 256.07) maxFuelFlow=0.31684 minFuelFlow=0.12674 throttleMin=0.400 props=LiquidFuel:0.9+Oxidizer:1.1 ratioSum=2.00 mixDensity=0.01000 pid=0
+16:54:43 PASS  [2.editorLoad.stockDV] stage 0: thrustVac=1000.00 ispVac=321.84 ispASL=256.07 dVvac=2575.0 TWRvac=28.43
+16:54:43 INFO  [2.editorLoad.KER] KER not installed
+16:54:43 INFO  [2.editorLoad.MechJeb] no MechJebCore on the craft (MechJeb/MechJebForAll not installed)
+16:54:44 PASS  [2.editorDirect.fields] mode=Direct maxThrust=650.00 (exp 650.00) minThrust=260.00 Isp0=305.43 (exp 305.43) Isp1=258.66 (exp 258.66) maxFuelFlow=0.21701 minFuelFlow=0.08680 throttleMin=0.400 props=LiquidFuel:0.9+Oxidizer:1.1 ratioSum=2.00 mixDensity=0.01000 pid=0
+16:54:47 PASS  [2.editorDirect.stockDV] stage 0: thrustVac=650.00 ispVac=305.43 ispASL=258.66 dVvac=3038.8 TWRvac=21.12
+16:54:47 INFO  [2.editorDirect.KER] KER not installed
+16:54:47 INFO  [2.editorDirect.MechJeb] no MechJebCore on the craft (MechJeb/MechJebForAll not installed)
+16:54:48 INFO  [shot] E:/Kerbal Space Program Instances/ksp_test_B/KSP_x64_Data/../GameData/ProcEngineSpike/PluginData\shots\local_editor_1000kN.png
+16:54:51 PASS  [4.dragcube.editor] cubes=1 De 0.68->3.63 m; area before=[0.460,0.460,0.363,0.047,0.459,0.459] after=[12.284,12.284,10.309,0.563,12.284,12.284]
+16:54:52 PASS  [6.culture] saved under de-DE: no comma decimals=True, bit-exact round trip=True; DESIGN = DESIGN
+{
+	thrustVac = 777.7
+	pc = 123.4
+	eps = 45.6
+	useLoad = True
+}
+
+16:54:52 INFO  [6.node] MODULE { name = ModuleProcEngineSpike isEnabled = True stagingEnabled = True schemaVersion = 1 modelVersion = 1 EVENTS { } ACTIONS { } DESIGN { thrustVac = 777.7 pc = 123.4 eps = 45.6 useLoad = True } STATS { maxThrust = 777.7 minThrust = 311.080017 ispVac = 328.022675 ispSL = 263.210663 mdot = 241.761734 mass = 0.9569739 cost = 1860.15 rt = 0.102888338 rc = 0.17820783 re = 0.694782 mountR = 0.106924705 mountH = 0.06237274 lc = 0.356415659 xInj = -0.49567 xCone = -0.139254332 xN = 0.020585414 rN = 0.108710438 qx = 0.7106047 qr = 0.5329579 ln = 1.76718187 thetaN = 31.5846233 thetaE = 8.707688 atmosphereCurve { key = 0 328.022675 key = 1 263.210663 key = 5.06114149 0.001 } } UPGRADESAPPLIED { } } 
+16:54:55 PASS  [6.craft] craft save/load: design F=777.7kN Pc=123.4bar eps=45.6 (exp F=777.7 Pc=123.4 eps=45.6) maxThrust=777.7 bottomNode.y=-2.3252 (exp -2.3252) savedModelVersion=1
+16:54:55 INFO  [craft] SpikeStack_rootAbove: probeCoreOcto > fuelTank > procEngineSpike > Decoupler.1 > fuelTank
+16:54:57 INFO  [3.rootAbove] engine parent=fuelTank bottom->Decoupler.1 top->fuelTank; root=probeCoreOcto.v2
+16:55:00 INFO  [shot] E:/Kerbal Space Program Instances/ksp_test_B/KSP_x64_Data/../GameData/ProcEngineSpike/PluginData\shots\local_stack_rootAbove_eps120.png
+16:55:07 PASS  [3.rootAbove] nozzle-decoupler gap before=0.00000 after eps30->120=0.00000 (bottom node moved -2.008->-3.653; decoupler pushed -1.6456 m); top gap=0.00000/0.00000; after 6 toggles back to eps30: gap=0.00000 drift=0.000000 m
+16:55:07 INFO  [craft] SpikeStack_rootBelow: fuelTank > Decoupler.1 > procEngineSpike > fuelTank > probeCoreOcto
+16:55:09 INFO  [3.rootBelow] engine parent=Decoupler.1 bottom->Decoupler.1 top->fuelTank; root=fuelTank
+16:55:12 INFO  [shot] E:/Kerbal Space Program Instances/ksp_test_B/KSP_x64_Data/../GameData/ProcEngineSpike/PluginData\shots\local_stack_rootBelow_eps120.png
+16:55:19 PASS  [3.rootBelow] nozzle-decoupler gap before=0.00000 after eps30->120=0.00000 (bottom node moved -2.008->-3.653; engine moved itself 1.6456 m); top gap=0.00000/0.00000; after 6 toggles back to eps30: gap=0.00000 drift=0.000000 m
+16:55:19 INFO  [craft] SpikeWing: probeCoreOcto > fuelTank > procEngineSpike > wingConnector3 > wingConnector3
+16:55:27 INFO  [flight] launched SpikeWing at LaunchPad, parts=5
+16:55:27 INFO  [1.flight] render meshes=2 verts=3108 tris=5508 OnStart build=1.74ms; analytic vs RecalculateNormals deviation median=0.13deg max=7.03deg (smooth vertices)
+16:55:27 INFO  [1.flight] colliders: peCollider0 convex=True tris=48 size=(0.4117,0.2645,0.3886); peCollider1 convex=True tris=48 size=(0.4880,0.4707,0.4713); peCollider2 convex=True tris=48 size=(0.6683,0.6828,0.7097)
+16:55:27 PASS  [1.flight] mesh+colliders built synchronously; raycast hit peCollider2 at 0.0000 m from exit plane
+16:55:27 INFO  [1.flight] engine thrustTransforms=1 first=thrustTransform parent=peGimbal worldPos-exit=(0.0000,0.0000,0.0000) fwd·down=1.000; gimbalTransforms=1 (peGimbal)
+16:55:27 PASS  [2.flight.fields] mode=Load maxThrust=200.00 (exp 200.00) minThrust=80.00 Isp0=315.12 (exp 315.12) Isp1=256.65 (exp 256.65) maxFuelFlow=0.06472 minFuelFlow=0.02589 throttleMin=0.400 props=LiquidFuel:0.9+Oxidizer:1.1 ratioSum=2.00 mixDensity=0.01000 pid=0
+16:55:30 PASS  [2.flight.stockDV] stage 0: thrustVac=200.00 ispVac=315.12 ispASL=256.65 dVvac=3879.9 TWRvac=7.29
+16:55:30 INFO  [2.flight.KER] KER not installed
+16:55:30 INFO  [2.flight.MechJeb] no MechJebCore on the craft (MechJeb/MechJebForAll not installed)
+16:55:30 INFO  [4.dragcube.flight] De=0.68 cubes=1 area=[0.460,0.460,0.363,0.047,0.459,0.459] AreaDrag=0.0272
+16:55:31 PASS  [4.dragcube.flight] in-flight re-render: YN area 0.047->0.563 (De 3.63); AreaDrag=3.2932
+16:55:32 INFO  [5.waterfall] template=waterfall-kerolox-lower-1 scale=0.683 effects=11 reinit=1.7ms
+16:55:35 INFO  [shot] E:/Kerbal Space Program Instances/ksp_test_B/KSP_x64_Data/../GameData/ProcEngineSpike/PluginData\shots\local_plume_small.png
+16:55:35 INFO  [5.waterfall] template=waterfall-kerolox-lower-1 scale=3.626 effects=11 reinit=1.8ms
+16:55:38 INFO  [shot] E:/Kerbal Space Program Instances/ksp_test_B/KSP_x64_Data/../GameData/ProcEngineSpike/PluginData\shots\local_plume_big.png
+16:55:38 PASS  [5.waterfall] plume renderer bounds (13.2465,1.7214,10.8746) -> (71.8635,38.4579,45.5903) (width ratio 5.43) for De 0.68 -> 3.63 (ratio 5.31); finalThrust=551.9 kN; template=waterfall-kerolox-lower-1 scale=3.626 effects=11 reinit=1.8ms
+16:55:39 INFO  [end] quitting

@@ -1,0 +1,9 @@
+17:00:13 INFO  [start] script=rnd culture=en-US ui=en-US far=False
+17:00:53 INFO  [game] pespike_career CAREER started, scene=SPACECENTER
+17:00:53 INFO  [7.handler] upgrade registered=True forTech(basicRocketry)=procEngineSpike-StagedCombustion unlocked=False availableToUnlock=False cost=0 allowed=True PartUpgradesInCareer=True
+17:00:58 INFO  [shot] E:/Kerbal Space Program Instances/ksp_test_B/KSP_x64_Data/../GameData/ProcEngineSpike/PluginData\shots\rnd_rnd_locked.png
+17:00:58 INFO  [7.locked] R&D part list items=4: UPGRADE procEngineSpike-StagedCombustion, fuelTankSmallFlat, solidBooster.v2, liquidEngine2.v2
+17:01:02 INFO  [shot] E:/Kerbal Space Program Instances/ksp_test_B/KSP_x64_Data/../GameData/ProcEngineSpike/PluginData\shots\rnd_rnd_researched.png
+17:01:02 INFO  [7.researched] R&D part list items=4: UPGRADE procEngineSpike-StagedCombustion, liquidEngine2.v2, solidBooster.v2, fuelTankSmallFlat
+17:01:02 PASS  [7] after research: unlocked=True (no purchase needed=True) enabled=True availableToUnlock=False cost=0
+17:01:02 INFO  [end] quitting

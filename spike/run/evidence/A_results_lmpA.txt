@@ -1,0 +1,10 @@
+17:16:01 INFO  [start] script=lmpA culture=en-US ui=en-US far=True
+17:16:34 INFO  [lmp] connecting to 127.0.0.1:5525
+17:16:49 INFO  [lmp] in SPACECENTER, mode=CAREER, save=LunaMultiplayer, vessels=3
+17:16:53 INFO  [craft] SpikeLMP: mk1pod.v2 > procEngineSpike
+17:17:06 INFO  [flight] launched SpikeLMP at LaunchPad, parts=2
+17:17:06 INFO  [6.lmpA] design=F=777.7kN Pc=123.4bar eps=45.6 maxThrust=777.7 ispVac=328.022675 isp1=263.210663 maxFuelFlow=0.241761729 De=1.389564 bottomNode=-2.32522464 bellVerts=4480 bellBounds=(1.3884,1.7672,1.3890) mass=0.9569739
+17:17:06 INFO  [shot] E:/Kerbal Space Program Instances/ksp_test_A/KSP_x64_Data/../GameData/ProcEngineSpike/PluginData\shots\lmpA_lmpA_flight.png
+17:17:26 INFO  [6.lmpA] flag written; waiting for B (max 12 min)
+17:17:49 INFO  [6.lmpA] B finished: True
+17:17:49 INFO  [end] quitting

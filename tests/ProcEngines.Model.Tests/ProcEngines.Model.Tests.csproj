@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Package-free test runner for ProcEngines.Model (compiles the model sources directly).
+      dotnet run -c Release (in this folder)            run the tests
+      add the argument "report" after a double dash      reference-engine comparison table
+      add the argument "fit" after a double dash         re-fit the Balance.cfg coefficients
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <InvariantGlobalization>false</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\..\src\ProcEngines.Model\**\*.cs" Exclude="..\..\src\ProcEngines.Model\obj\**;..\..\src\ProcEngines.Model\bin\**" LinkBase="Model" />
+  </ItemGroup>
+
+</Project>

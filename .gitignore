@@ -1,0 +1,8 @@
+# Python venv with NASA CEA (recreate: python -m venv tools/.venv && tools/.venv/Scripts/pip install cea numpy)
+tools/.venv/
+# build output
+**/bin/
+**/obj/
+# spike run scratch
+spike/run/flags/
+spike/run/*.out

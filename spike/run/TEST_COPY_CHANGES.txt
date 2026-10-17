@@ -1,0 +1,6 @@
+Changes made to the test copies for the ProcEngines spike (2026-10-17). Undo with spike/run/cleanup.sh.
+ksp_test_A/GameData: + 000_KSPBurst, 999_Scale_Redist.dll, FerramAerospaceResearch, ModularFlightIntegrator, Waterfall, KerbalEngineer, MechJeb2, MechJebForAll (copied from ksp_mp), + ProcEngineSpike
+ksp_test_B/GameData: + Waterfall (copied from ksp_mp), + ProcEngineSpike
+ksp_test_A/B settings.cfg: FULLSCREEN = False during the runs; restored afterwards
+saves created: ksp_test_A/saves/pespike, ksp_test_B/saves/pespike, ksp_test_B/saves/pespike_career
+LMPServer/Universe: backed up to _backup_2026-10-17_procengines before the LMP test and restored from it afterwards; the post-test universe is kept in _universe_after_procengines_test_2026-10-17

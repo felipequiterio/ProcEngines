@@ -1,0 +1,379 @@
+<title>ProcEngines Designer</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,400..800&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap">
+<style>
+/* Layout: test-stand console. A dark "stage" (the engine on the pad at night) flanked by
+   control and telemetry rails; reference sections below read like an engine data sheet. */
+:root {
+  --bg: #e9ecee;
+  --surface: #f6f7f8;
+  --surface-2: #dfe3e6;
+  --ink: #161a1e;
+  --muted: #59636c;
+  --line: #c9cfd4;
+  --copper: #a8521f;
+  --copper-soft: #a8521f22;
+  --stage-top: #262c33;
+  --stage-bot: #0e1114;
+  --stage-ink: #e6e9ec;
+  --stage-muted: #9aa5ae;
+  --stage-line: #ffffff1f;
+  --good: #2c7a50;
+  --warn: #9a6400;
+  --bad: #b23a26;
+  --warn-bg: #f0b42922;
+  --bad-bg: #d9483022;
+  --info-bg: #59636c14;
+  --sep-fill: #d94830;
+  --f-display: "Archivo", "Arial Narrow", "Helvetica Neue", Arial, sans-serif;
+  --f-body: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --f-mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  --r: 6px;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #101316; --surface: #171b1f; --surface-2: #20262b; --ink: #e5e8eb; --muted: #95a0a9; --line: #2b3238;
+    --copper: #e08a52; --copper-soft: #e08a5226; --stage-top: #1c2228; --stage-bot: #07090b;
+    --good: #5cc48a; --warn: #f0b429; --bad: #ef6a55; --warn-bg: #f0b4291f; --bad-bg: #ef6a551f; --info-bg: #ffffff0a; --sep-fill: #ef6a55;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #101316; --surface: #171b1f; --surface-2: #20262b; --ink: #e5e8eb; --muted: #95a0a9; --line: #2b3238;
+  --copper: #e08a52; --copper-soft: #e08a5226; --stage-top: #1c2228; --stage-bot: #07090b;
+  --good: #5cc48a; --warn: #f0b429; --bad: #ef6a55; --warn-bg: #f0b4291f; --bad-bg: #ef6a551f; --info-bg: #ffffff0a; --sep-fill: #ef6a55;
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+body { background: var(--bg); color: var(--ink); font: 14px/1.5 var(--f-body); }
+.wrap { max-width: 1480px; margin: 0 auto; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 0; }
+h1, h2, h3 { font-family: var(--f-display); text-wrap: balance; margin: 0; }
+.eyebrow { font: 500 11px/1 var(--f-mono); letter-spacing: .12em; text-transform: uppercase; color: var(--copper); }
+.mono { font-family: var(--f-mono); font-variant-numeric: tabular-nums; }
+button, select, input { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--copper); outline-offset: 2px; }
+
+/* Header */
+.masthead { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 12px 32px; padding-block: 28px 18px; }
+.wordmark { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+.wordmark h1 { font-size: clamp(30px, 4.4vw, 46px); font-weight: 800; font-stretch: 125%; letter-spacing: -.01em; line-height: 1; }
+.wordmark h1 span { color: var(--copper); }
+.tag { font: 500 11px/1 var(--f-mono); letter-spacing: .08em; text-transform: uppercase; border: 1px solid var(--line); color: var(--muted); padding: 5px 7px; border-radius: 3px; white-space: nowrap; }
+.lede { max-width: 62ch; color: var(--muted); margin: 0; font-size: 15px; }
+
+/* Designer grid */
+.designer { display: grid; gap: 14px; grid-template-columns: 290px minmax(0, 1fr) 310px; align-items: start; }
+@media (max-width: 1240px) { .designer { grid-template-columns: 280px minmax(0, 1fr); } .readout { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; } }
+@media (max-width: 820px) { .designer { grid-template-columns: minmax(0, 1fr); } .stagebox { order: -1; } }
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 14px; min-width: 0; }
+.panel + .panel { margin-top: 0; }
+.rail { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.ctl-group { display: flex; flex-direction: column; gap: 8px; }
+.ctl-group + .ctl-group { border-top: 1px solid var(--line); padding-top: 14px; margin-top: 14px; }
+.ctl-label { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; font: 600 12px/1.2 var(--f-body); letter-spacing: .02em; }
+.ctl-label .val { font: 500 13px/1 var(--f-mono); color: var(--copper); font-variant-numeric: tabular-nums; }
+.hint { font-size: 12px; color: var(--muted); }
+select { width: 100%; padding: 7px 8px; border: 1px solid var(--line); border-radius: 4px; background: var(--bg); }
+.seg { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; }
+.seg button, .cyc button, .chips button {
+  border: 1px solid var(--line); background: var(--bg); border-radius: 4px; padding: 7px 8px; cursor: pointer; text-align: left;
+  transition: border-color .15s, background .15s;
+}
+.seg button:hover:not(:disabled), .cyc button:hover:not(:disabled), .chips button:hover:not(:disabled) { border-color: var(--copper); }
+.seg button[aria-pressed="true"], .cyc button[aria-pressed="true"], .chips button[aria-pressed="true"] { border-color: var(--copper); background: var(--copper-soft); }
+.seg button:disabled, .cyc button:disabled { opacity: .45; cursor: not-allowed; }
+.seg b { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+.seg small { display: block; color: var(--muted); font-size: 11px; line-height: 1.3; }
+.dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.cyc { display: flex; flex-direction: column; gap: 4px; }
+.cyc button { display: grid; grid-template-columns: 30px 1fr auto; align-items: center; gap: 8px; padding: 6px 8px; }
+.cyc .abbr { font: 600 11px/1 var(--f-mono); color: var(--muted); border: 1px solid var(--line); border-radius: 3px; padding: 4px 0; text-align: center; }
+.cyc button[aria-pressed="true"] .abbr { color: var(--copper); border-color: var(--copper); }
+.cyc .nm { font-size: 13px; font-weight: 500; }
+.cyc .lock { font: 11px/1.2 var(--f-mono); color: var(--muted); text-align: right; }
+input[type="range"] { width: 100%; accent-color: var(--copper); margin: 0; }
+.range-ends { display: flex; justify-content: space-between; font: 11px/1 var(--f-mono); color: var(--muted); }
+.derived { font-size: 12px; color: var(--muted); background: var(--info-bg); border-radius: 4px; padding: 8px; }
+.derived b { color: var(--ink); font-weight: 600; }
+
+/* Stage */
+.stagebox { display: flex; flex-direction: column; gap: 0; min-width: 0; border-radius: var(--r); overflow: hidden; border: 1px solid var(--line); background: linear-gradient(180deg, var(--stage-top), var(--stage-bot)); color: var(--stage-ink); }
+.view { position: relative; height: clamp(420px, 66vh, 700px); touch-action: none; cursor: grab; }
+.view:active { cursor: grabbing; }
+.view canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+.view .floor { position: absolute; inset: auto 0 0 0; height: 38%; pointer-events: none; background: repeating-linear-gradient(90deg, var(--stage-line) 0 1px, transparent 1px 64px); mask-image: linear-gradient(transparent, #000 85%); -webkit-mask-image: linear-gradient(transparent, #000 85%); opacity: .5; }
+.hud { position: absolute; top: 12px; left: 12px; right: 12px; display: flex; justify-content: space-between; gap: 8px; pointer-events: none; flex-wrap: wrap; }
+.hud .title { font: 700 15px/1.1 var(--f-display); font-stretch: 112%; }
+.hud .sub { font: 12px/1.3 var(--f-mono); color: var(--stage-muted); margin-top: 3px; }
+.regime { font: 600 11px/1 var(--f-mono); letter-spacing: .06em; text-transform: uppercase; padding: 6px 8px; border-radius: 3px; border: 1px solid var(--stage-line); background: #00000059; align-self: flex-start; }
+.regime[data-k="sep"] { color: #ffb4a6; border-color: #ef6a5580; }
+.regime[data-k="over"] { color: #ffd38a; border-color: #f0b42966; }
+.regime[data-k="ideal"] { color: #9fe3bd; border-color: #5cc48a66; }
+.regime[data-k="under"], .regime[data-k="vac"] { color: #b9d7ff; border-color: #7fb0ff55; }
+.labels { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+.lbl { position: absolute; left: 0; top: 0; display: flex; align-items: center; gap: 6px; white-space: nowrap; font: 500 11px/1 var(--f-mono); color: var(--stage-ink); transition: opacity .2s; }
+.lbl i { width: 7px; height: 7px; border-radius: 50%; border: 1.5px solid var(--stage-ink); background: #0008; flex: none; }
+.lbl span { background: #0b0d10cc; border: 1px solid var(--stage-line); padding: 4px 6px; border-radius: 3px; }
+.lbl.left { flex-direction: row-reverse; }
+.lbl::before { content: ""; order: 0; }
+.tip { position: absolute; z-index: 3; pointer-events: none; max-width: 260px; background: #0b0d10ee; border: 1px solid var(--stage-line); border-radius: 4px; padding: 8px 10px; font-size: 12px; line-height: 1.4; color: var(--stage-ink); }
+.tip b { display: block; font: 600 12px/1.3 var(--f-body); margin-bottom: 2px; }
+.tip .k { font-family: var(--f-mono); color: #ffc197; margin-top: 4px; display: block; }
+.toolbar { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center; padding: 10px 12px; border-top: 1px solid var(--stage-line); background: #0000004d; }
+.toolbar .alt { display: flex; align-items: center; gap: 10px; flex: 1 1 280px; min-width: 0; }
+.toolbar .alt label { font: 600 11px/1 var(--f-mono); letter-spacing: .06em; text-transform: uppercase; color: var(--stage-muted); white-space: nowrap; }
+.toolbar .alt output { font: 500 12px/1.2 var(--f-mono); white-space: nowrap; min-width: 128px; text-align: right; }
+.toolbar .alt input { accent-color: #ffb27a; }
+.tbtns { display: flex; flex-wrap: wrap; gap: 6px; }
+.tbtn { border: 1px solid var(--stage-line); background: transparent; color: var(--stage-ink); border-radius: 3px; padding: 6px 9px; font: 500 12px/1 var(--f-mono); cursor: pointer; }
+.tbtn:hover { border-color: #ffffff55; }
+.tbtn[aria-pressed="true"] { background: #ffffff1c; border-color: #ffb27a99; color: #ffd6b8; }
+.tgroup { display: flex; align-items: center; gap: 6px; }
+.tgroup > span { font: 600 11px/1 var(--f-mono); letter-spacing: .06em; text-transform: uppercase; color: var(--stage-muted); margin-right: 2px; }
+
+/* Readout */
+.bigs { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 14px; }
+.big .k { font: 600 11px/1.2 var(--f-mono); letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+.big .v { font: 600 24px/1.15 var(--f-mono); font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
+.big .v small { font-size: 12px; font-weight: 500; color: var(--muted); letter-spacing: 0; margin-left: 3px; }
+.big .s { font: 12px/1.2 var(--f-mono); color: var(--muted); }
+.kv { display: grid; grid-template-columns: 1fr auto; gap: 5px 10px; margin: 0; font-size: 12.5px; }
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; font-family: var(--f-mono); font-variant-numeric: tabular-nums; text-align: right; }
+.chart svg { width: 100%; height: auto; display: block; }
+.chart text { font-family: var(--f-mono); font-size: 10px; fill: var(--muted); }
+.warns { display: flex; flex-direction: column; gap: 6px; margin: 0; padding: 0; list-style: none; }
+.warns li { font-size: 12.5px; line-height: 1.4; padding: 7px 9px; border-radius: 4px; background: var(--info-bg); border-left: 3px solid var(--muted); }
+.warns li[data-l="warn"] { background: var(--warn-bg); border-left-color: var(--warn); }
+.warns li[data-l="bad"] { background: var(--bad-bg); border-left-color: var(--bad); }
+.why { font-size: 13px; line-height: 1.45; }
+.why b { font-weight: 600; }
+.ph { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 10px; }
+.ph h3 { font-size: 13px; font-weight: 700; font-stretch: 110%; letter-spacing: .01em; }
+
+/* Sections */
+section.block { padding-block: 52px 8px; }
+.block-head { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); gap: 8px 40px; align-items: end; margin-bottom: 22px; }
+.block-head h2 { font-size: clamp(24px, 3vw, 34px); font-weight: 800; font-stretch: 118%; line-height: 1.05; margin-top: 8px; }
+.block-head p { margin: 0; color: var(--muted); max-width: 64ch; }
+@media (max-width: 820px) { .block-head { grid-template-columns: minmax(0, 1fr); } }
+
+.anat { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 14px; }
+@media (max-width: 1000px) { .anat { grid-template-columns: minmax(0, 1fr); } }
+.svgbox { overflow-x: auto; }
+.svgbox svg { width: 100%; min-width: 640px; height: auto; display: block; }
+.svgbox text { font-family: var(--f-mono); font-size: 12px; fill: var(--ink); }
+.svgbox .m { fill: var(--muted); }
+.kitlist { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 10px; }
+.kitlist li { display: grid; grid-template-columns: 22px 1fr; gap: 8px; font-size: 13px; }
+.kitlist .n { font: 600 11px/20px var(--f-mono); color: var(--copper); }
+.kitlist b { font-weight: 600; display: block; }
+.kitlist span { color: var(--muted); font-size: 12.5px; }
+
+.cards { display: grid; gap: 14px; grid-template-columns: repeat(4, minmax(0, 1fr)); }
+@media (max-width: 1150px) { .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 560px) { .cards { grid-template-columns: minmax(0, 1fr); } }
+.card { display: flex; flex-direction: column; background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); overflow: hidden; min-width: 0; }
+.card .thumb { aspect-ratio: 4 / 3; max-width: 100%; background: linear-gradient(180deg, var(--stage-top), var(--stage-bot)); position: relative; }
+.card .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.card .thumb .ex { position: absolute; left: 10px; bottom: 8px; font: 500 11px/1.2 var(--f-mono); color: var(--stage-muted); }
+.card .body { padding: 12px 14px 14px; display: flex; flex-direction: column; gap: 10px; flex: 1; }
+.card .top { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+.card h3 { font-size: 17px; font-weight: 750; font-stretch: 112%; }
+.card .pc { font: 500 12px/1 var(--f-mono); color: var(--copper); white-space: nowrap; }
+.card .kv { font-size: 12px; }
+.card .kv dd { text-align: left; font-family: var(--f-body); }
+.card .kv { grid-template-columns: 82px 1fr; }
+.card .foot { margin-top: auto; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.card .unlock { font: 11px/1.3 var(--f-mono); color: var(--muted); }
+.card .load { border: 1px solid var(--copper); color: var(--copper); background: transparent; border-radius: 4px; padding: 6px 10px; font: 600 12px/1 var(--f-body); cursor: pointer; white-space: nowrap; }
+.card .load:hover { background: var(--copper-soft); }
+.card .load:disabled { border-color: var(--line); color: var(--muted); cursor: default; background: transparent; }
+.card.planned { border-style: dashed; }
+.card.planned .thumb img { opacity: .55; }
+
+.notes { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr)); gap: 14px 36px; }
+.notes p { margin: 0; color: var(--muted); }
+.notes b { color: var(--ink); font-weight: 600; }
+footer { padding-block: 40px 48px; color: var(--muted); font-size: 12px; }
+
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="wrap">
+  <header class="masthead">
+    <div class="wordmark">
+      <h1>Proc<span>Engines</span></h1>
+      <span class="tag">Designer mockup · KSP 1.12.5</span>
+    </div>
+    <p class="lede">One part that becomes any liquid or nuclear rocket engine in the VAB. Pick a propellant and a cycle, set chamber pressure, expansion ratio and thrust, and the module computes the stats and builds the mesh.</p>
+  </header>
+
+  <main>
+    <div class="designer" id="designer">
+      <aside class="rail">
+        <div class="panel">
+          <div class="ctl-group">
+            <label class="ctl-label" for="preset">Start from</label>
+            <select id="preset"></select>
+          </div>
+          <div class="ctl-group">
+            <label class="ctl-label" for="tier">Career tech <span class="val" id="tierVal">Sandbox</span></label>
+            <select id="tier"></select>
+            <div class="hint" id="tierHint">Sandbox ignores tech caps.</div>
+          </div>
+          <div class="ctl-group">
+            <div class="ctl-label">Propellant</div>
+            <div class="seg" id="props" role="group" aria-label="Propellant"></div>
+          </div>
+          <div class="ctl-group">
+            <div class="ctl-label">Cycle</div>
+            <div class="cyc" id="cycles" role="group" aria-label="Engine cycle"></div>
+          </div>
+          <div class="ctl-group" id="fuelGroup" hidden>
+            <label class="ctl-label" for="fuel">Fuel element</label>
+            <select id="fuel"></select>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="ctl-group">
+            <label class="ctl-label" for="pc">Chamber pressure <span class="val" id="pcVal"></span></label>
+            <input type="range" id="pc" step="0.5">
+            <div class="range-ends"><span id="pcMin"></span><span id="pcMax"></span></div>
+          </div>
+          <div class="ctl-group">
+            <label class="ctl-label" for="eps">Expansion ratio ε <span class="val" id="epsVal"></span></label>
+            <input type="range" id="eps" min="0" max="1000" step="1">
+            <div class="range-ends"><span id="epsMin"></span><span id="epsMax"></span></div>
+          </div>
+          <div class="ctl-group">
+            <label class="ctl-label" for="thr">Vacuum thrust <span class="val" id="thrVal"></span></label>
+            <input type="range" id="thr" min="0" max="1000" step="1">
+            <div class="range-ends"><span id="thrMin"></span><span id="thrMax"></span></div>
+          </div>
+          <div class="ctl-group">
+            <label class="ctl-label" for="lf">Bell length fraction <span class="val" id="lfVal"></span></label>
+            <input type="range" id="lf" min="0.6" max="0.9" step="0.01">
+            <div class="range-ends"><span>0.60 short</span><span>0.90 long</span></div>
+          </div>
+          <div class="ctl-group">
+            <div class="derived">Locked: <b>thrust</b>, <b>Pc</b>, <b>ε</b>. Derived: <b>exit diameter</b> from At = F / (η·Cf·Pc).</div>
+          </div>
+        </div>
+      </aside>
+
+      <div class="stagebox">
+        <div class="view" id="view">
+          <div class="floor"></div>
+          <canvas id="gl" aria-label="3D view of the generated engine. Drag to orbit, scroll to zoom."></canvas>
+          <div class="labels" id="labels"></div>
+          <div class="hud">
+            <div>
+              <div class="title" id="hudTitle">Kerolox gas generator</div>
+              <div class="sub" id="hudSub"></div>
+            </div>
+            <div class="regime" id="regime" data-k="ideal">Near ideal</div>
+          </div>
+          <div class="tip" id="tip" hidden></div>
+        </div>
+        <div class="toolbar">
+          <div class="alt">
+            <label for="alt">Altitude</label>
+            <input type="range" id="alt" min="0" max="120" step="0.5" value="0">
+            <output id="altVal">0 km · 1.000 atm</output>
+          </div>
+          <div class="tbtns">
+            <button class="tbtn" data-alt="0">Sea level</button>
+            <button class="tbtn" data-alt="20">20 km</button>
+            <button class="tbtn" data-alt="120">Vacuum</button>
+          </div>
+          <div class="tgroup">
+            <span>View</span>
+            <div class="tbtns">
+              <button class="tbtn" id="tPlume" aria-pressed="true">Plume</button>
+              <button class="tbtn" id="tExplode" aria-pressed="false">Exploded</button>
+              <button class="tbtn" id="tCut" aria-pressed="false">Cutaway</button>
+              <button class="tbtn" id="tLabels" aria-pressed="true">Labels</button>
+              <button class="tbtn" id="tSpin" aria-pressed="true">Spin</button>
+            </div>
+          </div>
+          <div class="tgroup">
+            <span>Cluster</span>
+            <div class="tbtns" id="cluster"></div>
+          </div>
+        </div>
+      </div>
+
+      <aside class="rail readout">
+        <div class="panel">
+          <div class="bigs">
+            <div class="big"><div class="k">Isp vac</div><div class="v" id="oIspV"></div><div class="s" id="oIspS"></div></div>
+            <div class="big"><div class="k">Thrust vac</div><div class="v" id="oFV"></div><div class="s" id="oFS"></div></div>
+            <div class="big"><div class="k">Mass</div><div class="v" id="oM"></div><div class="s" id="oMs"></div></div>
+            <div class="big"><div class="k">TWR vac</div><div class="v" id="oTWR"></div><div class="s" id="oTWRs"></div></div>
+          </div>
+        </div>
+        <div class="panel">
+          <dl class="kv" id="oKV"></dl>
+        </div>
+        <div class="panel chart">
+          <div class="ph"><h3>Isp vs altitude, Earth</h3><span class="hint mono" id="chartNote"></span></div>
+          <svg id="chart" viewBox="0 0 300 170" role="img" aria-label="Specific impulse against altitude"></svg>
+        </div>
+        <div class="panel">
+          <div class="ph"><h3>Why?</h3></div>
+          <div class="why" id="why"></div>
+          <ul class="warns" id="warns" style="margin-top:10px"></ul>
+        </div>
+      </aside>
+    </div>
+
+    <section class="block" id="anatomy">
+      <div class="block-head">
+        <div><div class="eyebrow">DESIGN §8.2–§8.5</div><h2>How the mesh is built</h2></div>
+        <p>The profile below is the one the 3D view revolves: a 1.5·Rt converging arc, a 0.382·Rt throat arc, and a quadratic Bézier bell from N to E with its middle point Q at the tangent intersection. Kit pieces are placed on a ring around the chamber and scale with pump power.</p>
+      </div>
+      <div class="anat">
+        <div class="panel svgbox"><svg id="profile" viewBox="0 0 1000 440" role="img" aria-label="Half-section of the nozzle contour"></svg></div>
+        <div class="panel">
+          <div class="ph"><h3 id="kitTitle">Kit for this cycle</h3></div>
+          <ol class="kitlist" id="kitList"></ol>
+        </div>
+      </div>
+    </section>
+
+    <section class="block" id="cycles-section">
+      <div class="block-head">
+        <div><div class="eyebrow">DESIGN §5.3 · cycles table</div><h2>Seven cycles, one part</h2></div>
+        <p>Each cycle is a data node with its own Pc range, pump pressure rise, mass factor, ignition rules and kit. These renders come from the same generator as the designer, using a real-engine-like preset for each.</p>
+      </div>
+      <div class="cards" id="cards"></div>
+    </section>
+
+    <section class="block">
+      <div class="block-head">
+        <div><div class="eyebrow">What this mockup simplifies</div><h2>Approximations</h2></div>
+        <p>The numbers follow the DESIGN.md model closely enough to show the trade-offs, but this page is a sketch of the mod, not the mod.</p>
+      </div>
+      <div class="notes">
+        <p><b>Thermochemistry.</b> Frozen-γ fits with c* by chamber pressure, tuned to the §5.2 sanity table. The mod would use CEA tables of Isp and Cf over Pc × ε, which reads 2–3 % higher for hydrolox and methalox.</p>
+        <p><b>Separation.</b> Summerfield criterion with k = 0.35: when exit pressure drops below 0.35 × ambient, Cf is evaluated at the wall point where that pressure is reached. No side-load or reliability model here.</p>
+        <p><b>Mass.</b> The §5.5 component sum with hand-tuned coefficients (Merlin ≈ 0.5 t, RL10 ≈ 0.16 t, RS-25 ≈ 3.2 t). Pressure-fed includes helium bottles, so it looks heavier than real engines that keep pressurant in the tank.</p>
+        <p><b>Atmosphere.</b> Standard Earth troposphere with an exponential above 11 km. The mod would read pressure from the launch body.</p>
+        <p><b>Geometry.</b> The bell, chamber and dome follow §8.2–§8.3. Kit pieces are primitives and swept tubes placed by simple rules; in the mod they get placement handles and template-vertex stretching.</p>
+        <p><b>Plume.</b> A shader cone whose width, length and shock-diamond spacing follow pe/pa. In the game this is a Waterfall template scaled by exit diameter (§9).</p>
+      </div>
+    </section>
+  </main>
+  <footer>ProcEngines is a planned mod. Design reference: _dev/ProceduralEngines/DESIGN.md. Real-engine names are comparisons only.</footer>
+</div>
+
+<script>
+/*PHYSICS*/
+</script>
+<script type="module">
+/*APP*/
+</script>
