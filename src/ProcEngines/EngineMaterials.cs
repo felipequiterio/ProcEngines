@@ -284,8 +284,20 @@ namespace ProcEngines
         /// <summary>Chamber, mount and convergent: EngineGeometry.MatSteel, MatRegenStatic, MatBolts.</summary>
         public static Material[] Static(string propellant) { Init(); return new[] { steel, Regen(propellant), bolts }; }
 
-        /// <summary>Kit: KitBuilder.MatStructure, MatMachine, MatLines, MatHot, MatFoil.</summary>
-        public static Material[] Kit() { Init(); return new[] { steel, machine, lines, hotDuct, foil }; }
+        /// <summary>Kit: KitBuilder.MatStructure, MatMachine, MatLines, MatHot, MatFoil, MatAuthored (the baked
+        /// atlas of the Blender pieces; plain machine steel if it's missing).</summary>
+        public static Material[] Kit()
+        {
+            Init();
+            if (authored == null)
+            {
+                Texture2D a = KitAssets.Atlas();
+                authored = a != null ? Make(bumped, a, flatNormal, Color.white, 0.3f, new Color(0.45f, 0.45f, 0.47f)) : machine;
+            }
+            return new[] { steel, machine, lines, hotDuct, foil, authored };
+        }
+
+        static Material authored;
 
         /// <summary>Bell: regen tubes, the extension (niobium, or carbon-carbon at the Late tech level), the inside, steel, bolts.</summary>
         public static Material[] Bell(string techLevel, string propellant)

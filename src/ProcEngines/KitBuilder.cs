@@ -232,6 +232,26 @@ namespace ProcEngines
             }
         }
 
+        /// <summary>Place an authored piece: piece-space (x, y, z) maps to origin + (X x + Y y + Z z) * scale. The
+        /// basis must be a rotation (det +1), so the file's winding holds.</summary>
+        public void AddMesh(KitMesh m, Vector3 origin, Vector3 X, Vector3 Y, Vector3 Z, float scale, int mat)
+        {
+            int start = v.Count;
+            for (int i = 0; i < m.Positions.Length; i++)
+            {
+                Vector3 p = m.Positions[i], nn = m.Normals[i];
+                v.Add(origin + (X * p.x + Y * p.y + Z * p.z) * scale);
+                Vector3 wn = (X * nn.x + Y * nn.y + Z * nn.z).normalized;
+                n.Add(wn);
+                Vector3 t = Vector3.Cross(wn, Mathf.Abs(wn.y) < 0.95f ? Vector3.up : Vector3.right).normalized;
+                tg.Add(new Vector4(t.x, t.y, t.z, -1));
+                uv.Add(m.Uvs[i]);
+            }
+            var tl = new List<int>(m.Indices.Length);
+            foreach (int i in m.Indices) tl.Add(start + i);
+            tris[Math.Min(mat, tris.Length - 1)].AddRange(tl);
+        }
+
         public void Box(Vector3 c, Vector3 size, int mat)
         {
             Vector3 h = size * 0.5f;
@@ -259,7 +279,15 @@ namespace ProcEngines
     /// </summary>
     public static class KitBuilder
     {
-        public const int MatStructure = 0, MatMachine = 1, MatLines = 2, MatHot = 3, MatFoil = 4, Materials = 5;
+        public const int MatStructure = 0, MatMachine = 1, MatLines = 2, MatHot = 3, MatFoil = 4, MatAuthored = 5, Materials = 6;
+
+        /// <summary>Where a turbopump's lines attach (part frame): positions and outward directions.</summary>
+        sealed class PumpPorts
+        {
+            public Vector3 OxOut, OxDir, FuelOut, FuelDir, TurbineIn, TurbineInDir, TurbineExhaust, TurbineExhaustDir, Inlet;
+            public bool HasInlet, HasFuelIn, Authored;
+            public Vector3 FuelIn;
+        }
 
         public sealed class Result
         {
@@ -327,44 +355,76 @@ namespace ProcEngines
             Vector3 Dome(float ang, float frac) => Around(ang, rc * frac, g.YInjector + 0.4f * g.DomeHeight);
             float yMan = g.ManifoldY, manR = g.ManifoldRadius;
 
-            // everything stays below the mount plate, so nothing pokes into the part stacked on top; a plain pump
-            // hangs below its inlet duct
-            Vector3 PumpC(float ang, float scale, bool preburner) => Around(ang, rc + rp * scale * 1.25f, yUnder - rp * scale * (preburner ? 2.35f : 1.7f));
-
-            void Pump(float ang, float scale, bool preburner, bool fuelToManifold, bool oxToDome)
+            // Turbopumps: the authored Blender piece when it's installed, else primitives. Everything stays below the
+            // mount plate, so nothing pokes into the part stacked on top. A plain pump hangs below its inlet duct;
+            // a staged-combustion pump hangs upside down, turbine end up, with its preburner on top of the turbine.
+            PumpPorts Pump(float ang, float scale, bool preburner, bool dual)
             {
                 float r = rp * scale;
-                float pr = rc + r * 1.25f;
-                Vector3 c = PumpC(ang, scale, preburner);
-                mb.Cylinder(c - Vector3.up * r, c + Vector3.up * r * 0.9f, r * 0.75f, MatMachine);            // housing
-                mb.Torus(c + Vector3.up * r * 0.2f, Vector3.up, r * 0.78f, r * 0.32f, MatMachine);            // volute
-                mb.Torus(c - Vector3.up * r * 0.55f, Vector3.up, r * 0.76f, r * 0.06f, MatStructure, 20, 6);  // housing flange
-                mb.Cylinder(c - Vector3.up * r * 1.35f, c - Vector3.up * r * 0.95f, r * 0.9f, MatStructure);  // turbine
-                // inlet duct up to the tank interface, with a bellows to take up gimbal and thermal motion
-                if (!preburner)
+                Vector3 radial = Around(ang, 1, 0), tang = Around(ang + 90, 1, 0);
+                KitMesh km = KitAssets.Get(dual ? "turbopump_dual" : "turbopump_single");
+                var p = new PumpPorts();
+                if (km != null)
                 {
-                    float inR = Mathf.Max(fuelR, oxR) * 1.15f;
-                    mb.Tube(new[] { c + Vector3.up * r * 0.9f, new Vector3(c.x, yUnder - 0.004f, c.z) }, inR, oxToDome ? MatLines : fuelMat, 12, MatStructure, 0.3f, 0.7f);
+                    Vector3 c = Around(ang, rc + r * 1.25f, yUnder - r * (preburner ? 2.8f : 1.7f));
+                    Vector3 Y = preburner ? Vector3.down : Vector3.up, Z = preburner ? -tang : tang;
+                    mb.AddMesh(km, c, radial, Y, Z, r, MatAuthored);
+                    bool A(string name, out Vector3 pos, out Vector3 dir)
+                    {
+                        bool ok = km.TryAnchor(name, out Vector3 lp, out Vector3 ld);
+                        pos = c + (radial * lp.x + Y * lp.y + Z * lp.z) * r;
+                        dir = radial * ld.x + Y * ld.y + Z * ld.z;
+                        return ok;
+                    }
+                    if (!A("ox_out", out p.OxOut, out p.OxDir)) A("out", out p.OxOut, out p.OxDir);
+                    if (!A("fuel_out", out p.FuelOut, out p.FuelDir)) A("out", out p.FuelOut, out p.FuelDir);
+                    A("turbine_in", out p.TurbineIn, out p.TurbineInDir);
+                    A("turbine_exhaust", out p.TurbineExhaust, out p.TurbineExhaustDir);
+                    p.HasInlet = !preburner && A("inlet", out p.Inlet, out _);
+                    p.HasFuelIn = !preburner && A("fuel_in", out p.FuelIn, out _);
+                    p.Authored = true;
                 }
+                else
+                {
+                    Vector3 c = Around(ang, rc + r * 1.25f, yUnder - r * (preburner ? 2.35f : 1.7f));
+                    mb.Cylinder(c - Vector3.up * r, c + Vector3.up * r * 0.9f, r * 0.75f, MatMachine);            // housing
+                    mb.Torus(c + Vector3.up * r * 0.2f, Vector3.up, r * 0.78f, r * 0.32f, MatMachine);            // volute
+                    mb.Torus(c - Vector3.up * r * 0.55f, Vector3.up, r * 0.76f, r * 0.06f, MatStructure, 20, 6);  // housing flange
+                    mb.Cylinder(c - Vector3.up * r * 1.35f, c - Vector3.up * r * 0.95f, r * 0.9f, MatStructure);  // turbine
+                    p.OxOut = c + Around(ang + 90, r * 0.75f, r * 0.2f); p.OxDir = tang;
+                    p.FuelOut = c + Around(ang - 90, r * 0.75f, r * 0.2f); p.FuelDir = -tang;
+                    p.TurbineIn = c + Around(ang + 28, r * 0.9f, -r * 1.15f); p.TurbineInDir = Around(ang + 28, 1, 0);
+                    // the primitive preburner sits on the housing; the turbine exhaust is at the bottom
+                    p.TurbineExhaust = preburner ? c + Vector3.up * r * 0.9f : c - Vector3.up * r * 1.35f;
+                    p.TurbineExhaustDir = preburner ? Vector3.up : Vector3.down;
+                    p.Inlet = c + Vector3.up * r * 0.9f;
+                    p.HasInlet = !preburner;
+                }
+                // inlet ducts up to the tank interface, with bellows to take up gimbal and thermal motion
+                float inR = Mathf.Max(fuelR, oxR) * 1.15f;
+                if (p.HasInlet) mb.Tube(new[] { p.Inlet, new Vector3(p.Inlet.x, yUnder - 0.004f, p.Inlet.z) }, inR, MatLines, 12, MatStructure, 0.3f, 0.7f);
+                if (p.HasFuelIn) mb.Tube(new[] { p.FuelIn, new Vector3(p.FuelIn.x, yUnder - 0.004f, p.FuelIn.z) }, fuelR * 1.1f, fuelMat, 12, MatStructure, 0.3f, 0.7f);
                 if (preburner)
                 {
-                    Vector3 pb = c + Vector3.up * (r * 0.9f);
+                    Vector3 pb = p.TurbineExhaust;
                     mb.Cylinder(pb, pb + Vector3.up * r * 0.9f, r * 0.45f, MatMachine);
                     mb.Sphere(pb + Vector3.up * r * 0.9f, r * 0.45f, MatMachine);
                     mb.Torus(pb + Vector3.up * r * 0.1f, Vector3.up, r * 0.46f, r * 0.05f, MatStructure, 20, 6);
                     // hot-gas duct into the injector dome
                     mb.Tube(new[] { pb + Vector3.up * r * 1.2f, Vector3.Lerp(pb, Dome(ang, 0.2f), 0.5f) + Vector3.up * r * 0.6f, Dome(ang, 0.2f) }, r * 0.28f, MatMachine, 12, MatStructure);
                 }
-                if (oxToDome)
-                    mb.Tube(new[] { c + Around(ang + 90, r * 0.75f, r * 0.2f), Around(ang + 30, rc * 1.05f, c.y + r * 0.2f), Dome(ang + 30, 0.7f) }, oxR, MatLines, 10, MatStructure);
-                if (fuelToManifold)
-                {
-                    Vector3 start = c + Around(ang - 90, r * 0.75f, r * 0.2f);
-                    float yMid = g.YChamberBottom;
-                    float yHalf = g.YThroat - 0.5f * (g.YThroat - yMan);
-                    // the line crosses onto the gimballed bell: a bellows section takes up the motion
-                    mb.Tube(new[] { start, Around(ang - 25, pr, yMid), Around(ang - 25, g.BellRadiusAt(yHalf) + fuelR * 2, yHalf), Around(ang - 25, manR, yMan) }, fuelR, fuelMat, 10, MatStructure, 0.18f, 0.3f);
-                }
+                return p;
+            }
+
+            void OxToDome(PumpPorts p, float ang, float r) =>
+                mb.Tube(new[] { p.OxOut, p.OxOut + p.OxDir * r * 0.35f, Around(ang + 30, rc * 1.05f, p.OxOut.y), Dome(ang + 30, 0.7f) }, oxR, MatLines, 10, MatStructure);
+
+            // the fuel line crosses onto the gimballed bell: a bellows section takes up the motion
+            void FuelToManifold(PumpPorts p, float ang, float r, int mat, float sweep = -25)
+            {
+                float yMid = Mathf.Min(g.YChamberBottom, p.FuelOut.y - r * 0.3f);
+                float yHalf = g.YThroat - 0.5f * (g.YThroat - yMan);
+                mb.Tube(new[] { p.FuelOut, p.FuelOut + p.FuelDir * r * 0.35f, Around(ang + sweep, rc + r * 1.3f, yMid), Around(ang + sweep, g.BellRadiusAt(yHalf) + fuelR * 2, yHalf), Around(ang + sweep, manR, yMan) }, fuelR, mat, 10, MatStructure, 0.2f, 0.3f);
             }
 
             switch (d.Cycle)
@@ -393,20 +453,26 @@ namespace ProcEngines
                 }
                 case "GasGenerator":
                 {
-                    Pump(0, 1, false, true, true);
-                    // gas generator beside the pump, exhaust duct down past the bell ending in a small nozzle
                     float r = rp;
-                    Vector3 pumpC = PumpC(0, 1, false);
-                    Vector3 gg = Around(28, rc + r * 0.9f, pumpC.y + r * 0.55f);
-                    mb.Sphere(gg, r * 0.38f, MatMachine);
-                    mb.Cylinder(gg - Vector3.up * r * 0.5f, gg - Vector3.up * r * 0.25f, r * 0.2f, MatMachine, 10);
+                    PumpPorts p = Pump(0, 1, false, true);
+                    OxToDome(p, 0, r);
+                    FuelToManifold(p, 0, r, fuelMat);
+                    // gas generator feeding the turbine inlet
+                    Vector3 gg = p.TurbineIn + p.TurbineInDir * r * 0.45f + Vector3.up * r * 0.1f;
+                    mb.Sphere(gg, r * 0.3f, MatMachine);
+                    mb.Cylinder(gg, p.TurbineIn, r * 0.12f, MatHot, 10);
+                    mb.Cylinder(gg + Vector3.up * r * 0.25f, gg + Vector3.up * r * 0.45f, r * 0.14f, MatMachine, 10);
+                    // exhaust duct down past the bell ending in a small nozzle
                     float yEx = g.YThroat - 0.45f * bellLen;
                     float ductR = Mathf.Max(r * 0.32f, 0.01f);
                     float clear = g.BellRadiusAt(yEx) + ductR * 1.6f;
                     Vector3 exitTop = Around(-35, clear, yEx);
                     Vector3 exitBottom = exitTop - Vector3.up * ductR * 2.2f;
+                    Vector3 te = p.TurbineExhaust;
+                    float yMid = Mathf.Min(g.YChamberBottom, te.y - r * 0.4f);
+                    float yLow = Mathf.Min(g.YThroat - 0.2f * bellLen, yMid - r * 0.2f);
                     // uncooled turbine exhaust: heat-tinted, and it glows dull red while running (MatHot)
-                    mb.Tube(new[] { pumpC - Vector3.up * r * 1.35f, Around(-20, rc + r * 1.25f, g.YChamberBottom), Around(-30, g.BellRadiusAt(g.YThroat - 0.2f * bellLen) + ductR * 1.6f, g.YThroat - 0.2f * bellLen), exitTop }, ductR, MatHot, 12, MatStructure);
+                    mb.Tube(new[] { te, te + p.TurbineExhaustDir * r * 0.3f, Around(-20, rc + r * 1.25f, yMid), Around(-30, g.BellRadiusAt(yLow) + ductR * 1.6f, yLow), exitTop }, ductR, MatHot, 12, MatStructure);
                     mb.Frustum(exitTop, exitBottom, ductR, ductR * 1.7f, MatHot, 14, false);
                     res.HasExhaust = true;
                     res.ExhaustPosition = exitBottom;
@@ -415,23 +481,32 @@ namespace ProcEngines
                 }
                 case "Expander":
                 {
-                    Pump(0, 1, false, false, true);
-                    // heated hydrogen: regen manifold up to the turbine (warm gas: plain line, no insulation)
                     float r = rp;
-                    Vector3 pumpC = PumpC(0, 1, false);
-                    float yHalf = g.YThroat - 0.5f * (g.YThroat - yMan);
-                    mb.Tube(new[] { Around(-25, manR, yMan), Around(-25, g.BellRadiusAt(yHalf) + fuelR * 2, yHalf), Around(-15, rc + r * 1.25f, g.YChamberBottom), pumpC - Vector3.up * r * 1.35f }, fuelR, MatLines, 10, MatStructure, 0.7f, 0.82f);
+                    PumpPorts p = Pump(0, 1, false, true);
+                    OxToDome(p, 0, r);
                     // cold hydrogen from the pump to the manifold, insulated
-                    mb.Tube(new[] { pumpC + Around(-90, r * 0.75f, r * 0.2f), Around(-60, rc + r * 1.3f, g.YChamberBottom), Around(-55, g.BellRadiusAt(yHalf) + fuelR * 2, yHalf), Around(-50, manR, yMan) }, fuelR, MatFoil, 10, MatStructure, 0.18f, 0.3f);
+                    FuelToManifold(p, 0, r, MatFoil, -55);
+                    // heated hydrogen: regen manifold up to the turbine inlet (warm gas: plain line, no insulation)
+                    float yHalf = g.YThroat - 0.5f * (g.YThroat - yMan);
+                    mb.Tube(new[] { Around(-25, manR, yMan), Around(-25, g.BellRadiusAt(yHalf) + fuelR * 2, yHalf), Around(-15, rc + r * 1.3f, Mathf.Min(g.YChamberBottom, p.TurbineIn.y - r * 0.3f)), p.TurbineIn + p.TurbineInDir * r * 0.4f, p.TurbineIn }, fuelR, MatLines, 10, MatStructure, 0.7f, 0.82f);
                     break;
                 }
                 case "StagedCombustion":
-                    Pump(0, 1, true, true, true);
+                {
+                    PumpPorts p = Pump(0, 1, true, true);
+                    OxToDome(p, 0, rp);
+                    FuelToManifold(p, 0, rp, fuelMat);
                     break;
+                }
                 case "FullFlowStaged":
-                    Pump(0, 0.8f, true, true, false);
-                    Pump(180, 0.8f, true, false, true);
+                {
+                    // one single-propellant pump per side, each with its own preburner
+                    PumpPorts fp = Pump(0, 0.8f, true, false);
+                    FuelToManifold(fp, 0, rp * 0.8f, fuelMat);
+                    PumpPorts op = Pump(180, 0.8f, true, false);
+                    OxToDome(op, 180, rp * 0.8f);
                     break;
+                }
             }
 
             mb.Build(mesh);

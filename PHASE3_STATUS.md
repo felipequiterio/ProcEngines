@@ -85,6 +85,34 @@ First step of the model-improvement plan. Everything is still generated in code;
   - **When cooled:** the per-material blocks are cleared, so KSP's renderer-wide block (part highlight) applies again.
 - **Tests:** the `visual` script adds a close-up (camera on the bell) and an **after-shutdown** shot: plume out, metal still hot. It also checks the emissive ST. Shots are `visual_detail_*` and `visual_afterglow_*`.
 
+## Blender pipeline and the first authored piece (turbopumps)
+
+Step 2 of the model-improvement plan.
+
+- **`tools/blender/build_kit.py`** runs headless in Blender 5.2, in about 5 s at 32 samples:
+  - Models each piece with bmesh, from lathe profiles, swept tubes, scroll volutes, bolt rings and ribs. Edges sharper than 32° are marked sharp, so the exported split normals keep hard edges.
+  - Places **anchors** as empties named `<piece>.<anchor>`, with +Z as the direction.
+  - Smart-UV-projects all pieces into **one shared atlas**.
+  - Bakes it with Cycles, once for base colour (noise-mottled per material) and once for ambient occlusion. The atlas is base colour × (0.3 + 0.7·AO), 1024².
+  - Exports each piece to a small binary **`.pem`** file: positions, normals, UVs, indices and anchors, already in Unity axes and winding.
+  - Saves `kit.blend`. `--export-only` re-bakes and exports from a hand-edited `kit.blend`.
+- **Pieces:**
+  - **`turbopump_dual`** (GG, staged combustion, expander): single shaft. From top to bottom: bolted axial ox inlet, inducer flare, ox pump with scroll volute discharging tangentially, ribbed inter-stage seal, fuel pump with its own volute and an inlet elbow turning up, bearing neck, then the turbine with a bronze toroidal hot-gas manifold, a side inlet and a bolted exhaust flange. Anchors: `inlet`, `fuel_in`, `ox_out`, `fuel_out`, `turbine_in`, `turbine_exhaust`. 9.4k vertices.
+  - **`turbopump_single`** (full-flow, one propellant per pump): the same without the fuel stage. 6.5k vertices.
+- **Plugin (`KitAssets.cs`):** loads the `.pem` files and atlas from `GameData/ProcEngines/PluginData/Kit`. PluginData is outside KSP's GameDatabase, so the atlas isn't also loaded as a game texture.
+  - The atlas is compressed to **DXT1** (~0.7 MB with mips) and drops its CPU copy.
+  - Missing or broken files fall back to the primitive pump.
+- **`KitBuilder`:**
+  - Places the piece with a rotation basis: +X radially out, +Y up, +Z tangential.
+  - All plumbing now routes from the pump's anchors: ox line to the dome, fuel line to the manifold, GG on the turbine inlet, GG exhaust duct from the turbine exhaust, expander hot hydrogen into the turbine inlet. Two inlet ducts (ox and fuel), each with bellows, run up to the tank interface.
+  - **Staged-combustion pumps hang upside down**, turbine end up, with the preburner sitting on the turbine, as on the RS-25.
+  - The kit's 6th material is the atlas.
+- **Tests:** `visual.kit_assets` checks that both pieces and their anchors load and that the atlas is DXT1. A second close-up (`visual_detail2_*`) shows the pump side, which is in shadow in that view. Visual 7/7, sandbox 24/24.
+- **Not done yet:**
+  - The other authored pieces: preburner, gas generator, valves, actuators, injector head.
+  - A baked normal map: the atlas uses a flat normal.
+  - Levels of detail: the pumps add about 9–13k kit vertices per engine.
+
 ## Evidence
 
 [tests/ksp/evidence/phase3/](tests/ksp/evidence/phase3/): results files, and screenshots:

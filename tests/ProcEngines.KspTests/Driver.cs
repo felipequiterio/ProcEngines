@@ -436,6 +436,9 @@ namespace ProcEngines.KspTests
                 ("KeroloxGGVacRad", D("Kerolox", "GasGenerator", 980, 97, 150, true)),
                 ("KeroloxPF", D("Kerolox", "PressureFed", 78, 21, 40)),
             };
+            KitMesh dual = KitAssets.Get("turbopump_dual"), single = KitAssets.Get("turbopump_single");
+            Check("visual.kit_assets", dual != null && single != null && KitAssets.Atlas() != null && dual.Anchors.ContainsKey("ox_out") && single.Anchors.ContainsKey("out"),
+                $"dual {dual?.Positions.Length} verts {dual?.Anchors.Count} anchors, single {single?.Positions.Length} verts, atlas {KitAssets.Atlas()?.format} {KitAssets.Atlas()?.width}px, dir {KitAssets.Directory}");
             foreach (var (tag, d) in combos)
             {
                 if (HighLogic.LoadedScene != GameScenes.EDITOR) yield return EnterEditor();
@@ -457,6 +460,9 @@ namespace ProcEngines.KspTests
                 CameraOn(bellT, size * 1.1f, 4, 60);
                 yield return new WaitForSecondsRealtime(1f);
                 yield return Shot("detail_" + tag);
+                CameraOn(bellT, size * 1.1f, 4, 240);
+                yield return new WaitForSecondsRealtime(1f);
+                yield return Shot("detail2_" + tag);
                 Camera(size * 2.0f, -6, 35, m.part);
                 var e = m.part.FindModuleImplementing<ModuleEnginesFX>();
                 FlightInputHandler.state.mainThrottle = 1f;
