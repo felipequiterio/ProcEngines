@@ -17,7 +17,9 @@ namespace ProcEngines
     /// holding them) is built in a second mesh in the bell's frame (<see cref="Build(Mesh, Mesh, EngineDesign,
     /// EngineStats, EngineGeometry, ModelData, int)"/>); everything else is static and keeps out of the volume the bell
     /// sweeps, with a small gap. The lines cross from the static kit onto the bell at flanged joints under their
-    /// bellows, where the bell's motion is small.
+    /// bellows, where the bell's motion is small. The gimbal actuators span the two: given meshes for them, each
+    /// becomes a barrel on its clevis and a rod on the bell lug that slides in it (<see cref="ActuatorPose"/>), which
+    /// ModuleProcEngine aims at the gimballed eye every frame.
     ///
     /// Proportions follow the real hardware: fat gimbal actuators just outside the chamber on outriggers, landing on
     /// lugs on the regen bell; pump-suction ducts sized for 15 m/s and high-pressure discharge lines for 30 m/s with
@@ -63,6 +65,26 @@ namespace ProcEngines
             public float ExhaustRadius;
             /// <summary>Thrust-frame struts placed (4, or 3 when the dome is too crowded; for tests).</summary>
             public int ThrustStruts;
+            /// <summary>The gimbal actuators at rest (empty when they were drawn into the static kit).</summary>
+            public ActuatorPose[] Actuators = new ActuatorPose[0];
+            /// <summary>Barrel radius (m).</summary>
+            public float ActuatorRadius;
+            /// <summary>Along the actuator axis: from the clevis pin to where the rod leaves the gland, and from the
+            /// rod-eye pin up to the top of the rod (hidden in the barrel), in metres. The rod is still in the barrel
+            /// while length - RodLength &lt; Gland.</summary>
+            public float ActuatorGland, ActuatorRodLength;
+        }
+
+        /// <summary>
+        /// A gimbal actuator at rest, part frame: the top clevis pin centre (fixed to the thrust frame), the rod-eye
+        /// pin centre (on the bell lug, so it gimbals with the bell), the direction its servo block faces (outward,
+        /// square to the axis) and the pin axis of both clevises. Its barrel mesh (KitBuilder's actuator body) hangs
+        /// from the clevis in the frame (X = Out, Y = up the actuator, Z = Pin); its rod mesh has the same axes with the
+        /// rod-eye pin at the origin. ModuleProcEngine aims both at the gimballed eye every frame.
+        /// </summary>
+        public struct ActuatorPose
+        {
+            public Vector3 Top, Eye, Out, Pin;
         }
 
         static Vector3 Around(float deg, float radius, float y) => new Vector3(radius * Mathf.Cos(deg * Mathf.Deg2Rad), y, radius * Mathf.Sin(deg * Mathf.Deg2Rad));
@@ -98,16 +120,29 @@ namespace ProcEngines
         /// BELL frame: part frame minus (0, YThroat, 0), the frame of EngineGeometry.Lathe(bell, ..., g.YThroat). With
         /// `bellMesh` null that geometry goes into `mesh`. Result positions are in the part frame.
         /// </summary>
-        public static Result Build(Mesh mesh, Mesh bellMesh, EngineDesign d, EngineStats s, EngineGeometry g, ModelData data, int lod = 0)
+        public static Result Build(Mesh mesh, Mesh bellMesh, EngineDesign d, EngineStats s, EngineGeometry g, ModelData data, int lod = 0) =>
+            Build(mesh, bellMesh, null, null, d, s, g, data, lod);
+
+        /// <summary>
+        /// As above, and with `actBody` and `actRod` given the gimbal actuators are not in the static kit: one barrel
+        /// (`actBody`, in the clevis frame) and one rod (`actRod`, in the rod-eye frame) that every actuator of this
+        /// engine shares, placed per actuator from Result.Actuators (<see cref="ActuatorPose"/>).
+        /// </summary>
+        public static Result Build(Mesh mesh, Mesh bellMesh, Mesh actBody, Mesh actRod, EngineDesign d, EngineStats s, EngineGeometry g, ModelData data, int lod = 0)
         {
-            // pooled builders (ASSETS round 2, D7): slot 0 = LOD0, 1 = LOD1, 4 / 5 = their bell kits; Build copies the
-            // data, so reuse is safe. Modest pre-sizes, a quarter of a big kit: the buffers double to the largest kit
-            // built (MeshBuilder.Reserve), landing at 147k / 49k vertices for the biggest test kits (142k / 47k).
+            // pooled builders (ASSETS round 2, D7): slot 0 = LOD0, 1 = LOD1, 4 / 5 = their bell kits, 6 / 7 the LOD0
+            // actuator barrel and rod, 8 / 9 at LOD1; Build copies the data, so reuse is safe. Modest pre-sizes, a
+            // quarter of a big kit: the buffers double to the largest kit built (MeshBuilder.Reserve), landing at
+            // 147k / 49k vertices for the biggest test kits (142k / 47k).
             MeshBuilder mb = MeshBuilder.Pooled(Materials, lod <= 0 ? 0 : 1, lod <= 0 ? 36864 : 12288);
             MeshBuilder mbBell = bellMesh != null ? MeshBuilder.Pooled(Materials, lod <= 0 ? 4 : 5, lod <= 0 ? 6144 : 2048) : null;
-            Result res = Fill(mb, mbBell, d, s, g, data, lod);
+            bool act = actBody != null && actRod != null;
+            MeshBuilder mbBody = act ? MeshBuilder.Pooled(Materials, lod <= 0 ? 6 : 8, lod <= 0 ? 4096 : 1024) : null;
+            MeshBuilder mbRod = act ? MeshBuilder.Pooled(Materials, lod <= 0 ? 7 : 9, lod <= 0 ? 1024 : 512) : null;
+            Result res = Fill(mb, mbBell, mbBody, mbRod, d, s, g, data, lod);
             mb.Build(mesh);
             if (bellMesh != null) mbBell.Build(bellMesh);
+            if (act) { mbBody.Build(actBody); mbRod.Build(actRod); }
             return res;
         }
 
@@ -270,16 +305,105 @@ namespace ProcEngines
 
         /// <summary>Adds the kit for one level of detail: static pieces to `mb` (part frame), bell-attached ones to
         /// `bellMb` in the bell frame (part frame minus (0, YThroat, 0)), or to `mb` when `bellMb` is null.</summary>
-        public static Result Fill(MeshBuilder mb, MeshBuilder bellMb, EngineDesign d, EngineStats s, EngineGeometry g, ModelData data, int lod = 0)
+        public static Result Fill(MeshBuilder mb, MeshBuilder bellMb, EngineDesign d, EngineStats s, EngineGeometry g, ModelData data, int lod = 0) =>
+            Fill(mb, bellMb, null, null, d, s, g, data, lod);
+
+        /// <summary>As above; with `bodyMb` and `rodMb` the gimbal actuators go there (one barrel and one rod in their
+        /// own frames, see <see cref="ActuatorPose"/>) instead of into the static kit.</summary>
+        public static Result Fill(MeshBuilder mb, MeshBuilder bellMb, MeshBuilder bodyMb, MeshBuilder rodMb, EngineDesign d, EngineStats s, EngineGeometry g, ModelData data, int lod = 0)
         {
             int bellStart = bellMb != null ? bellMb.VertexCount : 0;
-            Result res = FillParts(mb, bellMb ?? mb, d, s, g, data, lod);
+            Result res = FillParts(mb, bellMb ?? mb, bodyMb != null && rodMb != null ? bodyMb : null, rodMb, d, s, g, data, lod);
             if (bellMb != null) bellMb.Translate(new Vector3(0, -g.YThroat, 0), bellStart);
             return res;
         }
 
-        /// <summary>The kit: static pieces into `mb`, bell-attached ones into `mbB`, both in the part frame.</summary>
-        static Result FillParts(MeshBuilder mb, MeshBuilder mbB, EngineDesign d, EngineStats s, EngineGeometry g, ModelData data, int lod)
+        static readonly Dictionary<KitMesh, KitMesh[]> actuatorSplit = new Dictionary<KitMesh, KitMesh[]>();
+
+        /// <summary>
+        /// The authored actuator cut into its barrel (clevis, servo block, barrel, gland and the wiper fillet that
+        /// closes onto the rod) and its rod (chrome rod, lock nut, rod-end eye), cached per loaded piece. The rod is
+        /// what lies below the top of the rod stretch zone (zone1_hi + 0.25) within 2 % of the rod radius, plus
+        /// everything below zone1_lo - 0.05; the rod radius is the smallest radius above 0.1 between zone1_lo and
+        /// zone1_hi + 0.2 (0.42 barrel radii). Both levels of the shipped piece cut cleanly at the ring where the
+        /// fillet meets the rod (y -7.11). Null when the piece has no rod zone or the cut leaves either half empty.
+        /// </summary>
+        static KitMesh[] SplitActuator(KitMesh m)
+        {
+            if (m == null) return null;
+            if (actuatorSplit.TryGetValue(m, out KitMesh[] parts)) return parts;
+            parts = null;
+            if (m.TryAnchor("zone1_hi", out Vector3 hi, out _) && m.TryAnchor("zone1_lo", out Vector3 lo, out _) && m.TryAnchor("end", out _, out _))
+            {
+                float rodR = float.MaxValue;
+                foreach (Vector3 p in m.Positions)
+                {
+                    float r = Mathf.Sqrt(p.x * p.x + p.z * p.z);
+                    if (p.y >= lo.y && p.y <= hi.y + 0.2f && r > 0.1f && r < rodR) rodR = r;
+                }
+                if (rodR < 1f)
+                {
+                    float rodMax = 1.02f * rodR, yTop = hi.y + 0.25f, yEye = lo.y - 0.05f;
+                    bool Rod(Vector3 p) => p.y < yEye || (p.y <= yTop && p.x * p.x + p.z * p.z <= rodMax * rodMax);
+                    KitMesh body = m.Subset(Rod, false, ".body"), rod = m.Subset(Rod, true, ".rod");
+                    if (body != null && rod != null) parts = new[] { body, rod };
+                }
+            }
+            actuatorSplit[m] = parts;
+            return parts;
+        }
+
+        static float ZoneLength(KitMesh m, int zone) =>
+            m.TryAnchor("zone" + zone + "_hi", out Vector3 hi, out _) && m.TryAnchor("zone" + zone + "_lo", out Vector3 lo, out _) ? Mathf.Max(hi.y - lo.y, 0) : 0;
+
+        /// <summary>
+        /// One gimbal actuator as two meshes that slide on each other: the barrel in the clevis frame (clevis pin at
+        /// the origin, the axis down -Y, the servo block toward +X, the pin along Z) and the rod in the rod-eye frame
+        /// (eye pin at the origin, the rod up +Y). At the rest `length` (m) they line up exactly as the single
+        /// stretched piece did: the barrel zone (zone0) and the rod zone (zone1) share the stretch in proportion to
+        /// their lengths, and a length that would fold them scales the piece along its axis instead (as AddMesh).
+        /// The rod is longer than that by a reserve hidden in the barrel: the eye, `eyeArm` from the gimbal pivot,
+        /// moves at most 2 eyeArm sin(max / 2) when the bell swings GimbalClearanceDeg, which bounds how much longer
+        /// the actuator gets, plus 0.35 barrel radii, so the rod never leaves the gland.
+        /// `parts` are this level's (barrel, rod) halves and `parts0` the LOD0 piece's, which set the stations;
+        /// null draws primitives.
+        /// </summary>
+        static void BuildActuator(MeshBuilder mbBody, MeshBuilder mbRod, KitMesh[] parts, KitMesh[] parts0, float length, float ra, float eyeArm, Result res, Func<int, int> S)
+        {
+            float reserve = 2 * eyeArm * Mathf.Sin(0.5f * GimbalClearanceDeg * Mathf.Deg2Rad) + 0.35f * ra;
+            if (parts != null && parts0 != null && parts0[1].TryAnchor("end", out Vector3 end, out _))
+            {
+                float z0 = ZoneLength(parts0[0], 0), z1 = ZoneLength(parts0[0], 1), endL = Mathf.Max(-end.y, 1e-3f);
+                float L = length / ra, D = L - endL, k = 1, d0 = 0, d1 = 0;
+                if (z0 + z1 <= 0 || D < -0.7f * (z0 + z1)) k = L / endL;
+                else { d0 = D * z0 / (z0 + z1); d1 = D * z1 / (z0 + z1); }
+                float e = reserve / (ra * k);   // the reserve in piece units, before the axial scale
+                float rodTop = float.NegativeInfinity;
+                foreach (Vector3 p in parts0[1].Positions) rodTop = Mathf.Max(rodTop, p.y);
+                Vector3 Y = Vector3.up * k;
+                mbBody.AddMesh(parts[0], Vector3.zero, Vector3.right, Y, Vector3.forward, ra, MatAuthored, new[] { d0, d1 });
+                // the rod: zone0 unstretched (the rod lies below it), zone1 grown by the reserve, the eye moved to the origin
+                float eyeY = end.y - d1 - e;
+                mbRod.AddMesh(parts[1], new Vector3(0, -eyeY * k * ra, 0), Vector3.right, Y, Vector3.forward, ra, MatAuthored, new[] { 0f, d1 + e });
+                res.ActuatorGland = (d0 - rodTop) * k * ra;
+                res.ActuatorRodLength = (rodTop - eyeY) * k * ra;
+                return;
+            }
+            // primitives: clevis ball, barrel and gland on the clevis; rod and rod-end ball on the eye
+            float lb = 0.55f * length;
+            mbBody.Sphere(new Vector3(0, -0.6f * ra, 0), ra * 1.1f, MatStructure, S(20));
+            mbBody.Cylinder(new Vector3(0, -0.6f * ra, 0), new Vector3(0, -lb, 0), ra, MatMachine, S(24));
+            mbBody.Cylinder(new Vector3(0, -lb + 0.25f * ra, 0), new Vector3(0, -lb - 0.05f * ra, 0), ra * 1.18f, MatStructure, S(24));
+            float rodLen = length - lb + reserve;
+            mbRod.Cylinder(Vector3.zero, new Vector3(0, rodLen, 0), ra * 0.42f, MatLines, S(16));
+            mbRod.Sphere(Vector3.zero, ra * 0.5f, MatStructure, S(20));
+            res.ActuatorGland = lb + 0.05f * ra;
+            res.ActuatorRodLength = rodLen;
+        }
+
+        /// <summary>The kit: static pieces into `mb`, bell-attached ones into `mbB`, both in the part frame; with
+        /// `mbBody` non-null the actuator barrel and rod into `mbBody` / `mbRod` in their own frames.</summary>
+        static Result FillParts(MeshBuilder mb, MeshBuilder mbB, MeshBuilder mbBody, MeshBuilder mbRod, EngineDesign d, EngineStats s, EngineGeometry g, ModelData data, int lod)
         {
             var res = new Result();
             bool full = lod <= 0;
@@ -364,8 +488,9 @@ namespace ProcEngines
             // just outside the chamber: the top clevis hangs from an outrigger under the stage above, clear of the
             // injector flange; the rod end lands on a lug on the regen bell, above the extension joint and the
             // manifold. Sized from its own length (L ~ 18 barrel radii), iterated since the stations depend on it.
-            // The actuator is static: its rod eye and rod stay outside the swept bell, and the lug cheeks (on the bell)
-            // reach out to the eye.
+            // The stations are laid out as if the actuator were static (its rod eye and rod outside the swept bell,
+            // the lug cheeks on the bell reaching out to the eye); in the part it follows the bell (ActuatorPose). The
+            // visual test checks it stays clear of the bell and the kit at full deflection in every direction.
             float[] actAngles = d.Cycle == "FullFlowStaged" ? new[] { 90f, 270f } : new[] { 135f, 225f };
             float regenLimit = g.YThroat - 0.6f * (g.YThroat - g.RegenEndY);
             float ra = 0.15f * rc, rTop = 0, yAct = 0, yBeam = 0, yPin = 0, rEye = 0;
@@ -402,8 +527,17 @@ namespace ProcEngines
 
             // ---------------------------------------------------------------- actuators
             KitMesh actuator = KitAssets.Get("actuator");
-            foreach (float ang in actAngles)
+            bool moving = mbBody != null;
+            KitMesh[] split0 = moving ? SplitActuator(actuator) : null, split = moving ? SplitActuator(Draw(actuator, "actuator")) : null;
+            if (split == null) split = split0;   // a LOD1 file that doesn't cut: the full piece's halves
+            if (moving)
             {
+                res.Actuators = new ActuatorPose[actAngles.Length];
+                res.ActuatorRadius = ra;
+            }
+            for (int ai = 0; ai < actAngles.Length; ai++)
+            {
+                float ang = actAngles[ai];
                 Vector3 radial = Around(ang, 1, 0);
                 Vector3 top = Around(ang, rTop, yPin);
                 float rb = g.BellRadiusAt(yAct);
@@ -425,6 +559,13 @@ namespace ProcEngines
                     mbB.Cylinder(pad + N * 0.1f * ra + Z * side * 0.6f * ra, bot + lugOut * 0.3f * ra + Z * side * 0.6f * ra, 0.22f * ra, MatStructure, S(12));
                 mbB.Cylinder(bot - Z * 0.85f * ra, bot + Z * 0.85f * ra, 0.17f * ra, MatStructure, S(12));
 
+                if (moving)
+                {
+                    res.Actuators[ai] = new ActuatorPose { Top = top, Eye = bot, Out = X, Pin = Z };
+                    // every actuator has the same stations, so the first one's barrel and rod serve them all
+                    if (ai == 0) BuildActuator(mbBody, mbRod, split0 != null ? split : null, split0, (bot - top).magnitude, ra, (bot - g.YThroat * Vector3.up).magnitude, res, S);
+                    continue;
+                }
                 if (actuator != null)
                 {
                     mb.AddMesh(Draw(actuator, "actuator"), top, X, Y, Z, ra, MatAuthored, (bot - top).magnitude / ra);

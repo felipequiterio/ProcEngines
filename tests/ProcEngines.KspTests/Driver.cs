@@ -253,6 +253,7 @@ namespace ProcEngines.KspTests
                 m.SetDesign(d);
                 yield return new WaitForSecondsRealtime(1.5f);
                 yield return CheckApplied(m, tag, true);
+                yield return CheckActuators(m, tag);
                 yield return Shot("editor_" + tag);
             }
 
@@ -403,7 +404,245 @@ namespace ProcEngines.KspTests
             yield return new WaitForSecondsRealtime(2f);
             Check("flight.burn", e.finalThrust > 0.5f * (float)m.Stats.ThrustSL && m.WaterfallStatus.Contains("effects"), $"finalThrust {e.finalThrust:F1} kN (SL {m.Stats.ThrustSL:F1}); waterfall {m.WaterfallStatus}");
             yield return Shot("flight_burn");
+            // the gimbal in flight: the bell moved from FixedUpdate as ModuleGimbal does (7 degrees about a diagonal),
+            // the actuators follow it. The stock module itself is tried first and only reported: in this rig it never
+            // deflects (actuation stays 0 with pitch and yaw input; see PHASE3_STATUS "Moving gimbal actuators").
+            {
+                Transform gT = m.part.transform.Find("model/peRoot/peGimbal");
+                Quaternion rest = gT.localRotation;
+                ModuleGimbal gm = m.part.FindModuleImplementing<ModuleGimbal>();
+                ActuatorsFollow(m, out float _, out float _, out float len0, out float _, out string _);
+                if (gm != null) gm.gimbalActive = true;   // staging would (OnActive); the test ignited the engine directly
+                FlightInputCallback fbw = st => { st.pitch = 1; st.yaw = 1; };
+                v.OnFlyByWire += fbw;
+                yield return new WaitForSecondsRealtime(1f);
+                Info("flight.gimbal.stock", string.Format(Inv, "ModuleGimbal with pitch and yaw input: deflection {0:F2}°, actuation {1}", Quaternion.Angle(rest, gT.localRotation), gm?.actuationLocal));
+                v.OnFlyByWire -= fbw;
+                if (gm != null) gm.enabled = false;
+                Quaternion target = Quaternion.AngleAxis(7f, new Vector3(1, 0, 1).normalized) * rest;
+                for (float tg = Time.realtimeSinceStartup; Time.realtimeSinceStartup - tg < 1f;)
+                {
+                    yield return new WaitForFixedUpdate();
+                    gT.localRotation = Quaternion.Slerp(gT.localRotation, target, 0.3f);
+                }
+                yield return null;
+                float defl = Quaternion.Angle(rest, gT.localRotation);
+                bool ok = ActuatorsFollow(m, out float sep, out float stat, out float len, out float tilt, out string info);
+                yield return Shot("flight_gimbal");
+                gT.localRotation = rest;
+                if (gm != null) gm.enabled = true;
+                Check("flight.gimbal", defl > 6.9f && ok && Mathf.Abs(len - len0) > 1e-4f,
+                    string.Format(Inv, "bell moved from FixedUpdate to {0:F2}°: eye-lug gap {1:F5} m (static {2:F4}), length {3:F4} -> {4:F4} m; {5}", defl, sep, stat, len0, len, info));
+            }
             FlightInputHandler.state.mainThrottle = 0f;
+        }
+
+        // ------------------------------------------------------------------ gimbal actuators
+
+        /// <summary>
+        /// How the actuators sit as their pivots stand now, in the peRoot frame: the rod eye against the lug pin it
+        /// hangs on (the bell renderer turning the rest eye, independent of the module's own aim), what the gap would
+        /// be with a static actuator, the barrel on its clevis and aimed through the eye, barrel and rod coaxial, the
+        /// rod still in the gland and below the barrel head, and the eye's misalignment with the lug pin (the
+        /// spherical bearing takes it). Returns whether all of it holds; sep / staticSep / length are the worst gap,
+        /// the worst static gap and actuator 0's length.
+        /// </summary>
+        static bool ActuatorsFollow(ModuleProcEngine m, out float sep, out float staticSep, out float length, out float tilt, out string info)
+        {
+            sep = staticSep = length = tilt = 0;
+            info = "";
+            Transform root = m.part.transform.Find("model/peRoot");
+            Transform bell = root.Find("peGimbal/peBell");
+            KitBuilder.Result k = m.Kit;
+            EngineGeometry g = m.Geometry;
+            if (k == null || g == null || k.Actuators.Length != ModuleProcEngine.ActuatorCount) { info = $"no actuator poses ({k?.Actuators.Length})"; return false; }
+            bool ok = true;
+            float ra = k.ActuatorRadius;
+            var parts = new List<string>();
+            for (int i = 0; i < k.Actuators.Length; i++)
+            {
+                KitBuilder.ActuatorPose a = k.Actuators[i];
+                Transform body = root.Find(ModuleProcEngine.ActuatorName + i), rod = root.Find(ModuleProcEngine.ActuatorRodName + i);
+                Vector3 lug = root.InverseTransformPoint(bell.TransformPoint(a.Eye - new Vector3(0, g.YThroat, 0)));
+                Vector3 top = root.InverseTransformPoint(body.position), eye = root.InverseTransformPoint(rod.position);
+                Vector3 up = root.InverseTransformDirection(body.up), rodUp = root.InverseTransformDirection(rod.up);
+                Vector3 pin = root.InverseTransformDirection(bell.TransformDirection(a.Pin));
+                float s = (eye - lug).magnitude, st = (a.Eye - lug).magnitude, clevis = (top - a.Top).magnitude;
+                float coax = Vector3.Angle(up, rodUp), aim = Vector3.Angle(up, top - eye), len = (top - eye).magnitude;
+                float rodTop = len - k.ActuatorRodLength;   // top of the rod, from the clevis along the axis
+                bool inserted = rodTop < k.ActuatorGland - 0.05f * ra && rodTop > 1.2f * ra;
+                float tl = Mathf.Abs(90 - Vector3.Angle(rodUp, pin));
+                ok &= s < 1e-3f && clevis < 1e-4f && coax < 0.01f && aim < 0.05f && inserted && body.gameObject.activeInHierarchy && rod.gameObject.activeInHierarchy;
+                sep = Mathf.Max(sep, s); staticSep = Mathf.Max(staticSep, st); tilt = Mathf.Max(tilt, tl);
+                if (i == 0) length = len;
+                parts.Add(string.Format(Inv, "#{0} gap {1:F5} m (static {2:F4}), clevis {3:F5}, coax {4:F3}°, aim {5:F3}°, length {6:F4}/{7:F4} m, rod top {8:F3} m below the clevis (gland {9:F3}, head {10:F3}), eye/pin misalignment {11:F2}°",
+                    i, s, st, clevis, coax, aim, len, (a.Top - a.Eye).magnitude, rodTop, k.ActuatorGland, 1.2f * ra, tl));
+            }
+            info = string.Join("; ", parts);
+            return ok;
+        }
+
+        /// <summary>
+        /// Smallest gaps (m) between the actuators as they stand and (bell) the bell wall and the coolant manifold,
+        /// (kit) the static kit, (bellKit) the kit on the bell away from each actuator's own lug. An actuator is its
+        /// axis from 1.8 barrel radii below the clevis (above that: the clevis on its outrigger beam, which doesn't
+        /// move) to the eye: barrel 1.05 ra, gland 1.25 ra in the 0.9 ra above where the rod leaves it, rod 0.45 ra,
+        /// rod end 0.65 ra in the last 0.7 ra. `kit` is the static kit's vertices (peRoot frame), `kitBell` the bell
+        /// kit's (bell frame); `worst` names the static-kit vertex closest to an actuator.
+        /// </summary>
+        static void ActuatorClearance(ModuleProcEngine m, Vector3[] kit, Vector3[] kitBell, out float bell, out float stat, out float bellKit, out string worst)
+        {
+            bell = stat = bellKit = float.MaxValue;
+            worst = "";
+            Transform root = m.part.transform.Find("model/peRoot");
+            Transform bellT = root.Find("peGimbal/peBell");
+            KitBuilder.Result k = m.Kit;
+            EngineGeometry g = m.Geometry;
+            float ra = k.ActuatorRadius;
+            Quaternion qb = Quaternion.Inverse(root.rotation) * bellT.rotation, qi = Quaternion.Inverse(qb);
+            Vector3 pivot = root.InverseTransformPoint(bellT.position);
+            for (int i = 0; i < k.Actuators.Length; i++)
+            {
+                KitBuilder.ActuatorPose a = k.Actuators[i];
+                Vector3 top = root.InverseTransformPoint(root.Find(ModuleProcEngine.ActuatorName + i).position);
+                Vector3 eye = root.InverseTransformPoint(root.Find(ModuleProcEngine.ActuatorRodName + i).position);
+                float L = (eye - top).magnitude;
+                Vector3 u = (eye - top) / L;
+                float Need(float s) => s < 1.8f * ra ? -1 : s <= k.ActuatorGland - 0.9f * ra ? 1.05f * ra : s <= k.ActuatorGland ? 1.25f * ra : s <= L - 0.7f * ra ? 0.45f * ra : 0.65f * ra;
+                float Gap(Vector3 p)
+                {
+                    Vector3 d = p - top;
+                    float s = Vector3.Dot(d, u);
+                    if (s < 1.8f * ra) return float.MaxValue;
+                    if (s > L) return (p - eye).magnitude - 0.65f * ra;
+                    return (d - u * s).magnitude - Need(s);
+                }
+                // the bell wall and manifold, in the bell's frame (heights as at rest)
+                for (int n = 0; n <= 80; n++)
+                {
+                    float s = Mathf.Lerp(1.8f * ra, L, n / 80f);
+                    Vector3 pb = qi * (top + u * s - pivot);
+                    float y = pb.y + g.YThroat, r = Mathf.Sqrt(pb.x * pb.x + pb.z * pb.z);
+                    if (y <= g.YThroat && y >= g.YExit) bell = Mathf.Min(bell, r - g.BellRadiusAt(y) - Need(s));
+                    bell = Mathf.Min(bell, new Vector2(r - g.ManifoldRadius, y - g.ManifoldY).magnitude - g.ManifoldTubeRadius - Need(s));
+                }
+                foreach (Vector3 v in kit)
+                {
+                    float gp = Gap(v);
+                    if (gp >= stat) continue;
+                    stat = gp;
+                    float sv = Vector3.Dot(v - top, u);
+                    worst = string.Format(Inv, "actuator {0} at {1:F2} ra down the axis, vertex r {2:F3} y {3:F3} at {4:F0}°", i, sv / ra, Mathf.Sqrt(v.x * v.x + v.z * v.z), v.y, Mathf.Atan2(v.z, v.x) * Mathf.Rad2Deg);
+                }
+                // the bell kit, minus this actuator's lug (pad on the wall out to the pin, and a little past it)
+                Vector3 eyeB = a.Eye - new Vector3(0, g.YThroat, 0), radial = new Vector3(a.Eye.x, 0, a.Eye.z).normalized;
+                Vector3 padB = radial * g.BellRadiusAt(a.Eye.y) + new Vector3(0, eyeB.y, 0), lugOut = (eyeB - padB).normalized;
+                Vector3 l0 = padB - lugOut * 0.3f * ra, l1 = eyeB + lugOut * 0.45f * ra;
+                foreach (Vector3 vb in kitBell)
+                {
+                    Vector3 w = vb - l0, seg = l1 - l0;
+                    float t = Mathf.Clamp01(Vector3.Dot(w, seg) / seg.sqrMagnitude);
+                    if ((w - seg * t).magnitude < 1.05f * ra) continue;
+                    bellKit = Mathf.Min(bellKit, Gap(pivot + qb * vb));
+                }
+            }
+        }
+
+        /// <summary>
+        /// Editor: the bell turned GimbalClearanceDeg about eight horizontal axes (every 45 degrees, so both ways
+        /// about the actuators' radial and pin axes). At each pose and at rest the actuators must follow
+        /// (ActuatorsFollow), keep clear of the bell, and not run into the kit any more than they do at rest. Both
+        /// levels have their barrel and rod renderers in the LODGroup.
+        /// </summary>
+        IEnumerator CheckActuators(ModuleProcEngine m, string tag)
+        {
+            Transform root = m.part.transform.Find("model/peRoot"), gT = root.Find("peGimbal");
+            Quaternion rest = gT.localRotation;
+            Vector3[] kit = root.Find("peKit").GetComponent<MeshFilter>().sharedMesh.vertices;
+            Vector3[] kitBell = root.Find("peGimbal/peBell/peKitBell").GetComponent<MeshFilter>().sharedMesh.vertices;
+            bool follow = ActuatorsFollow(m, out float sep, out float _, out float len0, out float _, out string info0);
+            ActuatorClearance(m, kit, kitBell, out float bell0, out float kit0, out float bk0, out string where0);
+            float worstSep = sep, worstStatic = 0, worstTilt = 0, bellMin = float.MaxValue, kitMin = float.MaxValue, bkMin = float.MaxValue, lenMin = len0, lenMax = len0;
+            string bad = follow ? null : "rest: " + info0, whereMin = "";
+            for (int n = 0; n < 8; n++)
+            {
+                Vector3 axis = Quaternion.Euler(0, 45 * n, 0) * Vector3.right;
+                gT.localRotation = Quaternion.AngleAxis(KitBuilder.GimbalClearanceDeg, axis) * rest;
+                yield return null;   // the module aims its actuators in LateUpdate
+                bool ok = ActuatorsFollow(m, out sep, out float st, out float len, out float tilt, out string info);
+                ActuatorClearance(m, kit, kitBell, out float b, out float kc, out float bk, out string where);
+                if (kc < kitMin) whereMin = $"axis {45 * n}°: {where}";
+                if (!ok && bad == null) bad = $"axis {45 * n}°: {info}";
+                follow &= ok;
+                worstSep = Mathf.Max(worstSep, sep); worstStatic = Mathf.Max(worstStatic, st); worstTilt = Mathf.Max(worstTilt, tilt);
+                bellMin = Mathf.Min(bellMin, b); kitMin = Mathf.Min(kitMin, kc); bkMin = Mathf.Min(bkMin, bk);
+                lenMin = Mathf.Min(lenMin, len); lenMax = Mathf.Max(lenMax, len);
+            }
+            gT.localRotation = rest;
+            yield return null;
+            follow &= ActuatorsFollow(m, out float sepBack, out float _, out float lenBack, out float _, out string _) && Mathf.Abs(lenBack - len0) < 1e-5f;
+            var lg = root.GetComponent<LODGroup>().GetLODs();
+            bool lods = true;
+            for (int i = 0; i < ModuleProcEngine.ActuatorCount; i++)
+                foreach (var (pivot, lod0, lod1) in new[] { (ModuleProcEngine.ActuatorName + i, ModuleProcEngine.ActBodyName, ModuleProcEngine.ActBodyLodName), (ModuleProcEngine.ActuatorRodName + i, ModuleProcEngine.ActRodName, ModuleProcEngine.ActRodLodName) })
+                {
+                    MeshRenderer r0 = root.Find(pivot + "/" + lod0)?.GetComponent<MeshRenderer>(), r1 = root.Find(pivot + "/" + lod1)?.GetComponent<MeshRenderer>();
+                    Mesh m0 = r0?.GetComponent<MeshFilter>().sharedMesh, m1 = r1?.GetComponent<MeshFilter>().sharedMesh;
+                    lods &= r0 != null && r1 != null && m0 != null && m1 != null && m0.vertexCount > m1.vertexCount && m1.vertexCount > 0
+                            && lg[0].renderers.Contains(r0) && lg[1].renderers.Contains(r1) && !lg[2].renderers.Contains(r0) && !lg[2].renderers.Contains(r1);
+                }
+            bool clear = bellMin > 0 && kitMin >= Mathf.Min(kit0, 0) - 0.002f && bkMin >= Mathf.Min(bk0, 0) - 0.002f;
+            Check("actuators." + tag, follow && clear && lods && lenMax - lenMin > 1e-3f,
+                string.Format(Inv, "±{0}° about 8 axes: worst eye-lug gap {1:F5} m (a static actuator: {2:F4} m), length {3:F4} .. {4:F4} m (rest {5:F4}), eye misalignment ≤ {6:F2}°; " +
+                    "clearance bell {7:F4} (rest {8:F4}), static kit {9:F4} [{15}] (rest {10:F4} [{16}]), bell kit {11:F4} (rest {12:F4}); LOD renderers {13}{14}",
+                    KitBuilder.GimbalClearanceDeg, worstSep, worstStatic, lenMin, lenMax, len0, worstTilt, bellMin, bell0, kitMin, kit0, bkMin, bk0, lods, bad != null ? "; FIRST BAD " + bad : "", whereMin, where0));
+        }
+
+        /// <summary>Orbit `t` at `distance` from the heading (30-degree steps) that looks closest to along `worldDir`
+        /// (from the target toward the camera).</summary>
+        IEnumerator CameraToward(Transform t, Vector3 worldDir, float distance, float pitchDeg)
+        {
+            Vessel v = FlightGlobals.ActiveVessel;
+            Vector3 up = (v.transform.position - v.mainBody.position).normalized, want = Vector3.ProjectOnPlane(worldDir, up);
+            int best = 0;
+            float bestErr = float.MaxValue;
+            for (int h = 0; h < 360; h += 30)
+            {
+                CameraOn(t, distance, pitchDeg, h);
+                for (int f = 0; f < 3; f++) yield return null;
+                float err = Vector3.Angle(Vector3.ProjectOnPlane(FlightCamera.fetch.mainCamera.transform.position - t.position, up), want);
+                if (err < bestErr) { bestErr = err; best = h; }
+            }
+            CameraOn(t, distance, pitchDeg, best);
+            yield return new WaitForSecondsRealtime(1f);
+        }
+
+        /// <summary>Flight: the bell held at rest and at +-GimbalClearanceDeg about actuator 0's pin axis (the stock
+        /// gimbal module paused), a close-up on its rod eye and lug from outside for each, and the actuators checked to
+        /// follow at both deflections.</summary>
+        IEnumerator GimbalShots(ModuleProcEngine m, string tag)
+        {
+            Transform root = m.part.transform.Find("model/peRoot"), gT = root.Find("peGimbal");
+            ModuleGimbal gm = m.part.FindModuleImplementing<ModuleGimbal>();
+            if (gm != null) gm.enabled = false;
+            Quaternion rest = gT.localRotation;
+            KitBuilder.ActuatorPose a = m.Kit.Actuators[0];
+            Transform eye = root.Find(ModuleProcEngine.ActuatorRodName + "0");
+            yield return CameraToward(eye, root.TransformDirection((a.Out + 0.7f * a.Pin).normalized), 0.6f * (a.Top - a.Eye).magnitude, 2);
+            bool all = true;
+            var lines = new List<string>();
+            foreach (float deg in new[] { 0f, KitBuilder.GimbalClearanceDeg, -KitBuilder.GimbalClearanceDeg })
+            {
+                gT.localRotation = Quaternion.AngleAxis(deg, a.Pin) * rest;
+                yield return new WaitForSecondsRealtime(0.8f);
+                all &= ActuatorsFollow(m, out float sep, out float stat, out float len, out float _, out string info);
+                lines.Add(string.Format(Inv, "{0:+0;-0;0}°: gap {1:F5} m (static {2:F4}), length {3:F4}", deg, sep, stat, len));
+                yield return Shot(string.Format(Inv, "gimbal{0:+0;-0;0}_", deg) + tag);
+            }
+            gT.localRotation = rest;
+            if (gm != null) gm.enabled = true;
+            yield return null;
+            Check("visual.gimbal." + tag, all, string.Join("; ", lines));
         }
 
         // ------------------------------------------------------------------ visual checks (Phase 3)
@@ -504,6 +743,7 @@ namespace ProcEngines.KspTests
                     var mfs = m.part.transform.Find("model/peRoot").GetComponentsInChildren<MeshFilter>(true);
                     Info("visual.lod." + tag, $"lodGroup {(lg != null ? lg.lodCount.ToString() : "none")}, lodBias {QualitySettings.lodBias}; meshes {string.Join(", ", mfs.Select(f => f.name + ":" + (f.sharedMesh != null ? f.sharedMesh.vertexCount : -1)))}; build {m.LastBuildMs:F1} ms");
                 }
+                yield return CheckActuators(m, tag);
                 EditorLogic.fetch.ship.SaveShip().Save(path);
                 yield return LaunchFrozen(path);
                 m = Engine(FlightGlobals.ActiveVessel.parts);
@@ -535,6 +775,7 @@ namespace ProcEngines.KspTests
                 CameraOn(mid, size * 3f, -15, 35);
                 yield return new WaitForSecondsRealtime(0.6f);
                 yield return Shot("flight_" + tag);
+                yield return GimbalShots(m, tag);
                 Camera(size * 2.0f, -6, 35, m.part);
                 Destroy(mid.gameObject);
                 var e = m.part.FindModuleImplementing<ModuleEnginesFX>();

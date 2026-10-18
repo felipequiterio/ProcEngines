@@ -28,6 +28,44 @@ namespace ProcEngines
             return false;
         }
 
+        /// <summary>The triangles whose three vertices all pass `inside` (`keepInside` true), or all the other
+        /// triangles (false), as a piece of its own with the same anchors and only the vertices it uses (normals,
+        /// tangents and UVs copied). Vertices on the cut go into both halves. Null when no triangle qualifies.</summary>
+        public KitMesh Subset(Func<Vector3, bool> inside, bool keepInside, string suffix)
+        {
+            var map = new int[Positions.Length];
+            for (int i = 0; i < map.Length; i++) map[i] = -1;
+            bool[] at = new bool[Positions.Length];
+            for (int i = 0; i < at.Length; i++) at[i] = inside(Positions[i]);
+            var idx = new List<int>(Indices.Length);
+            var used = new List<int>(Positions.Length);
+            for (int k = 0; k + 2 < Indices.Length; k += 3)
+            {
+                bool all = at[Indices[k]] && at[Indices[k + 1]] && at[Indices[k + 2]];
+                if (all != keepInside) continue;
+                for (int j = 0; j < 3; j++)
+                {
+                    int v = Indices[k + j];
+                    if (map[v] < 0) { map[v] = used.Count; used.Add(v); }
+                    idx.Add(map[v]);
+                }
+            }
+            if (idx.Count == 0) return null;
+            Vector4[] T = TangentsOrFallback();
+            var m = new KitMesh
+            {
+                Name = Name + suffix, Version = 2, Positions = new Vector3[used.Count], Normals = new Vector3[used.Count],
+                Tangents = new Vector4[used.Count], Uvs = new Vector2[used.Count], Indices = idx.ToArray(),
+            };
+            for (int i = 0; i < used.Count; i++)
+            {
+                int v = used[i];
+                m.Positions[i] = Positions[v]; m.Normals[i] = Normals[v]; m.Tangents[i] = T[v]; m.Uvs[i] = Uvs[v];
+            }
+            foreach (var a in Anchors) m.Anchors[a.Key] = a.Value;
+            return m;
+        }
+
         /// <summary>The file's tangents, or (version 1) tangents derived once from the UVs: per-triangle dP/dU,
         /// area-weighted, orthogonalised against the normal, with w chosen so the binormal follows +V (ASSETS.md 2).</summary>
         public Vector4[] TangentsOrFallback()

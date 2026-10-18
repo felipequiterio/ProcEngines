@@ -223,12 +223,49 @@ This answers the user's request for higher-poly, more realistic models with worn
   | LMP two clients | identical |
 
 **Known follow-ups:**
-- Actuators are static, so at full gimbal the rod eye separates from the bell lug by a few centimetres. Fixing it needs actuators aimed every frame.
+- ~~Actuators are static, so at full gimbal the rod eye separates from the bell lug by a few centimetres.~~ Done: see "Moving gimbal actuators" below.
 - Optional 1:2 tube bifurcation on high-expansion all-regen bells.
 - A Merlin-Vac-style exhaust torus on extension engines.
 - A compact vertex layout.
 - Deferring LOD0 for distant vessels.
 - Checking with the Deferred and TexturesUnlimited mods present in ksp_mp.
+
+## Moving gimbal actuators
+
+The gimbal actuators now follow the bell. Before, they were part of the static kit, so at full gimbal the rod eye stood 3.5 to 6 cm off its lug pin.
+
+**How it works:**
+- **Split:** `KitBuilder` cuts the authored `actuator` piece into a **barrel** and a **rod**, at both levels (`SplitActuator`). The barrel is the clevis, servo block, barrel, gland and wiper fillet; the rod is the chrome rod, lock nut and eye. The cut is the ring where the wiper fillet meets the rod; the shipped piece has no triangle across it (checked on the `.pem` files).
+- **Two transforms per actuator:** `peActuator{i}` (barrel, at the top clevis) and `peActuatorRod{i}` (rod, at the rod eye), both under `peRoot`. Each holds a LOD0 and a LOD1 renderer.
+- **Aiming:** `ModuleProcEngine.AimActuators` runs in `LateUpdate` whenever the bell moved, in flight and in the editor.
+  - The eye is the rest eye turned with the bell about the pivot.
+  - The barrel stays on its clevis, aimed at the eye; the rod sits on the eye on the same axis and slides in the gland.
+  - The rod takes its roll from the lug pin, and the barrel from the clevis pin.
+  - There is no per-frame mesh work.
+- **Rest length unchanged:** at rest the two halves line up exactly as the one stretched piece did. The rod is longer by a hidden reserve: the most the actuator can lengthen at 10°, plus 0.35 barrel radii.
+- **Mesh cache:** each design has one barrel mesh and one rod mesh per level, shared by all its actuators. They are part of the cache entry (now six meshes) and use the kit materials. `MeshVersion` is `geo-r3`.
+- **Primitives:** without the authored piece, the primitive actuator is split the same way.
+- **Unchanged:** the static kit layout, the 10° swept clearance rules, the lugs on the bell kit and the outrigger beams.
+
+**Checks (in game):**
+- **`actuators.<design>`** (editor, sandbox and visual). The bell is turned 10° about eight horizontal axes. At every pose:
+  - eye-to-lug-pin gap 0.00000 m (a static actuator: 0.035 to 0.061 m);
+  - clevis fixed, barrel and rod coaxial and aimed through the eye;
+  - the rod still in the gland and below the barrel head;
+  - length changes of about ±7 %, for example 0.728 to 0.836 m around 0.784 m;
+  - clear of the bell wall and manifold (6.5 to 12 cm);
+  - clear of the static kit (min 4.6 mm, 8 to 11 mm at rest);
+  - clear of the bell kit away from the lug;
+  - LOD0 and LOD1 renderers in the right LODGroup levels.
+- **`visual.gimbal.<design>`:** in flight, the bell held at 0 and ±10° about actuator 0's pin axis, with a close-up of the rod eye for each (`visual_gimbal{0,+10,-10}_*`). All six designs: gap 0.
+- **`flight.gimbal`** (sandbox flight): the bell moved from FixedUpdate, as ModuleGimbal does, to 7°. Gap 0 (static: 0.029 m), length 0.632 → 0.656 m.
+- **Results:** sandbox A **32/32**, visual B **19/19**. Evidence is in [tests/ksp/evidence/actuators/](tests/ksp/evidence/actuators/): both results files, and the gimbal close-ups of three designs.
+
+**Notes:**
+- The eye is misaligned with the lug pin by up to about 8.8° when the bell swings about the actuator's radial axis, which the eye's spherical bearing takes. A real rod end allows about that much.
+- In the `visual_gimbal-10_*` shots, the gimballed bell's upper edge opens a visible gap against the static chamber at the throat. This was there before; it is a follow-up.
+- **Stock ModuleGimbal never deflects in the sandbox flight rig (pre-existing; follow-up).** With pitch and yaw input, the module is active, unlocked and its ranges are 7.5°, yet its actuation stays 0, even when its `FixedUpdate` is called directly. Its public `GimbalRotation(1, 0, 1)` returns (7.5, 7.5). The vessel's reference transform sits about 120 m from the engine. The test reports this as `flight.gimbal.stock` and drives the bell itself.
+- **`ApplyEngine` sets only `ModuleGimbal.gimbalRange` (pre-existing; follow-up).** KSP 1.12 reads `gimbalRangeXP/XN/YP/YN`, which take `gimbalRange` once at load, so the design's gimbal range never reaches the module (the A rig shows FAR's 7.5°).
 
 ## Evidence
 

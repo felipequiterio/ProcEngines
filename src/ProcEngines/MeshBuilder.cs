@@ -649,7 +649,33 @@ namespace ProcEngines
                         zK[z] = 1 + zDelta[z] / zl;   // local stretch along y inside the zone
                     }
             }
+            Emit(m, origin, X, Y, Z, scale, mat, zc);
+        }
 
+        /// <summary>Place an authored piece with given stretches: zone N (zoneN_hi above zoneN_lo) grows by
+        /// `zoneDelta[N]` piece units (negative shrinks it, to at least 30 % of its length), and everything below it
+        /// moves down with it. Zones without both anchors or a delta are left alone. KitBuilder's gimbal actuators use
+        /// it to give the barrel and the rod their own lengths.</summary>
+        public void AddMesh(KitMesh m, Vector3 origin, Vector3 X, Vector3 Y, Vector3 Z, float scale, int mat, float[] zoneDelta)
+        {
+            if (m == null || m.Positions == null || m.Positions.Length == 0) return;
+            int zc = 0;
+            for (int z = 0; z < 10 && zoneDelta != null && z < zoneDelta.Length; z++)
+                if (m.TryAnchor(ZoneHi[z], out Vector3 hi, out _) && m.TryAnchor(ZoneLo[z], out Vector3 lo, out _) && hi.y > lo.y)
+                {
+                    float zl = hi.y - lo.y;
+                    zHi[zc] = hi.y; zLo[zc] = lo.y;
+                    zDelta[zc] = Mathf.Max(zoneDelta[z], -0.7f * zl);
+                    zK[zc] = 1 + zDelta[zc] / zl;
+                    zc++;
+                }
+            Emit(m, origin, X, Y, Z, scale, mat, zc);
+        }
+
+        /// <summary>AddMesh's vertex and index copy, with the first `zc` stretch zones in zHi / zLo / zDelta / zK.</summary>
+        void Emit(KitMesh m, Vector3 origin, Vector3 X, Vector3 Y, Vector3 Z, float scale, int mat, int zc)
+        {
+            float[] zHi = this.zHi, zLo = this.zLo, zDelta = this.zDelta, zK = this.zK;
             Vector3[] P = m.Positions, N = m.Normals;
             Vector2[] UV = m.Uvs;
             Vector4[] T = m.TangentsOrFallback();

@@ -111,11 +111,27 @@ Pieces, units and anchors. **These must not change meaning.** Positions may move
 | `dome_inlet` | line radius | `in` at (1.95, 1.6, 0) Unity, i.e. the elbow end pointing +X | local +Z = dome normal; boss r ≈ 1.52 with its top face at 0.42; top of the piece ≤ 2.9. `KitBuilder` moves it outward on the dome until nothing pokes above the mount plate. |
 | `injector_ring` | chamber radius | (none) | torus R 1.12 at z −0.17 |
 
-- **Stretch zones (actuator):** `MeshBuilder.AddMesh(..., length)` stretches the vertices between `zoneN_hi` and `zoneN_lo` along y. Keep only plain barrel or rod surface inside a zone: no bolts, rings or blocks, or they get stretched too.
+- **Stretch zones (actuator):** `MeshBuilder.AddMesh` stretches the vertices between `zoneN_hi` and `zoneN_lo` along y, by a total length or by a length per zone. Keep only plain barrel or rod surface inside a zone: no bolts, rings or blocks, or they get stretched too.
+- **Moving actuators:** `KitBuilder` cuts the `actuator` piece (both levels) into a barrel and a rod, which slide on each other as the bell gimbals.
+  - The rod is every triangle whose vertices all lie either below `zone1_lo − 0.05`, or at or below `zone1_hi + 0.25` within 2 % of the rod radius. The rod radius is the smallest radius above 0.1 between `zone1_lo` and `zone1_hi + 0.2`.
+  - Everything else is the barrel: clevis, servo block, barrel, gland, and the wiper fillet that closes onto the rod.
+  - The shipped piece cuts cleanly at the ring where the fillet meets the rod (r 0.42, y −7.11), at LOD0 and LOD1.
+  - So keep the rod a plain cylinder from the wiper down to the lock nut, with nothing else in the band within 2 % of its radius, and keep everything below `zone1_lo − 0.05` part of the rod end.
+  - A piece that doesn't cut falls back to primitives.
 - **Atlas share:** each piece's UVs are weighted by its `pe_texel` property before packing: 0.8 for pump-unit pieces and 0.9 for the ring.
 - **Kit position rule:** the whole kit stays below the mount plate (y < 0) and above the exit plane.
 - **Bell kit:** parts rigidly fixed to the gimballed bell go into a second kit mesh, rendered as `peKitBell` / `peKitBellLod1` under the bell, in the bell frame (part frame minus (0, YThroat, 0)). These are the actuator lugs and pins, the fuel line below its lower bellows, and the expander hot line from the manifold to its bellows.
-- **Static clearance:** static kit keeps the bell's 10° swept envelope plus 4 mm + 1.5 % rc.
+- **Actuator meshes:** the gimbal actuators are in neither kit mesh. Each design has one barrel mesh and one rod mesh per level, shared by all its actuators (`KitBuilder.ActuatorPose`):
+  - The **barrel** is in the clevis frame: the clevis pin at the origin, the axis down −Y, the servo block toward +X, the pin along Z.
+  - The **rod** is in the rod-eye frame: the eye pin at the origin, the rod up +Y.
+  - At rest the two line up exactly as the one stretched piece did: zone0 stretches the barrel and zone1 the rod, in proportion.
+  - The rod is longer by a **reserve** hidden in the barrel: 2 · (eye-to-pivot distance) · sin 5°, the most the actuator can lengthen at 10° gimbal, plus 0.35 barrel radii.
+- **Aiming:** `ModuleProcEngine.AimActuators` runs in `LateUpdate` (flight and editor) whenever the bell moved.
+  - It turns the rest eye with the bell about the pivot.
+  - The barrel stays on its clevis, aimed at the eye, with its roll taken from the clevis pin.
+  - The rod sits on the eye with the same axis, rolled to the lug pin.
+  - Only transforms move; nothing is rebuilt per frame.
+- **Static clearance:** static kit keeps the bell's 10° swept envelope plus 4 mm + 1.5 % rc. The actuator stations are still laid out as if the actuator were static (rod and eye outside the swept bell). The in-game tests (`actuators.*`) turn the bell 10° about eight axes and check that the moving actuators stay clear of the bell, and come no closer to either kit than they are at rest.
 - **Splines:** lines use centripetal Catmull-Rom with straight legs and 2.5-radius bends, so they never overshoot.
 - **Thrust frame:** 4 struts, or 3 if the dome is crowded, laid out from the free arcs.
 
@@ -148,6 +164,10 @@ The emissive glow ramp stays generated in code.
 Each engine has two sets of renderers under one `LODGroup` on `peRoot`:
 - **LOD0** keeps the old names: `peChamber`, `peGimbal/peBell`, `peKit`. These are full resolution with the LOD0 pieces.
 - **LOD1** is new: `peChamberLod1`, `peGimbal/peBellLod1`, `peKitLod1`. These use about a third of the ring segments, decimated profiles, `.lod1.pem` pieces and fewer primitive sides.
+- **Actuators:** for actuator *i*, the pivots `peActuator{i}` (barrel) and `peActuatorRod{i}` (rod) sit under `peRoot`.
+  - Each pivot holds a LOD0 renderer and a LOD1 renderer: `peActBody` / `peActBodyLod1` and `peActRod` / `peActRodLod1`.
+  - They belong to LOD0 and LOD1 with the kit, and are culled at LOD2.
+  - Both levels hang on the same pivots, so they always line up.
 
 The LOD levels and their thresholds:
 
@@ -167,6 +187,7 @@ These are raw `LOD.screenRelativeTransitionHeight` values. KSP's `QualitySetting
 
 **Shared mesh cache:**
 - Render meshes are shared and reference-counted. The key is the serialized DESIGN + STATS, the LOD level, a mesh version and the scope (editor or flight).
+- An entry holds six meshes: chamber, bell, kit, bell kit, actuator barrel and actuator rod.
 - Identical engines (symmetry, clusters, LMP clients) build once. A design change takes a new entry; a shared mesh is never rebuilt in place.
 - Entries are destroyed when superseded, 5 s after their last part is destroyed, or on scene load.
 - Collider meshes stay per part.
@@ -174,7 +195,7 @@ These are raw `LOD.screenRelativeTransitionHeight` values. KSP's `QualitySetting
 
 **FAR:** `Patches/FAR.cfg` sets `forceUseColliders = True`, so FAR voxelises the collider hulls and never the render meshes.
 - **Glow blocks:** applied to both bell renderers (`MatRadiative`) and both kit renderers (`MatHot`).
-- **Materials:** applied to both levels.
+- **Materials:** applied to both levels. The actuator renderers take the kit materials; they have no `MatHot`, so no glow.
 - **Renderer creation:** the LOD1 renderers are created in `EnsureTransforms`, so the prefab and its clones have them. Clones take their meshes from the cache.
 - **Bell kit renderers:** `peKitBell` (LOD0) and `peKitBellLod1` (LOD1) live under the bell renderers. They are part of every cache entry and get the kit materials and the `MatHot` glow.
 - **Foreign mesh copies:** another mod's `MeshFilter.mesh` read (KSPCF's drag-cube patch, Firefly, ConformalDecals) silently copies a shared mesh.

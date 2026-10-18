@@ -22,8 +22,9 @@ namespace ProcEngines
     ///   handle step) rebuilds both levels together once nothing follows it for 0.15 s, without forcing LOD1.
     /// - Flight: LOD1 at OnStart (both renderer sets show it), LOD0 from a queue, about one engine build per frame
     ///   (cache hits are instant); <see cref="Lod0Pending"/> is true until then.
-    /// Each level has four renderers: the chamber, the bell (under the gimbal), the static kit, and the kit fixed to
-    /// the bell (a child of the bell renderer, so it gimbals with it). Mods that read MeshFilter.mesh replace a shared
+    /// Each level has the chamber, the bell (under the gimbal), the static kit, the kit fixed to the bell (a child of
+    /// the bell renderer, so it gimbals with it) and a barrel and a rod per gimbal actuator (on pivots aimed at the
+    /// gimballed rod eye every frame, AimActuators). Mods that read MeshFilter.mesh replace a shared
     /// mesh with a per-filter copy; the part puts its own back (see Show / RestoreMeshes).
     /// </summary>
     public class ModuleProcEngine : PartModule, IPartMassModifier, IPartCostModifier
@@ -35,6 +36,12 @@ namespace ProcEngines
         /// <summary>The kit fixed to the gimballed bell (KitBuilder's bell mesh): a child of peGimbal/peBell and of
         /// peGimbal/peBellLod1, in the bell's frame (ASSETS.md 6).</summary>
         public const string KitBellName = "peKitBell", KitBellLodName = "peKitBellLod1";
+        /// <summary>Gimbal actuators (KitBuilder.ActuatorPose): per actuator i a barrel pivot `peActuator{i}` at the top
+        /// clevis and a rod pivot `peActuatorRod{i}` at the rod eye, both under peRoot and aimed at the gimballed eye
+        /// every frame (AimActuators), each holding a LOD0 and a LOD1 renderer.</summary>
+        public const string ActuatorName = "peActuator", ActuatorRodName = "peActuatorRod",
+            ActBodyName = "peActBody", ActBodyLodName = "peActBodyLod1", ActRodName = "peActRod", ActRodLodName = "peActRodLod1";
+        public const int ActuatorCount = 2;
         /// <summary>LODGroup screen-relative heights (raw LOD.screenRelativeTransitionHeight values: KSP's
         /// QualitySettings.lodBias = 2 halves them in effect, to 0.125 and 0.015): LOD0 above, LOD1 above, LOD2 (kit
         /// culled) down to 0.</summary>
@@ -80,13 +87,20 @@ namespace ProcEngines
         public event Action DesignApplied;
 
         Transform root, gimbalT, thrustT, exhaustT;
+        /// <summary>The geometry the meshes and transforms were last built from (tests: actuator clearance).</summary>
+        public EngineGeometry Geometry => geometry;
         MeshFilter staticMF, bellMF, kitMF, kitBellMF, staticLodMF, bellLodMF, kitLodMF, kitBellLodMF;
         MeshRenderer bellR, bellLodR, kitR, kitLodR, kitBellR, kitBellLodR;
-        // The eight render filters by slot (LOD0 chamber, bell, kit, bell kit, then the same at LOD1: slot + Lod1Slot)
-        // and the mesh this part last gave each one. Not serialized, so a clone starts with none assigned.
-        const int SlotChamber = 0, SlotBell = 1, SlotKit = 2, SlotKitBell = 3, Lod1Slot = 4, Slots = 8;
+        // The render filters by slot (LOD0 chamber, bell, kit, bell kit, then barrel and rod of each actuator; then the
+        // same at LOD1: slot + Lod1Slot) and the mesh this part last gave each one. Not serialized, so a clone starts
+        // with none assigned.
+        const int SlotChamber = 0, SlotBell = 1, SlotKit = 2, SlotKitBell = 3, SlotActuator = 4, Lod1Slot = SlotActuator + 2 * ActuatorCount, Slots = 2 * Lod1Slot;
         readonly MeshFilter[] filters = new MeshFilter[Slots];
         readonly Mesh[] shown = new Mesh[Slots];
+        readonly Transform[] actuatorT = new Transform[ActuatorCount], actuatorRodT = new Transform[ActuatorCount];
+        Quaternion aimedRotation;
+        Vector3 aimedPivot;
+        KitBuilder.Result aimedKit;
         // copies other mods made of our meshes (MeshFilter.mesh) that a conformal decal may still project onto
         readonly List<Mesh> keptCopies = new List<Mesh>();
         float nextMeshCheck;
@@ -297,6 +311,7 @@ namespace ProcEngines
         /// applied its slow path (they all run it in the same frame).</summary>
         void LateUpdate()
         {
+            AimActuators(false);   // after ModuleGimbal moved the bell (FixedUpdate / Update), before rendering
             if (!shipModifiedPending) return;
             shipModifiedPending = false;
             if (shipModifiedFrame == Time.frameCount || !HighLogic.LoadedSceneIsEditor || EditorLogic.fetch == null) return;
@@ -306,6 +321,40 @@ namespace ProcEngines
         }
 
         static int shipModifiedFrame = -1;
+
+        /// <summary>
+        /// Points each gimbal actuator at where its rod eye is now: the eye pin is fixed to the bell lug, so it is the
+        /// rest eye turned with the bell about the gimbal pivot. The barrel stays on its clevis and turns to the eye,
+        /// keeping its roll from the clevis pin; the rod sits on the eye with the same axis, rolled to the lug pin
+        /// (the bell turns it), and slides in the barrel as the length changes. Only transforms move: the meshes are
+        /// the shared cache entry's. Runs when the bell moved (or `force`), in the editor too.
+        /// </summary>
+        void AimActuators(bool force)
+        {
+            KitBuilder.Result k = Kit;
+            if (k == null || gimbalT == null || bellMF == null || actuatorT[0] == null) return;
+            Quaternion bell = gimbalT.localRotation * bellMF.transform.localRotation;   // bell frame in the peRoot frame
+            Vector3 pivot = gimbalT.localPosition;
+            if (!force && k == aimedKit && pivot == aimedPivot && bell.x == aimedRotation.x && bell.y == aimedRotation.y && bell.z == aimedRotation.z && bell.w == aimedRotation.w)
+                return;
+            aimedKit = k; aimedRotation = bell; aimedPivot = pivot;
+            for (int i = 0; i < ActuatorCount; i++)
+            {
+                bool on = i < k.Actuators.Length;
+                if (actuatorT[i].gameObject.activeSelf != on) { actuatorT[i].gameObject.SetActive(on); actuatorRodT[i].gameObject.SetActive(on); }
+                if (!on) continue;
+                KitBuilder.ActuatorPose a = k.Actuators[i];
+                Vector3 eye = pivot + bell * (a.Eye - new Vector3(0, geometry != null ? geometry.YThroat : pivot.y, 0));
+                Vector3 axis = a.Top - eye;
+                if (axis.sqrMagnitude < 1e-12f) continue;
+                Vector3 y = axis.normalized, clevis = a.Pin - y * Vector3.Dot(a.Pin, y), lugPin = bell * a.Pin;
+                lugPin -= y * Vector3.Dot(lugPin, y);
+                actuatorT[i].localPosition = a.Top;
+                actuatorT[i].localRotation = Quaternion.LookRotation(clevis, y);
+                actuatorRodT[i].localPosition = eye;
+                actuatorRodT[i].localRotation = Quaternion.LookRotation(lugPin, y);
+            }
+        }
 
         static string CapsKey(TechCaps c) => c == null ? "" : string.Join("|", c.Unlimited, c.TechLevel, c.MaxPc, c.MaxEps, c.MaxThrust, c.RaoBell, c.RadiativeExtension,
             string.Join(",", c.Cycles.OrderBy(x => x)), string.Join(",", c.Propellants.OrderBy(x => x)));
@@ -572,6 +621,18 @@ namespace ProcEngines
             filters[SlotChamber] = staticMF; filters[SlotBell] = bellMF; filters[SlotKit] = kitMF; filters[SlotKitBell] = kitBellMF;
             filters[Lod1Slot + SlotChamber] = staticLodMF; filters[Lod1Slot + SlotBell] = bellLodMF;
             filters[Lod1Slot + SlotKit] = kitLodMF; filters[Lod1Slot + SlotKitBell] = kitBellLodMF;
+            // the gimbal actuators: a barrel pivot and a rod pivot each, under peRoot (made with the prefab like the
+            // LOD1 set, so clones and KSP's cached renderer lists have them)
+            for (int i = 0; i < ActuatorCount; i++)
+            {
+                actuatorT[i] = Pivot(ActuatorName + i);
+                actuatorRodT[i] = Pivot(ActuatorRodName + i);
+                int s = SlotActuator + 2 * i;
+                filters[s] = FindRenderer(actuatorT[i], ActBodyName) ?? MakeRenderer(actuatorT[i], ActBodyName, EngineMaterials.Kit(Design?.Propellant));
+                filters[s + 1] = FindRenderer(actuatorRodT[i], ActRodName) ?? MakeRenderer(actuatorRodT[i], ActRodName, EngineMaterials.Kit(Design?.Propellant));
+                filters[Lod1Slot + s] = FindRenderer(actuatorT[i], ActBodyLodName) ?? MakeRenderer(actuatorT[i], ActBodyLodName, EngineMaterials.Kit(Design?.Propellant));
+                filters[Lod1Slot + s + 1] = FindRenderer(actuatorRodT[i], ActRodLodName) ?? MakeRenderer(actuatorRodT[i], ActRodLodName, EngineMaterials.Kit(Design?.Propellant));
+            }
             // Instantiate() copies serialized state only: a clone (prefab -> part, or an editor copy) starts with
             // ownMeshes = false and still shares its source's collider meshes, so give it its own. Its renderers keep
             // showing the source's (prefab or cached) meshes until the first build assigns this part's cache entries;
@@ -587,6 +648,15 @@ namespace ProcEngines
             if (fresh) ownMeshes = true;
             if (part.collider == null) part.collider = colliders[0];
             SetupLods();
+        }
+
+        Transform Pivot(string name)
+        {
+            Transform t = root.Find(name);
+            if (t != null) return t;
+            t = new GameObject(name).transform;
+            t.SetParent(root, false);
+            return t;
         }
 
         static MeshFilter FindRenderer(Transform parent, string name)
@@ -605,10 +675,17 @@ namespace ProcEngines
             if (lodGroup == null) lodGroup = root.gameObject.AddComponent<LODGroup>();
             Renderer chamber0 = staticMF.GetComponent<MeshRenderer>(), chamber1 = staticLodMF.GetComponent<MeshRenderer>();
             lodGroup.fadeMode = LODFadeMode.None;
+            var lod0 = new List<Renderer> { chamber0, bellR, kitR, kitBellR };
+            var lod1 = new List<Renderer> { chamber1, bellLodR, kitLodR, kitBellLodR };
+            for (int s = SlotActuator; s < Lod1Slot; s++)   // the actuators go with the kit (culled at LOD2)
+            {
+                lod0.Add(filters[s].GetComponent<MeshRenderer>());
+                lod1.Add(filters[Lod1Slot + s].GetComponent<MeshRenderer>());
+            }
             lodGroup.SetLODs(new[]
             {
-                new LOD(Lod0Height, new Renderer[] { chamber0, bellR, kitR, kitBellR }),
-                new LOD(Lod1Height, new Renderer[] { chamber1, bellLodR, kitLodR, kitBellLodR }),
+                new LOD(Lod0Height, lod0.ToArray()),
+                new LOD(Lod1Height, lod1.ToArray()),
                 new LOD(0f, new Renderer[] { chamber1, bellLodR }),
             });
         }
@@ -668,7 +745,7 @@ namespace ProcEngines
             shown[slot] = mesh;
         }
 
-        /// <summary>The meshes of a cache entry on the four filters of its level.</summary>
+        /// <summary>The meshes of a cache entry on the filters of its level (every actuator shows the same barrel and rod).</summary>
         void ShowLevel(int lod, EngineMeshCache.Entry e)
         {
             int b = lod <= 0 ? 0 : Lod1Slot;
@@ -676,6 +753,11 @@ namespace ProcEngines
             Show(b + SlotBell, e.Bell);
             Show(b + SlotKit, e.Kit);
             Show(b + SlotKitBell, e.KitBell);
+            for (int i = 0; i < ActuatorCount; i++)
+            {
+                Show(b + SlotActuator + 2 * i, e.ActuatorBody);
+                Show(b + SlotActuator + 2 * i + 1, e.ActuatorRod);
+            }
         }
 
         /// <summary>Flight: put back what this part gave each filter wherever a mod swapped in something else.</summary>
@@ -769,6 +851,11 @@ namespace ProcEngines
             kitLodR.sharedMaterials = kit;
             kitBellR.sharedMaterials = kit;
             kitBellLodR.sharedMaterials = kit;
+            for (int s = SlotActuator; s < Lod1Slot; s++)
+            {
+                filters[s].GetComponent<MeshRenderer>().sharedMaterials = kit;
+                filters[Lod1Slot + s].GetComponent<MeshRenderer>().sharedMaterials = kit;
+            }
             radiativeTech = tech;
             materialKey = key;
         }
@@ -855,16 +942,18 @@ namespace ProcEngines
             Mesh bell = new Mesh { name = lod <= 0 ? BellName : BellLodName };
             Mesh kit = new Mesh { name = lod <= 0 ? KitName : KitLodName };
             Mesh kitBell = new Mesh { name = lod <= 0 ? KitBellName : KitBellLodName };
+            Mesh actBody = new Mesh { name = lod <= 0 ? ActBodyName : ActBodyLodName };
+            Mesh actRod = new Mesh { name = lod <= 0 ? ActRodName : ActRodLodName };
             try
             {
                 EngineGeometry.Lathe(chamber, g.Static, EngineGeometry.StaticMaterials, EngineGeometry.RingSegments(g.StaticMaxRadius, lod), 0f);
                 EngineGeometry.Lathe(bell, g.Bell, EngineGeometry.BellMaterials, EngineGeometry.RingSegments(g.MaxRadius, lod), g.YThroat);
-                KitBuilder.Result kr = KitBuilder.Build(kit, kitBell, Design, Stats, g, Data, lod);
-                return EngineMeshCache.Add(levelKey, chamber, bell, kit, kitBell, kr);
+                KitBuilder.Result kr = KitBuilder.Build(kit, kitBell, actBody, actRod, Design, Stats, g, Data, lod);
+                return EngineMeshCache.Add(levelKey, chamber, bell, kit, kitBell, actBody, actRod, kr);
             }
             catch
             {
-                Destroy(chamber); Destroy(bell); Destroy(kit); Destroy(kitBell);
+                Destroy(chamber); Destroy(bell); Destroy(kit); Destroy(kitBell); Destroy(actBody); Destroy(actRod);
                 throw;
             }
         }
@@ -875,6 +964,7 @@ namespace ProcEngines
             thrustT.localPosition = new Vector3(0, 0, geometry.YThroat - geometry.YExit);
             exhaustT.localPosition = Kit != null && Kit.HasExhaust ? Kit.ExhaustPosition : new Vector3(0, geometry.YExit, 0);
             exhaustT.localRotation = Quaternion.LookRotation(Vector3.down, Vector3.forward);   // +Z down the exhaust, like thrustTransform
+            AimActuators(true);
         }
 
         /// <summary>LOADING: the prefab's own meshes (made with its renderers), the distant level only; the LOD0
@@ -889,7 +979,14 @@ namespace ProcEngines
                 EngineGeometry g1 = EngineGeometry.Build(Design, Stats, tech, fuelR, 1);
                 EngineGeometry.Lathe(staticLodMF.sharedMesh, g1.Static, EngineGeometry.StaticMaterials, EngineGeometry.RingSegments(g1.StaticMaxRadius, 1), 0f);
                 EngineGeometry.Lathe(bellLodMF.sharedMesh, g1.Bell, EngineGeometry.BellMaterials, EngineGeometry.RingSegments(g1.MaxRadius, 1), g1.YThroat);
-                Kit = KitBuilder.Build(kitLodMF.sharedMesh, kitBellLodMF.sharedMesh, Design, Stats, g1, Data, 1);
+                int a0 = Lod1Slot + SlotActuator;   // the first actuator's LOD1 filters get the meshes, the others share them
+                Kit = KitBuilder.Build(kitLodMF.sharedMesh, kitBellLodMF.sharedMesh, filters[a0].sharedMesh, filters[a0 + 1].sharedMesh, Design, Stats, g1, Data, 1);
+                for (int s = a0 + 2; s < Slots; s++)
+                {
+                    Mesh old = filters[s].sharedMesh, mine = filters[a0 + (s - a0) % 2].sharedMesh;
+                    filters[s].sharedMesh = mine;
+                    if (old != null && old != mine) Destroy(old);
+                }
                 geometry = g1;
                 geometryKey = null;
             }
@@ -1036,24 +1133,25 @@ namespace ProcEngines
         public sealed class Entry
         {
             public readonly string Key;
-            /// <summary>Static chamber, gimballed bell, static kit, and the kit fixed to the bell (in the bell's frame).</summary>
-            public readonly Mesh Chamber, Bell, Kit, KitBell;
+            /// <summary>Static chamber, gimballed bell, static kit, the kit fixed to the bell (in the bell's frame), and
+            /// the actuator barrel and rod every actuator shows (in their own frames, KitBuilder.ActuatorPose).</summary>
+            public readonly Mesh Chamber, Bell, Kit, KitBell, ActuatorBody, ActuatorRod;
             public readonly KitBuilder.Result KitResult;   // shared, read-only: exhaust placement
             public int Refs { get; internal set; }
             /// <summary>False once ReleaseCpuCopy ran (flight only).</summary>
             public bool Readable { get; private set; } = true;
             internal float IdleSince, Grace;
 
-            internal Entry(string key, Mesh chamber, Mesh bell, Mesh kit, Mesh kitBell, KitBuilder.Result kitResult)
+            internal Entry(string key, Mesh chamber, Mesh bell, Mesh kit, Mesh kitBell, Mesh actuatorBody, Mesh actuatorRod, KitBuilder.Result kitResult)
             {
-                Key = key; Chamber = chamber; Bell = bell; Kit = kit; KitBell = kitBell; KitResult = kitResult;
+                Key = key; Chamber = chamber; Bell = bell; Kit = kit; KitBell = kitBell; ActuatorBody = actuatorBody; ActuatorRod = actuatorRod; KitResult = kitResult;
             }
 
             /// <summary>Meshes still there (Unity null check: nothing else should ever destroy them).</summary>
-            public bool Alive => Chamber != null && Bell != null && Kit != null && KitBell != null;
+            public bool Alive => Chamber != null && Bell != null && Kit != null && KitBell != null && ActuatorBody != null && ActuatorRod != null;
 
             /// <summary>One of this entry's meshes.</summary>
-            internal bool Has(Mesh m) => m == Chamber || m == Bell || m == Kit || m == KitBell;
+            internal bool Has(Mesh m) => m == Chamber || m == Bell || m == Kit || m == KitBell || m == ActuatorBody || m == ActuatorRod;
 
             /// <summary>Upload and drop the CPU copy (Mesh.UploadMeshData(true)); the meshes can't be read or written
             /// afterwards, and nothing in flight needs to.</summary>
@@ -1064,6 +1162,8 @@ namespace ProcEngines
                 Bell.UploadMeshData(true);
                 Kit.UploadMeshData(true);
                 KitBell.UploadMeshData(true);
+                ActuatorBody.UploadMeshData(true);
+                ActuatorRod.UploadMeshData(true);
                 Readable = false;
             }
         }
@@ -1091,7 +1191,7 @@ namespace ProcEngines
         }
 
         /// <summary>Register freshly built meshes under `key`, with one reference for the caller.</summary>
-        public static Entry Add(string key, Mesh chamber, Mesh bell, Mesh kit, Mesh kitBell, KitBuilder.Result kitResult)
+        public static Entry Add(string key, Mesh chamber, Mesh bell, Mesh kit, Mesh kitBell, Mesh actuatorBody, Mesh actuatorRod, KitBuilder.Result kitResult)
         {
             Hook();
             if (entries.TryGetValue(key, out Entry old))
@@ -1101,7 +1201,7 @@ namespace ProcEngines
                 entries.Remove(key);
                 if (old.Refs == 0) Destroy(old);
             }
-            var e = new Entry(key, chamber, bell, kit, kitBell, kitResult) { Refs = 1 };
+            var e = new Entry(key, chamber, bell, kit, kitBell, actuatorBody, actuatorRod, kitResult) { Refs = 1 };
             entries[key] = e;
             return e;
         }
@@ -1140,6 +1240,8 @@ namespace ProcEngines
             if (e.Bell != null) UnityEngine.Object.Destroy(e.Bell);
             if (e.Kit != null) UnityEngine.Object.Destroy(e.Kit);
             if (e.KitBell != null) UnityEngine.Object.Destroy(e.KitBell);
+            if (e.ActuatorBody != null) UnityEngine.Object.Destroy(e.ActuatorBody);
+            if (e.ActuatorRod != null) UnityEngine.Object.Destroy(e.ActuatorRod);
             Destroyed++;
         }
 

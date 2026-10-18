@@ -84,7 +84,7 @@ namespace ProcEngines
         public static bool ChannelNozzle(EngineDesign d) => ChannelWall(d) && d.Propellant != "Hydrolox";
 
         /// <summary>Bumped when the meshes built from the same DESIGN + STATS change (code or asset contract).</summary>
-        public const string MeshVersion = "geo-r2";
+        public const string MeshVersion = "geo-r3";
 
         /// <summary>
         /// Identity of the render meshes: every input of Build, KitBuilder and the lathes. The serialized DESIGN (it
