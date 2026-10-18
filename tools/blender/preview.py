@@ -36,10 +36,12 @@ sc.world.use_nodes = True
 sc.world.node_tree.nodes["Background"].inputs["Color"].default_value = (0.35, 0.42, 0.55, 1)
 for o in pieces:
     for p in pieces: p.hide_render = p is not o
-    c = o.location + Vector((0, 0, -0.1))
+    corners = [o.matrix_world @ Vector(v) for v in o.bound_box]
+    c = sum(corners, Vector()) / 8
+    size = max((corners[6] - corners[0]).length, 0.1)
     for tag, ang, el in (("a", 25, 15), ("b", 205, 10)):
         a, e = math.radians(ang), math.radians(el)
-        cam.location = c + Vector((math.cos(a) * math.cos(e), math.sin(a) * math.cos(e), math.sin(e))) * 5.5
+        cam.location = c + Vector((math.cos(a) * math.cos(e), math.sin(a) * math.cos(e), math.sin(e))) * size * 1.9
         cam.rotation_euler = (c - cam.location).to_track_quat("-Z", "Y").to_euler()
         sc.render.filepath = os.path.join(out, f"{o.name}_{tag}.png")
         bpy.ops.render.render(write_still=True)

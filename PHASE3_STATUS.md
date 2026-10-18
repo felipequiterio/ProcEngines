@@ -113,6 +113,27 @@ Step 2 of the model-improvement plan.
   - A baked normal map: the atlas uses a flat normal.
   - Levels of detail: the pumps add about 9–13k kit vertices per engine.
 
+## Remaining authored pieces (step 3)
+
+Six more pieces from `build_kit.py`. All eight share one **2048² atlas** (DXT1, ~2.8 MB with mips).
+
+**Texel weighting:** after Smart UV Project, each piece's UVs are scaled by its `pe_texel` weight before packing. The weight is roughly the size of the piece's unit in game relative to a 0.3 m pump radius. This stops a 12-unit actuator from taking more of the atlas than a turbopump.
+
+| Piece | Unit | Placement (`KitBuilder`) |
+|---|---|---|
+| `preburner` | pump radius | Stands on the turbine of the upside-down staged-combustion pump. Jacketed body, injector dome with ox and fuel feed stubs, bolted flanges. The hot-gas duct (now heat-tinted, glowing material) starts at its `hot_out` elbow and runs into the dome. |
+| `gas_generator` | pump radius | Bolted onto the pump's `turbine_in`, body pointing outward. Two propellant valves sit on the injector end. |
+| `valve` | line radius | In-line ball valve with flanges, actuator and connector. One main valve each on the ox and fuel lines, at the middle control point, aligned with the Catmull-Rom tangent. On pressure-fed engines, the tank feeds now run down through a valve. |
+| `actuator` | barrel radius | The gimbal actuators. **Template-vertex deformation** (DESIGN §8.5): `MeshBuilder.AddMesh(..., length)` stretches the `zone0` (barrel) and `zone1` (rod) bands to reach any length, in proportion to their own length. The clevis, servo block, gland and eye keep their shape. Shrinking a zone below 30 % of its length falls back to scaling along the axis. |
+| `dome_inlet` | line radius | Reinforcing boss plus a flanged elbow, placed on the analytic dome surface (`EngineGeometry.DomePoint`) along its normal, with the elbow pointing outward. Ox lines (and both pressure-fed lines) end at its `in` anchor. |
+| `injector_ring` | chamber radius | Regen-return manifold under the injector flange, with eight feeders into the chamber, two flanged ports and four instrumentation bosses on the chamber wall. |
+
+Every piece falls back to the previous primitives if its file is missing.
+
+**Vertex budget:** the kit is now 12k (pressure-fed) to 32k (full-flow) vertices per engine. **Levels of detail are the next priority**, before large clusters.
+
+**Tests:** `visual.kit_assets` now checks all eight pieces, their key anchors and the DXT1 atlas. Visual 7/7, sandbox 24/24.
+
 ## Evidence
 
 [tests/ksp/evidence/phase3/](tests/ksp/evidence/phase3/): results files, and screenshots:

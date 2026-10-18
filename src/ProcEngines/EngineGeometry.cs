@@ -49,6 +49,17 @@ namespace ProcEngines
         public int TubeCount;
         public Vector2 ColliderChamberTop, ColliderChamberBottom, ColliderMid, ColliderExit, ColliderThroat;   // (r, y)
 
+        public float DomeTopRadius;
+
+        /// <summary>Point on the injector dome at radius r (clamped onto the dome), with its outward (r, y) normal.</summary>
+        public void DomePoint(float r, out Vector2 point, out Vector2 normal)
+        {
+            float span = Mathf.Max(ChamberRadius - DomeTopRadius, 1e-4f);
+            float t = Mathf.Asin(Mathf.Clamp((r - DomeTopRadius) / span, 0.15f, 0.97f));
+            point = new Vector2(DomeTopRadius + span * Mathf.Sin(t), YDomeTop - DomeHeight * (1 - Mathf.Cos(t)));
+            normal = new Vector2(DomeHeight * Mathf.Sin(t), span * Mathf.Cos(t)).normalized;
+        }
+
         /// <summary>Outer bell radius at height y (0 above the throat).</summary>
         public float BellRadiusAt(float y)
         {
@@ -106,6 +117,7 @@ namespace ProcEngines
 
             // injector dome: flat top under the gimbal block, then a quarter ellipse out to the chamber
             float r0 = fr * 0.95f;
+            g.DomeTopRadius = r0;
             st.Add(new ProfileSegment(Line(fr, y, r0, y, 1), MatSteel, 4, steelV));
             var dome = new List<Vector2>();
             for (int i = 0; i <= 12; i++)

@@ -436,9 +436,11 @@ namespace ProcEngines.KspTests
                 ("KeroloxGGVacRad", D("Kerolox", "GasGenerator", 980, 97, 150, true)),
                 ("KeroloxPF", D("Kerolox", "PressureFed", 78, 21, 40)),
             };
-            KitMesh dual = KitAssets.Get("turbopump_dual"), single = KitAssets.Get("turbopump_single");
-            Check("visual.kit_assets", dual != null && single != null && KitAssets.Atlas() != null && dual.Anchors.ContainsKey("ox_out") && single.Anchors.ContainsKey("out"),
-                $"dual {dual?.Positions.Length} verts {dual?.Anchors.Count} anchors, single {single?.Positions.Length} verts, atlas {KitAssets.Atlas()?.format} {KitAssets.Atlas()?.width}px, dir {KitAssets.Directory}");
+            var pieces = new[] { "turbopump_dual", "turbopump_single", "preburner", "gas_generator", "valve", "actuator", "dome_inlet", "injector_ring" };
+            var loaded = pieces.Select(n => KitAssets.Get(n)).ToList();
+            KitMesh dual = loaded[0], single = loaded[1], act = loaded[5];
+            Check("visual.kit_assets", loaded.All(k => k != null) && KitAssets.Atlas() != null && dual.Anchors.ContainsKey("ox_out") && single.Anchors.ContainsKey("out") && act.Anchors.ContainsKey("zone1_lo"),
+                $"{string.Join(", ", pieces.Zip(loaded, (n, k) => $"{n} {k?.Positions.Length}v/{k?.Anchors.Count}a"))}; atlas {KitAssets.Atlas()?.format} {KitAssets.Atlas()?.width}px");
             foreach (var (tag, d) in combos)
             {
                 if (HighLogic.LoadedScene != GameScenes.EDITOR) yield return EnterEditor();

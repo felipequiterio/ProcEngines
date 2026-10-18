@@ -234,12 +234,31 @@ namespace ProcEngines
 
         /// <summary>Place an authored piece: piece-space (x, y, z) maps to origin + (X x + Y y + Z z) * scale. The
         /// basis must be a rotation (det +1), so the file's winding holds.</summary>
-        public void AddMesh(KitMesh m, Vector3 origin, Vector3 X, Vector3 Y, Vector3 Z, float scale, int mat)
+        public void AddMesh(KitMesh m, Vector3 origin, Vector3 X, Vector3 Y, Vector3 Z, float scale, int mat, float length = 0)
         {
+            // template-vertex deformation (DESIGN.md 8.5): to reach `length` (piece units, measured from y = 0 down
+            // to the "end" anchor) the stretch zones (zoneN_hi above zoneN_lo, on y) grow in proportion to their
+            // own length; everything below a zone moves down with it, so flanges and eyes keep their shape.
+            var zones = new List<Vector3>();   // (hi, lo, delta)
+            if (length > 0 && m.TryAnchor("end", out Vector3 endP, out _))
+            {
+                float total = 0;
+                for (int z = 0; z < 10; z++)
+                    if (m.TryAnchor("zone" + z + "_hi", out Vector3 hi, out _) && m.TryAnchor("zone" + z + "_lo", out Vector3 lo, out _) && hi.y > lo.y)
+                    {
+                        zones.Add(new Vector3(hi.y, lo.y, 0));
+                        total += hi.y - lo.y;
+                    }
+                float delta = length - (-endP.y);
+                // shrinking a zone below 30 % of its length would fold it: scale the whole piece along y instead
+                if (total <= 0 || delta < -0.7f * total) { zones.Clear(); Y *= length / Mathf.Max(-endP.y, 1e-3f); }
+                else for (int z = 0; z < zones.Count; z++) zones[z] = new Vector3(zones[z].x, zones[z].y, delta * (zones[z].x - zones[z].y) / total);
+            }
             int start = v.Count;
             for (int i = 0; i < m.Positions.Length; i++)
             {
                 Vector3 p = m.Positions[i], nn = m.Normals[i];
+                foreach (Vector3 z in zones) p.y -= z.z * Mathf.Clamp01((z.x - m.Positions[i].y) / (z.x - z.y));
                 v.Add(origin + (X * p.x + Y * p.y + Z * p.z) * scale);
                 Vector3 wn = (X * nn.x + Y * nn.y + Z * nn.z).normalized;
                 n.Add(wn);
@@ -334,20 +353,59 @@ namespace ProcEngines
                 mb.Cylinder(top, bot, sr, MatStructure, 8);
                 mb.Sphere(bot, sr * 1.6f, MatStructure, 8);
             }
-            // gimbal actuators: clevis, cylinder with a gland, rod, rod-end bearing; 90 degrees apart
+            // gimbal actuators, 90 degrees apart: the authored piece stretched to length (barrel and rod zones), or
+            // primitives (clevis, cylinder with a gland, rod, rod-end bearing)
             float yAct = g.YThroat - 0.3f * bellLen;
+            KitMesh actuator = KitAssets.Get("actuator");
             foreach (float ang in new[] { 135f, 225f })
             {
                 Vector3 top = Around(ang, g.MountRadius * 0.85f, yUnder);
                 Vector3 bot = Around(ang, g.BellRadiusAt(yAct) + 0.02f * rc + 0.005f, yAct);
                 Vector3 dir = (bot - top).normalized;
-                Vector3 mid = Vector3.Lerp(top, bot, 0.55f);
                 float ra = Mathf.Max(0.06f * rc, 0.006f);
+                if (actuator != null)
+                {
+                    Vector3 Y = -dir, X = Vector3.Cross(Y, Around(ang, 1, 0)).normalized, Z = Vector3.Cross(X, Y);
+                    mb.AddMesh(actuator, top, X, Y, Z, ra, MatAuthored, (bot - top).magnitude / ra);
+                    continue;
+                }
+                Vector3 mid = Vector3.Lerp(top, bot, 0.55f);
                 mb.Sphere(top + dir * ra * 0.6f, ra * 1.1f, MatStructure, 10);
                 mb.Cylinder(top + dir * ra * 0.6f, mid, ra, MatMachine, 12);
                 mb.Cylinder(mid - dir * ra * 0.25f, mid + dir * ra * 0.05f, ra * 1.18f, MatStructure, 12);
                 mb.Cylinder(mid, bot, ra * 0.42f, MatLines, 8);
                 mb.Sphere(bot, ra * 0.7f, MatStructure, 10);
+            }
+
+            // regen return manifold under the injector flange, with feeders and instrumentation bosses
+            KitMesh ring = KitAssets.Get("injector_ring");
+            if (ring != null) mb.AddMesh(ring, new Vector3(0, g.YInjector, 0), Vector3.right, Vector3.up, Vector3.forward, rc, MatAuthored);
+
+            // in-line main valve at a path point, flow along `along`, actuator on the upper side
+            KitMesh valveMesh = KitAssets.Get("valve");
+            void Valve(Vector3 at, Vector3 along, float lineR)
+            {
+                if (valveMesh == null || along.sqrMagnitude < 1e-8f) return;
+                Vector3 Y = along.normalized;
+                Vector3 X = Vector3.up - Y * Vector3.Dot(Vector3.up, Y);
+                if (X.sqrMagnitude < 1e-4f) X = Vector3.Cross(Y, Vector3.forward);
+                X.Normalize();
+                mb.AddMesh(valveMesh, at, X, Y, Vector3.Cross(X, Y), lineR, MatAuthored);
+            }
+
+            // a line entering the injector dome: the authored inlet (boss and flanged elbow) at radius `frac` of the
+            // chamber, elbow pointing outward; returns where the line attaches and its outward direction
+            KitMesh inletMesh = KitAssets.Get("dome_inlet");
+            Vector3 DomeInlet(float ang, float frac, float lineR, out Vector3 inDir)
+            {
+                g.DomePoint(rc * frac, out Vector2 pt, out Vector2 nrm);
+                Vector3 radial = Around(ang, 1, 0);
+                Vector3 at = Around(ang, pt.x, pt.y), N = radial * nrm.x + Vector3.up * nrm.y;
+                if (inletMesh == null || !inletMesh.TryAnchor("in", out Vector3 la, out Vector3 ld)) { inDir = N; return at; }
+                Vector3 X = (radial - N * Vector3.Dot(radial, N)).normalized, Y = N, Z = Vector3.Cross(X, Y);
+                mb.AddMesh(inletMesh, at, X, Y, Z, lineR, MatAuthored);
+                inDir = X * ld.x + Y * ld.y + Z * ld.z;
+                return at + (X * la.x + Y * la.y + Z * la.z) * lineR;
             }
 
             // turbopump envelope from its mass (dense machinery, ~5 t/m^3 including the housing), never wider than the chamber
@@ -407,24 +465,44 @@ namespace ProcEngines
                 if (preburner)
                 {
                     Vector3 pb = p.TurbineExhaust;
-                    mb.Cylinder(pb, pb + Vector3.up * r * 0.9f, r * 0.45f, MatMachine);
-                    mb.Sphere(pb + Vector3.up * r * 0.9f, r * 0.45f, MatMachine);
-                    mb.Torus(pb + Vector3.up * r * 0.1f, Vector3.up, r * 0.46f, r * 0.05f, MatStructure, 20, 6);
-                    // hot-gas duct into the injector dome
-                    mb.Tube(new[] { pb + Vector3.up * r * 1.2f, Vector3.Lerp(pb, Dome(ang, 0.2f), 0.5f) + Vector3.up * r * 0.6f, Dome(ang, 0.2f) }, r * 0.28f, MatMachine, 12, MatStructure);
+                    KitMesh pre = KitAssets.Get("preburner");
+                    if (pre != null && pre.TryAnchor("hot_out", out Vector3 ha, out Vector3 hd))
+                    {
+                        mb.AddMesh(pre, pb, radial, Vector3.up, tang, r, MatAuthored);
+                        // hot-gas duct from the preburner outlet into the injector dome
+                        Vector3 hot = pb + (radial * ha.x + Vector3.up * ha.y + tang * ha.z) * r, hdir = radial * hd.x + Vector3.up * hd.y + tang * hd.z;
+                        Vector3 into = Dome(ang, 0.25f);
+                        mb.Tube(new[] { hot, hot + hdir * r * 0.35f, Vector3.Lerp(hot, into, 0.6f) + Vector3.up * r * 0.25f, into }, r * 0.19f, MatHot, 14, MatStructure);
+                    }
+                    else
+                    {
+                        mb.Cylinder(pb, pb + Vector3.up * r * 0.9f, r * 0.45f, MatMachine);
+                        mb.Sphere(pb + Vector3.up * r * 0.9f, r * 0.45f, MatMachine);
+                        mb.Torus(pb + Vector3.up * r * 0.1f, Vector3.up, r * 0.46f, r * 0.05f, MatStructure, 20, 6);
+                        // hot-gas duct into the injector dome
+                        mb.Tube(new[] { pb + Vector3.up * r * 1.2f, Vector3.Lerp(pb, Dome(ang, 0.2f), 0.5f) + Vector3.up * r * 0.6f, Dome(ang, 0.2f) }, r * 0.28f, MatMachine, 12, MatStructure);
+                    }
                 }
                 return p;
             }
 
-            void OxToDome(PumpPorts p, float ang, float r) =>
-                mb.Tube(new[] { p.OxOut, p.OxOut + p.OxDir * r * 0.35f, Around(ang + 30, rc * 1.05f, p.OxOut.y), Dome(ang + 30, 0.7f) }, oxR, MatLines, 10, MatStructure);
+            // main oxidizer valve on the way, into the dome through an inlet elbow
+            void OxToDome(PumpPorts p, float ang, float r)
+            {
+                Vector3 inlet = DomeInlet(ang + 30, 0.72f, oxR, out Vector3 inDir);
+                Vector3 p1 = p.OxOut + p.OxDir * r * 0.35f, p2 = Around(ang + 30, Mathf.Max(rc * 1.05f, (inlet - Vector3.up * inlet.y).magnitude + oxR * 4), Mathf.Min(p.OxOut.y, inlet.y + oxR * 3)), p3 = inlet + inDir * oxR * 2.5f;
+                mb.Tube(new[] { p.OxOut, p1, p2, p3, inlet }, oxR, MatLines, 10, MatStructure);
+                Valve(p2, p3 - p1, oxR);
+            }
 
             // the fuel line crosses onto the gimballed bell: a bellows section takes up the motion
             void FuelToManifold(PumpPorts p, float ang, float r, int mat, float sweep = -25)
             {
                 float yMid = Mathf.Min(g.YChamberBottom, p.FuelOut.y - r * 0.3f);
                 float yHalf = g.YThroat - 0.5f * (g.YThroat - yMan);
-                mb.Tube(new[] { p.FuelOut, p.FuelOut + p.FuelDir * r * 0.35f, Around(ang + sweep, rc + r * 1.3f, yMid), Around(ang + sweep, g.BellRadiusAt(yHalf) + fuelR * 2, yHalf), Around(ang + sweep, manR, yMan) }, fuelR, mat, 10, MatStructure, 0.2f, 0.3f);
+                Vector3 p1 = p.FuelOut + p.FuelDir * r * 0.35f, p2 = Around(ang + sweep, rc + r * 1.3f, yMid), p3 = Around(ang + sweep, g.BellRadiusAt(yHalf) + fuelR * 2, yHalf);
+                mb.Tube(new[] { p.FuelOut, p1, p2, p3, Around(ang + sweep, manR, yMan) }, fuelR, mat, 10, MatStructure, 0.28f, 0.38f);
+                Valve(p2, p3 - p1, fuelR);   // main fuel valve
             }
 
             switch (d.Cycle)
@@ -443,11 +521,21 @@ namespace ProcEngines
                     }
                     foreach (float ang in new[] { 90f, 270f })
                     {
+                        float lr = ang < 180 ? fuelR : oxR;
+                        if (valveMesh != null)
+                        {
+                            // tank feed down through the main valve into the dome inlet
+                            Vector3 inlet = DomeInlet(ang, 0.7f, lr, out Vector3 inDir);
+                            Vector3 top = Around(ang, rc * 1.1f, yUnder - 0.004f), mid = Around(ang, rc * 1.1f, (yUnder + inlet.y) * 0.5f), near = inlet + inDir * lr * 2.5f;
+                            mb.Tube(new[] { top, mid, near, inlet }, lr, MatLines, 10, MatStructure);
+                            Valve(mid, near - top, lr);
+                            continue;
+                        }
                         Vector3 valve = Around(ang, rc * 0.85f, yUnder - 0.3f * g.DomeHeight);
                         float vr = Mathf.Max(oxR * 1.25f, 0.005f);
                         mb.Sphere(valve, vr, MatMachine, 12);
                         mb.Cylinder(valve, valve + Around(ang, vr * 1.6f, 0), vr * 0.45f, MatStructure, 8);   // actuator boss
-                        mb.Tube(new[] { valve + Vector3.up * 0.01f, Dome(ang, 0.6f) }, ang < 180 ? fuelR : oxR, MatLines, 10, MatStructure);
+                        mb.Tube(new[] { valve + Vector3.up * 0.01f, Dome(ang, 0.6f) }, lr, MatLines, 10, MatStructure);
                     }
                     break;
                 }
@@ -457,11 +545,18 @@ namespace ProcEngines
                     PumpPorts p = Pump(0, 1, false, true);
                     OxToDome(p, 0, r);
                     FuelToManifold(p, 0, r, fuelMat);
-                    // gas generator feeding the turbine inlet
-                    Vector3 gg = p.TurbineIn + p.TurbineInDir * r * 0.45f + Vector3.up * r * 0.1f;
-                    mb.Sphere(gg, r * 0.3f, MatMachine);
-                    mb.Cylinder(gg, p.TurbineIn, r * 0.12f, MatHot, 10);
-                    mb.Cylinder(gg + Vector3.up * r * 0.25f, gg + Vector3.up * r * 0.45f, r * 0.14f, MatMachine, 10);
+                    // gas generator bolted onto the turbine inlet
+                    KitMesh ggMesh = KitAssets.Get("gas_generator");
+                    Vector3 gx = (p.TurbineInDir - Vector3.up * Vector3.Dot(p.TurbineInDir, Vector3.up)).normalized;
+                    if (ggMesh != null && gx.sqrMagnitude > 0.5f)
+                        mb.AddMesh(ggMesh, p.TurbineIn, gx, Vector3.up, Vector3.Cross(gx, Vector3.up), r, MatAuthored);
+                    else
+                    {
+                        Vector3 gg = p.TurbineIn + p.TurbineInDir * r * 0.45f + Vector3.up * r * 0.1f;
+                        mb.Sphere(gg, r * 0.3f, MatMachine);
+                        mb.Cylinder(gg, p.TurbineIn, r * 0.12f, MatHot, 10);
+                        mb.Cylinder(gg + Vector3.up * r * 0.25f, gg + Vector3.up * r * 0.45f, r * 0.14f, MatMachine, 10);
+                    }
                     // exhaust duct down past the bell ending in a small nozzle
                     float yEx = g.YThroat - 0.45f * bellLen;
                     float ductR = Mathf.Max(r * 0.32f, 0.01f);

@@ -18,7 +18,7 @@ Layout:
 - `tests/ProcEngines.KspTests` + `tests/ksp/run.sh` – self-driving in-game tests (`run.sh <A|B> <sandbox|career|lmpA|lmpB|visual|plumes>`)
 - `tests/ProcEngines.Model.Tests` – `dotnet run -c Release` (add `report`, `fit` or `cv` after `--`)
 - `tools/gen_propellants.py` – regenerates `GameData/ProcEngines/Data/Propellants.cfg` with NASA CEA
-- `tools/blender/build_kit.py` – models, atlases, bakes and exports the authored kit pieces (turbopumps) into `GameData/ProcEngines/PluginData/Kit`, headless: `blender -b --factory-startup -P tools/blender/build_kit.py`. It also saves `tools/blender/kit.blend`; after hand edits there, `blender -b tools/blender/kit.blend -P tools/blender/build_kit.py -- --export-only` re-bakes and exports. `preview.py` renders review images.
+- `tools/blender/build_kit.py` – models, atlases, bakes and exports the authored kit pieces (turbopumps, preburner, gas generator, valve, actuator, dome inlet, injector ring) into `GameData/ProcEngines/PluginData/Kit`, headless: `blender -b --factory-startup -P tools/blender/build_kit.py`. It also saves `tools/blender/kit.blend`; after hand edits there, `blender -b tools/blender/kit.blend -P tools/blender/build_kit.py -- --export-only` re-bakes and exports. `preview.py` renders review images.
 - `GameData/ProcEngines` – the mod's data and part (the plugin DLLs are copied into `Plugins/` on deploy)
 - `spike/` – Phase 0 throwaway spike and its self-driving in-game test harness
 - `research/`, `visualization/` – prior-art studies and a browser mock-up of the designer
