@@ -63,6 +63,9 @@ namespace ProcEngines
             return m;
         }
 
+        /// <summary>A level of detail of a piece (`<name>.lod1.pem`), or the full piece when there's no such file.</summary>
+        public static KitMesh GetLod(string name, int lod) => lod <= 0 ? Get(name) : (Get(name + ".lod" + lod) ?? Get(name));
+
         public static KitMesh Read(string name, byte[] data)
         {
             using (var r = new BinaryReader(new MemoryStream(data)))

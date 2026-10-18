@@ -14,8 +14,9 @@ namespace ProcEngines
     /// </summary>
     public static class EngineMaterials
     {
-        public const float RadiativeTile = 0.4f;   // metres per texture repeat on the radiative extension
-        public const int TubesPerTile = 8;         // cooling tubes per U repeat of the regen texture
+        public const float RadiativeTile = 0.8f;   // metres per texture repeat on the radiative extension (ASSETS.md 5)
+        public const int TubesPerTile = 16;        // cooling tubes per U repeat of the regen texture
+        public const float SteelTile = 0.6f;       // metres per texture repeat on steel surfaces
 
         static Material steel, bolts, machine, lines, foil, hotDuct, niobium, carbon;
         static readonly Dictionary<string, Material> regen = new Dictionary<string, Material>(), soot = new Dictionary<string, Material>();
