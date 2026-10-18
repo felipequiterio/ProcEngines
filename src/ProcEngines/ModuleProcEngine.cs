@@ -70,6 +70,8 @@ namespace ProcEngines
         [KSPField(guiActive = false, guiActiveEditor = true, guiName = "Status")] public string status = "";
 
         public EngineDesign Design { get; private set; }
+        /// <summary>The visual finish (FINISH node): materials only, never stats or meshes.</summary>
+        public EngineFinish Finish { get; private set; } = new EngineFinish();
         public EngineStats Stats { get; private set; }
         public TechCaps Caps { get; private set; }
         public List<string> Violations { get; private set; } = new List<string>();
@@ -107,7 +109,8 @@ namespace ProcEngines
         bool vesselEvents;
         static int copiesReplaced;
         LODGroup lodGroup;
-        string radiativeTech, materialKey;
+        string materialKey;
+        bool carbonGlow;   // the extension shows carbon-carbon, which glows hotter
         float glow;
         bool glowApplied;
         MaterialPropertyBlock glowBlock;
@@ -135,6 +138,9 @@ namespace ProcEngines
             EngineDesign defaults = PrefabDesign();
             ConfigNode d = node.GetNode("DESIGN");
             Design = d != null ? Serialization.LoadDesign(KspData.ToCfg(d), defaults) : (Design ?? defaults);
+            // a saved engine without FINISH has the default (all Auto) finish
+            ConfigNode fn = node.GetNode("FINISH");
+            if (fn != null || d != null) Finish = EngineFinish.Load(fn != null ? KspData.ToCfg(fn) : null);
             ConfigNode s = node.GetNode("STATS");
             if (s != null)
             {
@@ -165,6 +171,7 @@ namespace ProcEngines
             node.AddValue("schemaVersion", Serialization.SchemaVersion);
             if (Design != null) node.AddNode(KspData.ToConfigNode(Serialization.SaveDesign(Design)));
             if (Stats != null) node.AddNode(KspData.ToConfigNode(Serialization.SaveStats(Stats)));
+            if (!Finish.IsDefault) node.AddNode(KspData.ToConfigNode(Finish.Save()));
         }
 
         /// <summary>Editor copies and symmetry clones: the design isn't a Unity-serialized field, so copy it here.</summary>
@@ -175,7 +182,20 @@ namespace ProcEngines
                 Design = Serialization.LoadDesign(Serialization.SaveDesign(src.Design));
                 Stats = src.Stats;
                 designName = src.designName;
+                Finish = src.Finish.Copy();
             }
+        }
+
+        /// <summary>Change the finish: swaps materials on the renderers right away (no mesh rebuild, no stats change)
+        /// and pushes it to the symmetry counterparts. In the editor it counts as a ship change (undo).</summary>
+        public void SetFinish(EngineFinish f, bool pushSymmetry = true)
+        {
+            Finish = (f ?? new EngineFinish()).Copy();
+            if (geometry != null && bellR != null && Design != null) UpdateMaterials();
+            if (HighLogic.LoadedSceneIsEditor) shipModifiedPending = true;
+            if (!pushSymmetry) return;
+            foreach (Part p in part.symmetryCounterparts)
+                p.FindModuleImplementing<ModuleProcEngine>()?.SetFinish(f, false);
         }
 
         EngineDesign PrefabDesign() => new EngineDesign
@@ -450,7 +470,7 @@ namespace ProcEngines
             // heats in ~2 s; cools like a radiator: fast while white-hot (T^4), a slow dull-red tail (~5 s in all)
             float rate = target > glow ? 0.5f : 0.12f + 0.5f * glow * glow * glow;
             glow = Mathf.MoveTowards(glow, target, rate * TimeWarp.deltaTime);
-            bool cc = radiativeTech == "Late";
+            bool cc = carbonGlow;
             GlowTemperature = 300 + glow * (cc ? 1700 : 1400);
             GlowColor = EngineMaterials.Glow(GlowTemperature);
             DuctGlowColor = EngineMaterials.Glow(300 + glow * 800);
@@ -840,16 +860,17 @@ namespace ProcEngines
         /// <summary>The extension material (niobium or carbon-carbon) depends on the tech level; the regen tube tint,
         /// the soot inside and the hot duct on the propellant; tube or channel wall on the cycle (and tech); the
         /// kerolox bell's sooted tube wall on whether the built bell has a radiative extension (its soot band belongs
-        /// at the exit lip, not at the joint). Called once `geometry` is current.</summary>
+        /// at the exit lip, not at the joint); and on the finish, which overrides any of them (the meshes stay as
+        /// they are). Called once `geometry` is current, and when the finish changes.</summary>
         void UpdateMaterials()
         {
             string tech = Design.Tech ?? "Mid";
             bool chamberChannel = EngineGeometry.ChannelWall(Design), bellChannel = EngineGeometry.ChannelNozzle(Design);
             bool extension = geometry != null && geometry.HasExtension;
-            string key = tech + "|" + Design.Propellant + "|" + chamberChannel + "|" + bellChannel + "|" + extension;
+            string key = tech + "|" + Design.Propellant + "|" + chamberChannel + "|" + bellChannel + "|" + extension + "|" + Finish.Key;
             if (materialKey == key) return;
-            Material[] bell = EngineMaterials.Bell(tech, Design.Propellant, bellChannel, extension), chamber = EngineMaterials.Static(Design.Propellant, chamberChannel),
-                kit = EngineMaterials.Kit(Design.Propellant);
+            Material[] bell = EngineMaterials.Bell(tech, Design.Propellant, bellChannel, extension, Finish), chamber = EngineMaterials.Static(Design.Propellant, chamberChannel, Finish),
+                kit = EngineMaterials.Kit(Design.Propellant, Finish);
             bellR.sharedMaterials = bell;
             bellLodR.sharedMaterials = bell;
             staticMF.GetComponent<MeshRenderer>().sharedMaterials = chamber;
@@ -863,7 +884,7 @@ namespace ProcEngines
                 filters[s].GetComponent<MeshRenderer>().sharedMaterials = kit;
                 filters[Lod1Slot + s].GetComponent<MeshRenderer>().sharedMaterials = kit;
             }
-            radiativeTech = tech;
+            carbonGlow = EngineMaterials.CarbonExtension(tech, Finish);
             materialKey = key;
         }
 

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using ProcEngines.Model;
 using UnityEngine;
 
 namespace ProcEngines
@@ -45,7 +46,8 @@ namespace ProcEngines
         static Shader bumped, emissive;
         static Material steel, bolts, machine, lines, structure, foil, niobium, carbon, authored;
         static readonly Dictionary<string, Material> walls = new Dictionary<string, Material>(), soot = new Dictionary<string, Material>(),
-            bellSteel = new Dictionary<string, Material>(), hotDuct = new Dictionary<string, Material>();
+            bellSteel = new Dictionary<string, Material>(), hotDuct = new Dictionary<string, Material>(),
+            variants = new Dictionary<string, Material>();   // finish options, by material name
         static readonly Dictionary<string, Texture2D> textures = new Dictionary<string, Texture2D>();
         static readonly List<string> report = new List<string>();
         static Texture2D flatNormal, white, glowRamp;
@@ -54,11 +56,12 @@ namespace ProcEngines
 
         /// <summary>Chamber, mount and convergent: EngineGeometry.MatSteel, MatRegenStatic, MatBolts. The wall slot is
         /// the tube wall (`regen`; never the sooted kerolox variant: the chamber's heat coordinate is 1 at the
-        /// injector, where no plume soot reaches) or, with `channel`, the brazed channel-wall jacket.</summary>
-        public static Material[] Static(string propellant, bool channel = false)
+        /// injector, where no plume soot reaches) or, with `channel`, the brazed channel-wall jacket. `finish` picks
+        /// the chamber wall's and the mount's material (null: all Auto).</summary>
+        public static Material[] Static(string propellant, bool channel = false, EngineFinish finish = null)
         {
             EnsureShaders();
-            return new[] { Steel(), Wall(WallSurface(false, propellant, channel), propellant), Bolts() };
+            return new[] { SteelPart("steel", Opt(finish, "mount"), Steel), Wall(WallSurface(false, propellant, channel), propellant, Opt(finish, "chamber")), Bolts() };
         }
 
         /// <summary>The surface of the cooled wall: the channel-wall `jacket`, else the tube wall, which on a kerolox
@@ -71,21 +74,42 @@ namespace ProcEngines
         /// <summary>Bell: the regen section (tubes, sooted toward the exit for kerolox without an extension; or the
         /// channel-wall jacket), the extension (niobium, or carbon-carbon at the Late tech level), the inside, the
         /// propellant-tinted steel of the hat bands / manifold / joint flange, bolts. `extension`: the built bell
-        /// has a radiative extension (EngineGeometry.HasExtension).</summary>
-        public static Material[] Bell(string techLevel, string propellant, bool channel = false, bool extension = false)
+        /// has a radiative extension (EngineGeometry.HasExtension). `finish` overrides the nozzle wall, the
+        /// extension, the inside and the bands.</summary>
+        public static Material[] Bell(string techLevel, string propellant, bool channel = false, bool extension = false, EngineFinish finish = null)
         {
             EnsureShaders();
-            return new[] { Wall(WallSurface(true, propellant, channel, extension), propellant), techLevel == "Late" ? Carbon() : Niobium(), Soot(propellant), BellSteel(propellant), Bolts() };
+            string hardware = Opt(finish, "hardware");
+            return new[]
+            {
+                Wall(WallSurface(true, propellant, channel, extension), propellant, Opt(finish, "nozzle")),
+                Extension(CarbonExtension(techLevel, finish), Opt(finish, "extension")),
+                Soot(InteriorPropellant(propellant, Opt(finish, "interior"))),
+                hardware == EngineFinish.Auto ? BellSteel(propellant) : SteelPart("steel", hardware, Steel),
+                Bolts(),
+            };
         }
 
         /// <summary>Kit: KitBuilder.MatStructure, MatMachine, MatLines, MatHot, MatFoil, MatAuthored (the baked
         /// atlas of the Blender pieces with its normal map; plain machine steel if the atlas is missing). The hot
-        /// duct is tinted per propellant (sooty for kerosene).</summary>
-        public static Material[] Kit(string propellant = null)
+        /// duct is tinted per propellant (sooty for kerosene). `finish` overrides the frame and the lines (the plain
+        /// and the foil-wrapped slot alike); the machinery and the hot duct keep their look.</summary>
+        public static Material[] Kit(string propellant = null, EngineFinish finish = null)
         {
             EnsureShaders();
-            return new[] { Structure(), Machine(), Lines(), HotDuct(propellant), Foil(), Authored() };
+            string lines = Opt(finish, "lines");
+            return new[] { SteelPart("lines", Opt(finish, "frame"), Structure), Machine(), LineMaterial(lines, false), HotDuct(propellant), LineMaterial(lines, true), Authored() };
         }
+
+        /// <summary>Whether the extension shows carbon-carbon, whose glow runs hotter than niobium's: chosen in the
+        /// finish, or Auto at the Late tech level.</summary>
+        public static bool CarbonExtension(string techLevel, EngineFinish finish)
+        {
+            string o = Opt(finish, "extension");
+            return o == "Carbon" || (o == EngineFinish.Auto && techLevel == "Late");
+        }
+
+        static string Opt(EngineFinish finish, string slot) => finish == null ? EngineFinish.Auto : finish.Get(slot);
 
         static readonly Color[] glowStops = { new Color(0.45f, 0.02f, 0f), new Color(0.95f, 0.2f, 0.02f), new Color(1f, 0.4f, 0.08f), new Color(1f, 0.58f, 0.22f) };
 
@@ -190,8 +214,9 @@ namespace ProcEngines
         /// The specular is dim and only half tinted (a fired wall has no polished copper left), with a tight lobe on
         /// the tubes so the highlight runs along each crown; the smooth jacket takes a dimmer, broader sheen.
         /// </summary>
-        static Material Wall(string surface, string propellant)
+        static Material Wall(string surface, string propellant, string option = EngineFinish.Auto)
         {
+            if (option != EngineFinish.Auto) return WallVariant(surface, option);
             propellant = propellant ?? "";
             string key = surface + "-" + PropName(propellant);
             if (walls.TryGetValue(key, out Material m) && m != null) return m;
@@ -227,6 +252,140 @@ namespace ProcEngines
             m = MakeSurface("soot-" + PropName(propellant), bumped, "soot", tint, 0.3f, new Color(0.16f, 0.16f, 0.16f));
             soot[propellant] = m;
             return m;
+        }
+
+        // ------------------------------------------------------------------ finish options (EngineFinish)
+        // Each option re-tints a surface the engine already uses, so it costs no texture memory. The textures are
+        // near-neutral grey with their wear baked in; an option names the albedo it should average to, and the tint
+        // is that over the texture's own mean (gamma space: the shader multiplies the sRGB albedo by the tint, which
+        // may exceed 1 to lighten a dark texture). Metals get a highlight tinted like the metal; paint and
+        // insulation a dim, broad one.
+
+        /// <summary>Mean albedo of each surface texture as shipped (build_surfaces.py output; regen_k as its clean
+        /// regen part). Close enough for a generated fallback.</summary>
+        static float SurfaceMean(string surface)
+        {
+            switch (surface)
+            {
+                case "regen": case "regen_k": return 0.515f;
+                case "jacket": return 0.432f;
+                default: return 0.5f;   // steel, lines
+            }
+        }
+
+        struct Look
+        {
+            public Color Albedo, Spec;
+            public float Shininess;
+            public Look(Color albedo, Color spec, float shininess) { Albedo = albedo; Spec = spec; Shininess = shininess; }
+        }
+
+        static Color C(float r, float g, float b) => new Color(r, g, b, 1);
+
+        /// <summary>The colour times k, alpha left at 1 (Color * float would scale it too).</summary>
+        static Color Lighten(Color c, float k) => new Color(c.r * k, c.g * k, c.b * k, 1);
+
+        /// <summary>The cooled-wall options (EngineFinish wall slots). Tube walls keep their tight lobe along each
+        /// crown; the smooth jacket takes a broader one.</summary>
+        static Look WallLook(string option, bool jacket)
+        {
+            float tight = jacket ? 0.35f : 0.45f;
+            switch (option)
+            {
+                case "Copper": return new Look(C(0.64f, 0.4f, 0.29f), C(0.6f, 0.4f, 0.3f), tight);
+                case "Bronze": return new Look(C(0.44f, 0.29f, 0.2f), C(0.34f, 0.24f, 0.18f), tight);
+                case "Stainless": return new Look(C(0.5f, 0.5f, 0.52f), C(0.55f, 0.55f, 0.57f), tight);
+                case "Inconel": return new Look(C(0.5f, 0.45f, 0.36f), C(0.44f, 0.4f, 0.33f), tight);
+                case "Nickel": return new Look(C(0.42f, 0.42f, 0.4f), C(0.34f, 0.34f, 0.32f), tight * 0.8f);
+                case "Black": return new Look(C(0.075f, 0.072f, 0.07f), C(0.2f, 0.2f, 0.2f), 0.25f);
+                default: return new Look(C(0.5f, 0.5f, 0.5f), C(0.4f, 0.4f, 0.4f), tight);
+            }
+        }
+
+        /// <summary>Steel parts (EngineFinish steel slots): bare, darkened, bronzed, or painted.</summary>
+        static Look SteelLook(string option)
+        {
+            switch (option)
+            {
+                case "Steel": return new Look(C(0.55f, 0.55f, 0.57f), C(0.6f, 0.6f, 0.62f), 0.3f);
+                case "DarkSteel": return new Look(C(0.3f, 0.3f, 0.31f), C(0.42f, 0.42f, 0.43f), 0.3f);
+                case "Bronzed": return new Look(C(0.5f, 0.42f, 0.34f), C(0.38f, 0.33f, 0.28f), 0.3f);
+                case "Primer": return new Look(C(0.5f, 0.51f, 0.52f), C(0.14f, 0.14f, 0.14f), 0.15f);
+                case "Black": return new Look(C(0.07f, 0.07f, 0.075f), C(0.16f, 0.16f, 0.16f), 0.2f);
+                case "White": return new Look(C(0.82f, 0.82f, 0.8f), C(0.2f, 0.2f, 0.2f), 0.2f);
+                default: return new Look(C(0.5f, 0.5f, 0.5f), C(0.4f, 0.4f, 0.4f), 0.3f);
+            }
+        }
+
+        static Material Variant(string key, Func<Material> make)
+        {
+            if (variants.TryGetValue(key, out Material m) && m != null) return m;   // Unity null check
+            m = make();
+            variants[key] = m;
+            return m;
+        }
+
+        static Material Tinted(string key, Shader sh, string surface, Look look) =>
+            Variant(key, () => MakeSurface(key, sh, surface, Lighten(look.Albedo, 1f / SurfaceMean(surface)), look.Shininess, look.Spec));
+
+        static Material WallVariant(string surface, string option) =>
+            Tinted("wall-" + surface + "-" + option, bumped, surface, WallLook(option, surface == "jacket"));
+
+        /// <summary>A steel-slot option on `surface` (steel for the mount and bands, the kit's lines texture for the
+        /// frame); Auto keeps the slot's own material.</summary>
+        static Material SteelPart(string surface, string option, Func<Material> auto) =>
+            option == EngineFinish.Auto ? auto() : Tinted("paint-" + surface + "-" + option, bumped, surface, SteelLook(option));
+
+        /// <summary>The radiative extension: coated niobium, bare niobium or carbon-carbon, all with the glow ramp.
+        /// Bare niobium is the brushed steel texture tinted lavender grey (the coated niobium texture, lightened that
+        /// far, turns its coating chips into blotches).</summary>
+        static Material Extension(bool carbon, string option)
+        {
+            if (carbon) return Carbon();
+            if (option != "BareNiobium") return Niobium();
+            return Variant("niobium-bare", () =>
+            {
+                var look = new Look(C(0.54f, 0.53f, 0.57f), C(0.5f, 0.5f, 0.55f), 0.35f);
+                Material m = MakeSurface("niobium-bare", emissive, "steel", Lighten(look.Albedo, 1f / SurfaceMean("steel")), look.Shininess, look.Spec);
+                Glowing(m, GlowRamp());
+                return m;
+            });
+        }
+
+        /// <summary>The inside of the nozzle: the soot level of a propellant (Clean = hydrogen's heat-tinted metal,
+        /// Light = methane's film, Heavy = kerosene's).</summary>
+        static string InteriorPropellant(string propellant, string option)
+        {
+            switch (option)
+            {
+                case "Clean": return "Hydrolox";
+                case "Light": return "Methalox";
+                case "Heavy": return "Kerolox";
+                default: return propellant;
+            }
+        }
+
+        /// <summary>Lines (KitBuilder.MatLines) and foil-wrapped lines (MatFoil): Auto keeps bare stainless and gold
+        /// foil on the hydrogen lines; the other options give every line the same skin.</summary>
+        static Material LineMaterial(string option, bool foilSlot)
+        {
+            switch (option)
+            {
+                case "Stainless": return Lines();
+                case "Gold": return Foil();
+                case "Silver":
+                    return Variant("foil-silver", () =>
+                    {
+                        // the gold foil texture's mean is (0.746, 0.63, 0.391): per-channel gains turn it silver
+                        var tint = new Color(0.7f / 0.746f, 0.7f / 0.63f, 0.72f / 0.391f, 1);
+                        return MakeSurface("foil-silver", bumped, "foil", tint, 0.6f, C(0.8f, 0.8f, 0.82f));
+                    });
+                case "White":
+                    return Tinted("insulation-White", bumped, "lines", new Look(C(0.84f, 0.84f, 0.82f), C(0.12f, 0.12f, 0.12f), 0.12f));
+                case "Black":
+                    return Tinted("insulation-Black", bumped, "lines", new Look(C(0.06f, 0.06f, 0.062f), C(0.12f, 0.12f, 0.12f), 0.12f));
+                default: return foilSlot ? Foil() : Lines();
+            }
         }
 
         static bool warmed;

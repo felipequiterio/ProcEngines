@@ -38,6 +38,44 @@ namespace ProcEngines.Model.Tests
         static EngineDesign D(string prop = "Kerolox", string cycle = "GasGenerator", double f = 500, double pc = 80, double eps = 20, string tech = "Mid") =>
             new EngineDesign { Propellant = prop, Cycle = cycle, ThrustVac = f, Pc = pc, Eps = eps, Tech = tech };
 
+        // ------------------------------------------------------------------ finish (cosmetic)
+
+        public static void FinishDefaultsToAutoAndRoundTrips(ModelData _)
+        {
+            var f = new EngineFinish();
+            Assert(f.IsDefault && f.PresetName == "Fired" && f.Key == "" && f.Save().Values.Count == 0, "a new finish is all Auto, the Fired preset, and saves no values");
+            f.Set("nozzle", "Copper");
+            f.Set("lines", "Silver");
+            f.Set("nozzle", "Unobtainium");   // unknown option: ignored
+            f.Set("paint", "Black");          // unknown slot: ignored
+            Assert(f.Get("nozzle") == "Copper" && f.Get("lines") == "Silver" && f.Get("chamber") == EngineFinish.Auto, "set and get");
+            Assert(f.PresetName == EngineFinish.Custom, "a mixed finish is Custom");
+            CfgNode n = CfgNode.Parse("FINISH\n{\n" + string.Join("\n", f.Save().Values.Select(v => v.Key + " = " + v.Value)) + "\nfuture = Gold\n}").Nodes[0];
+            EngineFinish back = EngineFinish.Load(n);
+            Assert(back.Equals(f) && back.Key == "nozzle=Copper,lines=Silver", $"FINISH round trip (unknown keys dropped): {back.Key}");
+            f.Set("nozzle", EngineFinish.Auto);
+            Assert(f.Get("nozzle") == EngineFinish.Auto && f.Key == "lines=Silver", "Auto clears a slot");
+            Assert(EngineFinish.Load(null).IsDefault, "no node: default");
+        }
+
+        public static void FinishPresetsAreValidAndDistinct(ModelData _)
+        {
+            var keys = new HashSet<string>();
+            foreach (EngineFinish.Preset p in EngineFinish.Presets)
+            {
+                foreach (var kv in p.Values)
+                {
+                    EngineFinish.Slot s = EngineFinish.SlotById(kv.Key);
+                    Assert(s != null && s.Options.Any(o => o.Id == kv.Value), $"preset {p.Name}: {kv.Key} = {kv.Value} is a real option");
+                }
+                EngineFinish f = EngineFinish.FromPreset(p.Name);
+                Assert(f.PresetName == p.Name, $"preset {p.Name} is recognised (got {f.PresetName})");
+                Assert(keys.Add(f.Key), $"preset {p.Name} differs from the others");
+            }
+            foreach (EngineFinish.Slot s in EngineFinish.Slots)
+                Assert(s.Options[0].Id == EngineFinish.Auto && s.Options.Select(o => o.Id).Distinct().Count() == s.Options.Length, $"slot {s.Id}: Auto first, options unique");
+        }
+
         // ------------------------------------------------------------------ data
 
         public static void CfgParserHandlesNestingCommentsAndInlineBraces(ModelData _)

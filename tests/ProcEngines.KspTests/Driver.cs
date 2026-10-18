@@ -48,7 +48,7 @@ namespace ProcEngines.KspTests
         {
             while (HighLogic.LoadedScene != GameScenes.MAINMENU) yield return null;
             yield return new WaitForSecondsRealtime(4f);
-            IEnumerator body = script == "career" ? Career() : script == "lmpA" ? LmpA() : script == "lmpB" ? LmpB() : script == "visual" ? Visual() : script == "plumes" ? Plumes() : script == "gimbal" ? GimbalOnly() : Sandbox();
+            IEnumerator body = script == "career" ? Career() : script == "lmpA" ? LmpA() : script == "lmpB" ? LmpB() : script == "visual" ? Visual() : script == "plumes" ? Plumes() : script == "finish" ? Finishes() : script == "gimbal" ? GimbalOnly() : Sandbox();
             yield return StartCoroutine(Guard(body));
             Info("end", $"{passes} passed, {fails} failed");
             results.Close();
@@ -225,6 +225,15 @@ namespace ProcEngines.KspTests
             Info("mesh." + tag, $"meshes {string.Join(", ", mfs.Select(f => f.name + ":" + f.sharedMesh.vertexCount))}; colliders {cols.Length} convex {cols.All(c => c.convex)}; build {m.LastBuildMs:F1} ms; Ø{s.ExitDiameter:F2} L{s.TotalLength:F2} m");
         }
 
+        /// <summary>The material names (without the ProcEngines/ prefix) of one renderer under peRoot.</summary>
+        static string[] Mats(ModuleProcEngine m, string path) =>
+            m.part.transform.Find("model/peRoot/" + path).GetComponent<MeshRenderer>().sharedMaterials.Select(x => x == null ? "null" : x.name.Replace("ProcEngines/", "").Replace(" (Instance)", "")).ToArray();
+
+        /// <summary>Every engine renderer (ours, named pe*: Waterfall adds its plume renderers under the thrust transform) with its materials: "name=mat,mat;name=...", in hierarchy order.</summary>
+        static string MaterialNames(ModuleProcEngine m) =>
+            string.Join(";", m.part.transform.Find("model/peRoot").GetComponentsInChildren<MeshRenderer>(true).Where(r => r.name.StartsWith("pe"))
+                .Select(r => r.name + "=" + string.Join(",", r.sharedMaterials.Select(x => x == null ? "null" : x.name.Replace("ProcEngines/", "").Replace(" (Instance)", "")))));
+
         static float Gap(Part a, string na, Part b, string nb) =>
             (a.transform.TransformPoint(a.FindAttachNode(na).position) - b.transform.TransformPoint(b.FindAttachNode(nb).position)).magnitude;
 
@@ -377,6 +386,53 @@ namespace ProcEngines.KspTests
                 var copies = pair.SelectMany(pe => pe.part.transform.Find("model/peRoot").GetComponentsInChildren<MeshFilter>(true))
                     .Where(f => f.sharedMesh != null && f.sharedMesh.name.Contains("Instance")).Select(f => f.name).ToList();
                 Check("mesh.cache", shared && split && copies.Count == 0, $"{pair.Count} engines; identical designs share meshes {shared}; after changing one, separate and intact {split}; mesh copies on [{string.Join(", ", copies)}]; far {KspData.FarPresent}");
+
+                // finish: a preset on one of two identical engines swaps its materials only
+                if (pair.Count == 2)
+                {
+                    pair[1].SetDesign(same);
+                    yield return new WaitForSecondsRealtime(2f);
+                    Mesh bell0 = Mesh0(pair[0], "peGimbal/peBell"), kit0 = Mesh0(pair[0], "peKit");
+                    int builds0 = pair[0].MeshRebuilds + pair[0].SlowRebuilds;
+                    EngineStats stats0 = pair[0].Stats;
+                    string design0 = Serialization.SaveDesign(pair[0].Design).ToString(), other0 = MaterialNames(pair[1]);
+                    pair[0].SetFinish(EngineFinish.FromPreset("Copper"));
+                    yield return new WaitForSecondsRealtime(1f);
+                    string[] bm = Mats(pair[0], "peGimbal/peBell"), cm = Mats(pair[0], "peChamber"), km = Mats(pair[0], "peKit");
+                    bool copper = bm[EngineGeometry.MatRegen].EndsWith("-Copper") && bm[EngineGeometry.MatSoot] == "soot-Hydrolox" && bm[EngineGeometry.MatBellSteel] == "paint-steel-Steel"
+                                  && cm[EngineGeometry.MatRegenStatic].EndsWith("-Copper") && cm[EngineGeometry.MatSteel] == "paint-steel-Steel"
+                                  && km[KitBuilder.MatStructure] == "paint-lines-Steel" && km[KitBuilder.MatLines] == "lines" && km[KitBuilder.MatFoil] == "lines";
+                    // every level and every kit renderer (bell kit, actuators) shows the same materials as its LOD0 twin
+                    bool levels = MaterialNames(pair[0]).Split(';').Select(x => x.Split('=')[1]).Distinct().Count() == 3;
+                    bool meshesKept = Mesh0(pair[0], "peGimbal/peBell") == bell0 && Mesh0(pair[0], "peKit") == kit0 && Mesh0(pair[1], "peGimbal/peBell") == bell0
+                                      && pair[0].MeshRebuilds + pair[0].SlowRebuilds == builds0;
+                    bool statsKept = ReferenceEquals(pair[0].Stats, stats0) && Serialization.SaveDesign(pair[0].Design).ToString() == design0;
+                    bool otherKept = MaterialNames(pair[1]) == other0;
+                    Check("finish.apply", copper && levels && meshesKept && statsKept && otherKept,
+                        $"Copper preset: bell [{string.Join(", ", bm)}] chamber [{string.Join(", ", cm)}] kit [{string.Join(", ", km)}]; all renderers per part {levels}; " +
+                        $"meshes kept and still shared {meshesKept}; stats and design unchanged {statsKept}; the other engine unchanged {otherKept}");
+                    yield return Shot("finish_pair");
+                    // a custom finish survives a save and reload; Fired (the default) puts the Auto materials back
+                    EngineFinish custom = EngineFinish.FromPreset("Black");
+                    custom.Set("lines", "Silver");
+                    pair[0].SetFinish(custom);
+                    yield return null;
+                    string pairPath = Path.Combine(KSPUtil.ApplicationRootPath, "saves", HighLogic.SaveFolder, "Ships", "VAB", "PE_Pair.craft");
+                    ConfigNode saved = EditorLogic.fetch.ship.SaveShip();
+                    saved.Save(pairPath);
+                    int finishNodes = saved.GetNodes("PART").SelectMany(p => p.GetNodes("MODULE")).Count(n => n.GetValue("name") == "ModuleProcEngine" && n.HasNode("FINISH"));
+                    string savedMats = MaterialNames(pair[0]);
+                    yield return LoadCraft(pairPath);
+                    yield return new WaitForSecondsRealtime(2f);
+                    var again = EditorLogic.fetch.ship.parts.SelectMany(pp => pp.FindModulesImplementing<ModuleProcEngine>()).ToList();
+                    ModuleProcEngine reB = again.FirstOrDefault(pe => !pe.Finish.IsDefault), plain = again.FirstOrDefault(pe => pe.Finish.IsDefault);
+                    bool reloaded = reB != null && plain != null && reB.Finish.Key == custom.Key && MaterialNames(reB) == savedMats && Mats(reB, "peKit")[KitBuilder.MatLines] == "foil-silver";
+                    reB?.SetFinish(new EngineFinish());
+                    yield return null;
+                    bool reset = reB != null && plain != null && MaterialNames(reB) == MaterialNames(plain);
+                    Check("finish.persist", finishNodes == 1 && reloaded && reset,
+                        $"FINISH nodes in the saved craft {finishNodes} (only the non-default engine); reloaded {reB?.Finish.Key} with the same materials {reloaded}; back to Fired matches the plain engine {reset}");
+                }
             }
 
             yield return FlightChecks();
@@ -389,7 +445,11 @@ namespace ProcEngines.KspTests
             yield return LoadCraft(WriteCraft("PE_Flight", Stack(false)));
             ModuleProcEngine m = Engine(EditorLogic.fetch.ship.parts);
             m.SetDesign(D("Kerolox", "GasGenerator", 300, 90, 14));
+            EngineFinish flightFinish = EngineFinish.FromPreset("Inconel");
+            flightFinish.Set("interior", "Heavy");
+            m.SetFinish(flightFinish);
             yield return new WaitForSecondsRealtime(1.5f);
+            string editorMaterials = MaterialNames(m);
             string flightPath = Path.Combine(KSPUtil.ApplicationRootPath, "saves", HighLogic.SaveFolder, "Ships", "VAB", "PE_Flight.craft");
             EditorLogic.fetch.ship.SaveShip().Save(flightPath);
             EngineStats editorStats = m.Stats;
@@ -412,6 +472,8 @@ namespace ProcEngines.KspTests
             EventData<PartJoint, float>.OnEvent onBreak = (pj, f) => Info("flight.jointBreak", string.Format(Inv, "+{0:F2} s: {1} -> {2} broke at {3:F1}", Time.realtimeSinceStartup - flightT0, pj?.Child?.partInfo?.name, pj?.Parent?.partInfo?.name, f));
             GameEvents.onPartJointBreak.Add(onBreak);
             Check("flight.stats", m.Stats.IspVac == editorStats.IspVac && m.Stats.Mass == editorStats.Mass, $"flight STATS identical to editor: Isp {m.Stats.IspVac}/{editorStats.IspVac}");
+            Check("finish.flight", m.Finish.Key == flightFinish.Key && MaterialNames(m) == editorMaterials,
+                $"finish {m.Finish.Key}; flight materials identical to the editor's {MaterialNames(m) == editorMaterials}: bell [{string.Join(", ", Mats(m, "peGimbal/peBell"))}]");
             yield return CheckApplied(m, "flight", false);
             Info("waterfall", m.WaterfallStatus);
             var e = m.part.FindModuleImplementing<ModuleEnginesFX>();
@@ -839,6 +901,50 @@ namespace ProcEngines.KspTests
             }
         }
 
+        /// <summary>Every finish preset on two engines in flight (a kerolox GG, and a hydrolox expander with a
+        /// radiative extension and foil-wrapped lines), lit by a low sun from beside the camera.</summary>
+        IEnumerator Finishes()
+        {
+            yield return NewGame("procengines_finish", Game.Modes.SANDBOX);
+            string probe = FirstAvailable("probeCoreOcto", "probeCoreOcto.v2");
+            foreach (var (tag, d) in new[] { ("KeroloxGG", D("Kerolox", "GasGenerator", 900, 97, 16)), ("HydroloxExpRad", D("Hydrolox", "Expander", 110, 44, 250, true)) })
+            {
+                yield return EnterEditor();
+                string path = WriteCraft("PE_Finish_" + tag, BigTankCraft(probe));
+                yield return LoadCraft(path);
+                ModuleProcEngine m = Engine(EditorLogic.fetch.ship.parts);
+                m.SetDesign(d);
+                yield return new WaitForSecondsRealtime(1.5f);
+                EditorLogic.fetch.ship.SaveShip().Save(path);
+                yield return LaunchFrozen(path);
+                m = Engine(FlightGlobals.ActiveVessel.parts);
+                float size = (float)Math.Max(m.Stats.TotalLength, m.Stats.ExitDiameter);
+                GameEvents.onHideUI.Fire();
+                Camera(size * 2.0f, -6, 35, m.part);   // target the part first, as Visual() does, then the mid-engine point
+                yield return new WaitForSecondsRealtime(1.5f);
+                var mid = new GameObject("peCamTarget").transform;
+                mid.SetParent(m.part.transform, false);
+                AttachNode bottomNode = m.part.FindAttachNode("bottom");
+                mid.localPosition = bottomNode != null ? bottomNode.position * 0.5f : Vector3.zero;
+                Vessel v = FlightGlobals.ActiveVessel;
+                Vector3 up = (v.transform.position - v.mainBody.position).normalized;
+                Vector3 toSun = Vector3.ProjectOnPlane((Planetarium.fetch.Sun.position - v.GetWorldPos3D()).normalized, up);
+                yield return CameraToward(mid, Quaternion.AngleAxis(35, up) * toSun, size * 1.3f, 8);
+                var seen = new HashSet<string>();
+                bool all = true;
+                foreach (EngineFinish.Preset p in EngineFinish.Presets)
+                {
+                    m.SetFinish(EngineFinish.FromPreset(p.Name));
+                    yield return new WaitForSecondsRealtime(0.8f);
+                    all &= m.Finish.PresetName == p.Name && seen.Add(MaterialNames(m));
+                    yield return Shot($"{p.Name}_{tag}");   // the script name prefixes it: finish_<preset>_<engine>
+                }
+                GameEvents.onShowUI.Fire();
+                Destroy(mid.gameObject);
+                Check("visual.finish." + tag, all, $"{EngineFinish.Presets.Length} presets, {seen.Count} distinct material sets");
+            }
+        }
+
         /// <summary>Calibration rig: each Waterfall template at scale 1 on a nozzle with a 1.000 m exit, side view.</summary>
         IEnumerator Plumes()
         {
@@ -930,7 +1036,7 @@ namespace ProcEngines.KspTests
             return string.Format(Inv, "{0}/{1} F={2:R} Isp0={3:R} Isp1={4:R} flow={5:R} De={6:R} node={7:R} bell={8} {9} kit={10} {11} mass={12:R} props={13}",
                 m.Design.Propellant, m.Design.Cycle, e.maxThrust, e.atmosphereCurve.Evaluate(0f), e.atmosphereCurve.Evaluate(1f), e.maxFuelFlow, m.Stats.ExitDiameter,
                 m.part.FindAttachNode("bottom").position.y, bell.vertexCount, bell.bounds.size.ToString("R"), kit.vertexCount, kit.bounds.size.ToString("R"), m.part.mass,
-                string.Join("+", e.propellants.Select(p => p.name + ":" + p.ratio.ToString("R", Inv))));
+                string.Join("+", e.propellants.Select(p => p.name + ":" + p.ratio.ToString("R", Inv)))) + " finish=" + m.Finish + " materials=" + MaterialNames(m);
         }
 
         IEnumerator LmpA()
@@ -944,6 +1050,9 @@ namespace ProcEngines.KspTests
             ModuleProcEngine m = Engine(EditorLogic.fetch.ship.parts);
             m.SetDesign(D("Kerolox", "PressureFed", 77.7, 21.3, 28.5));   // allowed by the start node in career
             m.designName = "LMP test";
+            EngineFinish lmpFinish = EngineFinish.FromPreset("Inconel");
+            lmpFinish.Set("lines", "Black");
+            m.SetFinish(lmpFinish);
             yield return new WaitForSecondsRealtime(1.5f);
             Info("lmpA.caps", $"violations [{string.Join("; ", m.Violations)}]");
             EditorLogic.fetch.ship.SaveShip().Save(path);
@@ -985,8 +1094,9 @@ namespace ProcEngines.KspTests
             ConfigNode aMod = ConfigNode.Parse(string.Join("\n", a.Skip(2)));
             ConfigNode aNode = aMod?.nodes.Count > 0 ? aMod.nodes[0] : aMod;
             bool same = modNode != null && aNode != null && modNode.GetNode("DESIGN")?.ToString() == aNode.GetNode("DESIGN")?.ToString()
-                        && modNode.GetNode("STATS")?.ToString() == aNode.GetNode("STATS")?.ToString();
-            Check("lmp.proto", same, "B's ProtoVessel DESIGN/STATS identical to A's");
+                        && modNode.GetNode("STATS")?.ToString() == aNode.GetNode("STATS")?.ToString()
+                        && modNode.GetNode("FINISH") != null && modNode.GetNode("FINISH").ToString() == aNode.GetNode("FINISH")?.ToString();
+            Check("lmp.proto", same, "B's ProtoVessel DESIGN/STATS/FINISH identical to A's");
             GamePersistence.SaveGame("persistent", HighLogic.SaveFolder, SaveMode.OVERWRITE);
             int idx = HighLogic.CurrentGame.flightState.protoVessels.FindIndex(p => p.vesselID == id);
             FlightDriver.StartAndFocusVessel("persistent", idx);

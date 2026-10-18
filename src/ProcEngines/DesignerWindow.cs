@@ -30,7 +30,8 @@ namespace ProcEngines
         EngineStats plotStats;
         string nameEdit = "", lastSaved = "";
         readonly Dictionary<string, string> editBuffers = new Dictionary<string, string>();
-        GUIStyle section, small, valueStyle, warn, bad, okStyle, closeButton;
+        GUIStyle section, small, valueStyle, warn, bad, okStyle, closeButton, centered;
+        static bool finishOpen = true;   // the Appearance section, remembered across opens
 
         public static bool IsOpen => instance != null && instance.target != null;
         public static ModuleProcEngine Target => instance?.target;
@@ -110,6 +111,8 @@ namespace ProcEngines
             bad = new GUIStyle(small) { fontSize = 12 }; bad.normal.textColor = new Color(1f, 0.42f, 0.42f);
             okStyle = new GUIStyle(small) { fontSize = 12 }; okStyle.normal.textColor = new Color(0.45f, 1f, 0.5f);
             closeButton = new GUIStyle(HighLogic.Skin.button) { fontSize = 14, fontStyle = FontStyle.Bold, padding = new RectOffset(0, 0, 0, 2) };
+            centered = new GUIStyle(HighLogic.Skin.label) { alignment = TextAnchor.MiddleCenter };
+            centered.normal.textColor = Color.white;
         }
 
         void Draw(int id)
@@ -196,6 +199,11 @@ namespace ProcEngines
 
             if (changed) m.SetDesign(next);
 
+            // ---- appearance: materials only
+            GUILayout.Space(4);
+            finishOpen = GUILayout.Toggle(finishOpen, new GUIContent((finishOpen ? "▾ " : "▸ ") + "Appearance (visual only)", "Materials and paint. No effect on performance, mass or cost."), section);
+            if (finishOpen) DrawFinish(m);
+
             // ---- performance
             if (s != null)
             {
@@ -228,6 +236,43 @@ namespace ProcEngines
             GUILayout.EndHorizontal();
             if (!string.IsNullOrEmpty(lastSaved)) GUILayout.Label(lastSaved, small);
             GUI.DragWindow(new Rect(0, 0, rect.width - 30, 24));
+        }
+
+        /// <summary>Preset buttons (the one the finish matches is down; none for a custom finish), then one row per
+        /// part group that steps through its options. Changes go through ModuleProcEngine.SetFinish (symmetry, undo).</summary>
+        void DrawFinish(ModuleProcEngine m)
+        {
+            EngineFinish f = m.Finish;
+            string current = f.PresetName;
+            GUILayout.BeginHorizontal();
+            GUILayout.Label(new GUIContent("Preset", "Sets every part at once; change single parts below"), small, GUILayout.Width(44));
+            foreach (EngineFinish.Preset p in EngineFinish.Presets)
+                if (GUILayout.Toggle(current == p.Name, new GUIContent(p.Name, p.Tip), HighLogic.Skin.button) && current != p.Name)
+                    m.SetFinish(EngineFinish.FromPreset(p.Name));
+            GUILayout.EndHorizontal();
+            if (current == EngineFinish.Custom) GUILayout.Label("Custom finish (matches no preset)", small);
+            bool extension = m.Geometry != null && m.Geometry.HasExtension;
+            foreach (EngineFinish.Slot s in EngineFinish.Slots)
+            {
+                int n = s.Options.Length, i = Math.Max(0, Array.FindIndex(s.Options, o => o.Id == f.Get(s.Id)));
+                bool usable = s.Id != "extension" || extension;
+                GUI.enabled = usable;
+                GUILayout.BeginHorizontal();
+                GUILayout.Label(new GUIContent(s.Label, usable ? s.Tip : "This engine has no radiative extension"), GUILayout.Width(96));
+                int step = 0;
+                if (GUILayout.Button(new GUIContent("<", "Previous"), GUILayout.Width(26))) step = -1;
+                EngineFinish.Option o = s.Options[i];
+                GUILayout.Label(new GUIContent(o.Label, o.Tip), centered, GUILayout.Width(150));
+                if (GUILayout.Button(new GUIContent(">", "Next"), GUILayout.Width(26))) step = 1;
+                GUILayout.EndHorizontal();
+                GUI.enabled = true;
+                if (step != 0)
+                {
+                    EngineFinish next = f.Copy();
+                    next.Set(s.Id, s.Options[(i + step + n) % n].Id);
+                    m.SetFinish(next);
+                }
+            }
         }
 
         // ------------------------------------------------------------------ widgets

@@ -1,0 +1,6 @@
+14:01:47 INFO  [start] script=finish far=False
+14:02:44 INFO  [visual.sun] sun elevation 24.4 deg at UT 3005 (+3000 s)
+14:02:55 PASS  [visual.finish.KeroloxGG] 6 presets, 6 distinct material sets
+14:03:13 INFO  [visual.sun] sun elevation 24.4 deg at UT 3006 (+3000 s)
+14:03:24 PASS  [visual.finish.HydroloxExpRad] 6 presets, 6 distinct material sets
+14:03:24 INFO  [end] 2 passed, 0 failed

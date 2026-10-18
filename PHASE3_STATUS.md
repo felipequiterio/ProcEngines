@@ -269,6 +269,63 @@ The gimbal actuators now follow the bell. Before, they were part of the static k
   - **The engine part has KSP's default joint strength** (`breakingForce` / `breakingTorque` 22, like the LV-T45), and a small engine gets a size-0 top node. That is left as is; consider it if large designs shake loose in play.
 - **The design's gimbal range now reaches ModuleGimbal (fixed).** KSP 1.12 deflects by `gimbalRangeXP/XN/YP/YN`, which it copies from `gimbalRange` only in `OnLoad`, so setting `gimbalRange` had no effect. `ApplyEngine` now sets all five fields. This also overrides range patches meant for stock engines, such as FAR's ×1.5: the design's range is the one its mass pays for.
 
+## Engine finishes (cosmetic materials)
+
+The player can choose the material of eight part groups per engine, or apply one of six presets. It is visual only: performance, mass, cost, tech checks and the shared render meshes don't change.
+
+**Part groups and options** (`EngineFinish.Slots`, in `src/ProcEngines.Model/Finish.cs`; every group defaults to **Auto**, the propellant- and cycle-driven look of a test-fired engine):
+
+| Group | What it covers | Options |
+|---|---|---|
+| Chamber | the chamber's cooled wall | Fired (Auto), Copper, Bronze, Stainless, Inconel, Nickel, Black |
+| Nozzle | the cooled nozzle wall (tubes or jacket) | same as Chamber |
+| Extension | the radiative extension | Auto (by tech), Niobium, Bare niobium, Carbon-carbon |
+| Inside | inside the nozzle | Auto (by propellant), Clean, Light soot, Heavy soot |
+| Bell bands | hat bands, coolant manifold, joint flange | Auto, Steel, Dark steel, Bronzed, Grey primer, Black, White |
+| Mount | thrust mount, injector dome, chamber flanges | same as Bell bands |
+| Frame | struts, thrust frame, line flanges, collars | same as Bell bands |
+| Lines | propellant lines | Auto (stainless; gold foil on hydrogen lines), Stainless, Gold foil, Silver foil, White, Black |
+
+**Presets** (`EngineFinish.Presets`):
+- **Fired:** all Auto. This is the default.
+- **Copper:** a fresh engine: bare copper walls, a clean nozzle, bare niobium and bare steel.
+- **Stainless:** stainless walls and bare steel.
+- **Inconel:** heat-tinted walls, bronzed bands and gold-foil lines.
+- **Black:** black coating and paint, black insulation and carbon-carbon.
+- **White:** a flight look: stainless walls, white paint and insulation, and grey primer.
+
+A finish that matches no preset shows as "Custom".
+
+**How it works:**
+- **Storage:** a `FINISH` node in the module, next to `DESIGN` and `STATS`, holding only the groups that aren't Auto. A default engine writes none. It travels with craft files, subassemblies (the library), editor copies and symmetry, undo, and LMP vessel protos.
+- **Applying:** `ModuleProcEngine.SetFinish` swaps the materials on every renderer of both LODs, including the bell kit and the actuators, and pushes the finish to symmetry counterparts. It never rebuilds a mesh, so two engines with the same design and different finishes still share their meshes.
+- **Glow:** a carbon-carbon extension glows hotter whether it was picked in the finish or comes from the Late tech level.
+- **Materials:** `EngineMaterials` builds each option by re-tinting a texture the engine already uses, so finishes cost no texture memory (ASSETS.md 5). Variants are created on first use and shared by every engine that uses them.
+- **Untouched:** the authored machinery (pumps, valves, preburner, actuators), the hot gas duct and the bolts keep their baked look. Repainting the authored pieces needs a paint mask in the atlas; that is the follow-up.
+- **Designer:** an **Appearance (visual only)** section, after the nozzle, holds the six preset buttons and one row per part group with `<` and `>` buttons. Each option has a tooltip, and the extension row is greyed out on engines without an extension.
+
+**Checks (in game):**
+- **`finish.apply`** (sandbox): the Copper preset on one of two identical engines. It changes the expected material in every slot and on every renderer of that part. The meshes stay the same objects and still shared, nothing is rebuilt, the stats and design are unchanged, and the other engine is untouched.
+- **`finish.persist`:** a custom finish (Black with silver-foil lines) is saved: one FINISH node, only on that engine. It reloads with identical materials, and going back to Fired gives exactly the plain engine's materials.
+- **`finish.flight`:** a finish set in the editor reaches flight. KSP clones part materials in flight (" (Instance)"), and Waterfall adds renderers under the thrust transform, so the check compares names without the suffix and only our `pe*` renderers.
+- **`visual.finish.<engine>`** (new `finish` script): all six presets on a kerolox GG and a hydrolox expander with an extension, in flight under a low sun. Each preset gives a distinct material set. Screenshots: `finish_<preset>_<engine>.png`.
+- **LMP:** client A launches an engine with a custom finish. B's proto has the identical FINISH node, and B's loaded engine has identical materials (part of `lmp.loaded`).
+- **Model unit tests:** finish round trip, unknown keys dropped, and presets valid, distinct and recognised (`FinishDefaultsToAutoAndRoundTrips`, `FinishPresetsAreValidAndDistinct`).
+- **Results:**
+
+  | Run | Result |
+  |---|---|
+  | model tests | 27/27 |
+  | sandbox A (FAR) | 35/35 |
+  | finish B | 2/2 |
+  | visual B | 19/19 |
+  | career B | 6/6 |
+  | LMP | `lmp.proto` and `lmp.loaded` pass; both clients show the same finish and materials |
+
+  Evidence is in [tests/ksp/evidence/finish/](tests/ksp/evidence/finish/): the preset contact sheet (rows 1–2 are the kerolox GG and rows 3–4 the hydrolox expander, each in the order Fired, Copper, Stainless, Inconel, Black, White), three full shots, the designer's Appearance section, and the results files.
+
+**Tuning notes:** the first tints were judged from in-game shots and adjusted. Stainless and white washed out in sunlight; Inconel read as cream paint; bare niobium on the niobium texture showed the coating chips as blotches, so it now uses the steel texture.
+
 ## Evidence
 
 [tests/ksp/evidence/phase3/](tests/ksp/evidence/phase3/): results files, and screenshots:
@@ -292,3 +349,4 @@ New driver scripts in `tests/ProcEngines.KspTests/Driver.cs`:
    - The GG exhaust plume is small; its reference sizes were judged visually.
    - On large engines, the kit pieces sit just below the tank and can be hard to see from above.
 5. **Not installed in ksp_mp yet**, and nothing changed there.
+6. **Paintable machinery:** finishes don't reach the authored pieces (pumps, valves, preburner, actuators) or the hot duct. That needs a paint mask baked into the kit atlas (build_kit.py) and a mask-aware tint.

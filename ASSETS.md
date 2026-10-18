@@ -159,6 +159,8 @@ Directory: `GameData/ProcEngines/PluginData/Surfaces/`. Each surface has `<name>
 
 The emissive glow ramp stays generated in code.
 
+**Finishes** (`EngineFinish`, the player's per-engine material choice) add no textures: each option re-tints a surface above (wall options on `regen` / `regen_k` / `jacket`, steel options on `steel` or, for the kit frame, `lines`, bare niobium on `steel`, silver foil on `foil`, insulation on `lines`). An option names the sRGB albedo it should average to, and `EngineMaterials` divides it by the texture's mean albedo (measured on the shipped files: tube walls 0.515, jacket 0.432, steel and lines 0.50). **If a surface is regenerated with a different overall brightness, update `EngineMaterials.SurfaceMean`.**
+
 ## 6. Levels of detail (GEO)
 
 Each engine has two sets of renderers under one `LODGroup` on `peRoot`:
