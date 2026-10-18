@@ -206,15 +206,17 @@ namespace ProcEngines
         /// of 4), CPU copy dropped. Albedo (normalMap false) is sRGB with gloss in alpha; when the file has no
         /// alpha at all, every texel gets `defaultGloss` (if >= 0). A normal map (RGB = n * 0.5 + 0.5, OpenGL) is
         /// linear and swizzled to the DXT5nm layout (1, y, 1, x): x in alpha, y in green, which KSP's
-        /// UnpackNormalDXT5nm reads and which Unity's UnpackNormal (x = r * a) also reads correctly. Returns null for
-        /// a missing or unreadable file; never throws.
+        /// UnpackNormalDXT5nm reads and which Unity's UnpackNormal (x = r * a) also reads correctly. `mipBias` (sampler
+        /// LOD bias, 0 = none) lets a texture with a fine regular pattern pick a blurrier mip earlier, against moire.
+        /// Returns null for a missing or unreadable file; never throws.
         /// </summary>
-        public static Texture2D LoadTexture(string path, bool normalMap, TextureWrapMode wrapU, TextureWrapMode wrapV, float defaultGloss = -1)
+        public static Texture2D LoadTexture(string path, bool normalMap, TextureWrapMode wrapU, TextureWrapMode wrapV, float defaultGloss = -1, float mipBias = 0)
         {
             Texture2D png = null;
             try
             {
                 if (!File.Exists(path)) return null;
+                var sw = System.Diagnostics.Stopwatch.StartNew();
                 png = new Texture2D(2, 2, TextureFormat.RGBA32, false, normalMap);
                 if (!png.LoadImage(File.ReadAllBytes(path), false))
                 {
@@ -242,13 +244,14 @@ namespace ProcEngines
                 var t = new Texture2D(w, h, TextureFormat.RGBA32, true, normalMap)
                 {
                     name = "ProcEngines/" + Path.GetFileNameWithoutExtension(path),
-                    wrapModeU = wrapU, wrapModeV = wrapV, filterMode = FilterMode.Trilinear, anisoLevel = 4,
+                    wrapModeU = wrapU, wrapModeV = wrapV, filterMode = FilterMode.Trilinear, anisoLevel = 4, mipMapBias = mipBias,
                 };
                 t.SetPixels32(px);
                 t.Apply(true, false);                           // mipmaps from the full-size image
                 if ((w & 3) == 0 && (h & 3) == 0) t.Compress(true);   // RGBA32 -> DXT5 (1 byte per texel)
                 t.Apply(false, true);                           // drop the CPU copy
-                Debug.Log($"[ProcEngines] texture {Path.GetFileName(path)}: {w}x{h} {t.format}{(normalMap ? " linear normal" : "")}");
+                t.mipMapBias = mipBias;                         // (sampler state; set again in case compression reset it)
+                Debug.Log($"[ProcEngines] texture {Path.GetFileName(path)}: {w}x{h} {t.format}{(normalMap ? " linear normal" : "")}{(mipBias != 0 ? $" mip bias {mipBias:F2}" : "")}, loaded in {sw.Elapsed.TotalMilliseconds:F0} ms");
                 return t;
             }
             catch (Exception e)

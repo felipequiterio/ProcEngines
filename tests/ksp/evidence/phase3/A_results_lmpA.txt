@@ -1,0 +1,6 @@
+02:22:51 INFO  [start] script=lmpA far=True
+02:23:37 INFO  [lmp] scene SPACECENTER, mode CAREER, vessels 3
+02:23:45 INFO  [lmpA.caps] violations [bell nozzles not researched (conical only)]
+02:23:55 INFO  [lmpA] Kerolox/PressureFed F=77.7 Isp0=321.453918 Isp1=193.166656 flow=0.024647994 De=0.84123610135939064 node=-1.58738387 bell=36636 (0.891756, 1.02348423, 0.8918114) kit=53397 (0.727730334, 0.670251548, 0.396289) mass=0.390123785 props=LiquidFuel:0.9+Oxidizer:1.1
+02:24:38 PASS  [lmpA.done] B finished
+02:24:38 INFO  [end] 1 passed, 0 failed

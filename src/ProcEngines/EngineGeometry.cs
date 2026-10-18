@@ -27,8 +27,9 @@ namespace ProcEngines
     /// which therefore never moves). Deterministic: every LMP client builds the same mesh from the same node.
     ///
     /// Top to bottom: mount plate (bolted rim), gimbal block in an open thrust-frame bay, injector dome, injector
-    /// flange, chamber with stiffener bands, regen convergent, then the gimballed bell: regen tubes with hat bands,
-    /// the coolant manifold, and either a bolted joint flange plus a radiative extension or a plain exit.
+    /// flange, chamber (the cooled wall, tubes or channel jacket, from the flange down) with steel stiffener bands,
+    /// regen convergent, then the gimballed bell: regen wall with hat-section bands, the coolant manifold, and either
+    /// a bolted joint flange plus a radiative extension or a plain exit.
     ///
     /// Every profile is a polyline of control points with a fillet radius per corner (ProfileBuilder): outer edges
     /// are rounded and joints carry weld fillets, so edges catch highlights instead of reading as CAD creases. The
@@ -61,11 +62,53 @@ namespace ProcEngines
 
         public float DomeTopRadius;
 
+        /// <summary>Cooling tube width at the end of the regen section, and the most tubes a wall gets.</summary>
+        public const float TubeWidth = 0.020f;
+        public const int TubesMax = 512;
+
         /// <summary>Ring segments around the axis: ~2 cm facets at LOD0 (64..192), about a third of that at LOD1.</summary>
         public static int RingSegments(float maxRadius, int lod)
         {
             int s0 = Mathf.Clamp(Mathf.CeilToInt(2 * Mathf.PI * Mathf.Max(maxRadius, 1e-3f) / 0.02f), 64, 192);
             return lod <= 0 ? s0 : Mathf.Clamp(Mathf.RoundToInt(s0 / 3f), 24, 64);
+        }
+
+        /// <summary>Wall construction (ASSETS.md 5, round 2): a milled-channel / brazed-jacket chamber instead of brazed
+        /// tubes, as on the RD-180, NK-33, Raptor and late Merlin: staged combustion, full flow, and gas generators at
+        /// the Late tech level. Only the material changes (the `jacket` surface shares the tube UV contract).</summary>
+        public static bool ChannelWall(EngineDesign d) =>
+            d != null && (d.Cycle == "StagedCombustion" || d.Cycle == "FullFlowStaged" || (d.Cycle == "GasGenerator" && d.Tech == "Late"));
+
+        /// <summary>Channel wall on the nozzle as well. Hydrogen engines keep a tube-wall nozzle under a channel-wall
+        /// chamber (RS-25, J-2X, Vulcain 2), so a hydrolox engine only gets the jacket on the static (chamber) mesh.</summary>
+        public static bool ChannelNozzle(EngineDesign d) => ChannelWall(d) && d.Propellant != "Hydrolox";
+
+        /// <summary>Bumped when the meshes built from the same DESIGN + STATS change (code or asset contract).</summary>
+        public const string MeshVersion = "geo-r2";
+
+        /// <summary>
+        /// Identity of the render meshes: every input of Build, KitBuilder and the lathes. The serialized DESIGN (it
+        /// carries the tech level and propellant) plus the serialized STATS (in flight they are the stored node, which
+        /// may differ from what DESIGN would compute today), the mesh version, and a caller scope (for example the
+        /// scene class, so meshes that may lose their CPU copy in flight never serve the editor). Model data and the
+        /// kit assets are fixed for the session. The level of detail is prefixed by the caller.
+        /// </summary>
+        public static string MeshKey(EngineDesign d, EngineStats s, string scope)
+        {
+            var sb = new System.Text.StringBuilder(2048);
+            sb.Append(MeshVersion).Append('|').Append(scope).Append('|');
+            AppendNode(sb, Serialization.SaveDesign(d));
+            sb.Append('|');
+            AppendNode(sb, Serialization.SaveStats(s));
+            return sb.ToString();
+        }
+
+        static void AppendNode(System.Text.StringBuilder sb, CfgNode n)
+        {
+            sb.Append(n.Name).Append('{');
+            foreach (KeyValuePair<string, string> kv in n.Values) sb.Append(kv.Key).Append('=').Append(kv.Value).Append(';');
+            foreach (CfgNode c in n.Nodes) AppendNode(sb, c);
+            sb.Append('}');
         }
 
         /// <summary>Point on the injector dome at radius r (clamped onto the dome), with its outward (r, y) normal.</summary>
@@ -121,10 +164,18 @@ namespace ProcEngines
             float gimbalH = 0.24f * rc + 0.01f;
             g.MountRadius = mountR; g.MountHeight = mountH; g.DomeHeight = domeH; g.ChamberRadius = rc; g.ThroatRadius = rt; g.GimbalRadius = rg;
 
-            // whole number of cooling tubes, a whole number of texture tiles (EngineMaterials.TubesPerTile each),
-            // constant along the length (they taper with the wall), DESIGN.md 8.4
-            int tubeTileCount = Mathf.Clamp(Mathf.RoundToInt(2 * Mathf.PI * rc / 0.035f * 2 / EngineMaterials.TubesPerTile), 2, 15);
-            g.TubeCount = tubeTileCount * EngineMaterials.TubesPerTile;
+            // Cooling tubes: a whole number of texture tiles (EngineMaterials.TubesPerTile tubes each), constant along
+            // the length, so they taper with the wall (DESIGN.md 8.4). Sized where they are widest, at the end of the
+            // regen section: ~20 mm there, as on real tube walls (H-1 ~290, RL10 ~180, F-1 178/356 tubes), 64..TubesMax
+            // tubes, and no narrower than 3.5 mm at the throat as long as one whole tile (32 tubes) still fits there,
+            // which can drop small engines to 32. Below a throat radius of about 17.8 mm (32 x 3.5 mm / 2 pi, roughly
+            // under 10 kN) the one-tile floor wins and the throat tubes get narrower (about 2 mm at a 10 mm throat).
+            double regenEps = d.RadiativeExtension ? Math.Min(d.Eps, tech?.RegenEpsMax ?? 30) : d.Eps;
+            int tpt = EngineMaterials.TubesPerTile;
+            float rEnd = rt * Mathf.Sqrt((float)regenEps);
+            int tubeTileCount = Mathf.Clamp(Mathf.RoundToInt(2 * Mathf.PI * rEnd / TubeWidth / tpt), Mathf.Max(1, 64 / tpt), Mathf.Max(1, TubesMax / tpt));
+            tubeTileCount = Mathf.Max(Mathf.Max(1, 32 / tpt), Mathf.Min(tubeTileCount, Mathf.FloorToInt(2 * Mathf.PI * rt / 0.0035f / tpt)));
+            g.TubeCount = tubeTileCount * tpt;
             float tubeTiles = tubeTileCount;
 
             Style steel = Style.Steel(MatSteel), bolts = Style.Bolts(MatBolts);
@@ -190,27 +241,30 @@ namespace ProcEngines
             pb.Line(new Vector2(rc + ft, yInj - fh * 0.5f), bolts, edgeI);
             pb.Line(new Vector2(rc, yInj - fh * 0.5f), steel, weldI);
 
-            // chamber: steel jacket over the regen liner, with stiffener bands on long chambers
+            // chamber: the cooled wall (tubes, or the channel jacket) runs up to the injector flange, as on the H-1,
+            // F-1, J-2 and RL10 tube walls; steel stiffener bands on long chambers. Heat coordinate 1 at the flange
+            // down to 0.5 where the convergent starts (set by height below, so it runs on across the bands).
             float yConvStart = yInj - lc;
             g.YChamberBottom = yConvStart;
+            var chamberWall = new Style { Mat = MatRegenStatic, Kind = Uv.Fixed, U = tubeTiles, V = -2f * lc, VOffset = 1f, Priority = 2, Made = new List<ProfileSegment>() };
             if (lc > 1.1f * rc)
                 for (int k = 1; k <= 2; k++)
                 {
                     float yb = yInj - lc * k / 3f, bh = 0.06f * rc + 0.005f, bt = 0.025f * rc + 0.002f;
-                    pb.Line(new Vector2(rc, yb + bh * 0.5f), steel, 0.6f * bt);
+                    pb.Line(new Vector2(rc, yb + bh * 0.5f), chamberWall, 0.6f * bt);
                     pb.Line(new Vector2(rc + bt, yb + bh * 0.5f), steel, 0.35f * bt);
                     pb.Line(new Vector2(rc + bt, yb - bh * 0.5f), steel, 0.35f * bt);
                     pb.Line(new Vector2(rc, yb - bh * 0.5f), steel, 0.6f * bt);
                 }
 
             // convergent: a rounded shoulder, 30-degree cone, then a 1.5 Rt arc into the throat (regen tubes; heat
-            // coordinate 0.5 -> 0 along its own arc length)
+            // coordinate 0.5 -> 0 along its own arc length). The shoulder fillet belongs to the chamber wall.
             float rArc = 2.5f * rt - 1.5f * rt * Mathf.Sin(60 * Mathf.Deg2Rad);
             float coneLen = Mathf.Max(rc - rArc, 0) / Mathf.Tan(30 * Mathf.Deg2Rad);
             float yThroat = yConvStart - coneLen - 0.75f * rt;
             g.YThroat = yThroat;
             var conv = new Style { Mat = MatRegenStatic, Kind = Uv.ArcScaled, U = tubeTiles, V = -2, VOffset = 0.5f, Priority = 2 };
-            pb.Line(new Vector2(rc, yConvStart), steel, 0.8f * rc);
+            pb.Line(new Vector2(rc, yConvStart), chamberWall, 0.8f * rc);
             pb.Line(new Vector2(rArc, yThroat + 0.75f * rt), conv, -1);
             for (int i = 1; i <= det.Conv; i++)
             {
@@ -218,10 +272,10 @@ namespace ProcEngines
                 pb.Line(new Vector2(2.5f * rt + 1.5f * rt * Mathf.Sin(th), yThroat - 1.5f * rt * Mathf.Cos(th)), conv, -1);
             }
             pb.Emit(g.Static);
+            HeatByHeight(chamberWall.Made, yInj - fh * 0.5f, 1f, 0.5f);
 
             // ---------------------------------------------------------------- bell (gimballed)
             var contour = new NozzleContour(d.Eps, d.LengthFraction, d.Conical);
-            double regenEps = d.RadiativeExtension ? Math.Min(d.Eps, tech?.RegenEpsMax ?? 30) : d.Eps;
             var raw = new List<Vector2>(contour.Wall.Count);
             bool ext = false;
             foreach (WallPoint w in contour.Wall)
@@ -229,7 +283,6 @@ namespace ProcEngines
                 raw.Add(new Vector2((float)w.R * rt, yThroat - (float)w.X * rt));
                 if (w.R * w.R > regenEps + 1e-6) ext = true;
             }
-            g.HasExtension = ext;
             Vector2 exit = raw[raw.Count - 1];
             g.YExit = exit.y;
 
@@ -241,6 +294,12 @@ namespace ProcEngines
             Densify(raw, 8, dense, denseTan, cost);
             float total = cost[cost.Count - 1];
             float cSplit = ext ? CostAtRadius(dense, cost, Mathf.Sqrt((float)regenEps) * rt) : total;
+            // The extension is decided once, from the split itself: for Eps a hair above regenEps the wall test above
+            // says "extension" while the split lands on the exit (SplitSample then puts every point in the regen part
+            // and the extension lists would be empty). HasExtension, the branch below, the joint flange, the
+            // manifold and the glow all follow this one flag.
+            if (ext && cSplit >= total - 1e-6f) { ext = false; cSplit = total; }
+            g.HasExtension = ext;
             int n0 = d.Conical ? 56 : DetailFor(0).BellPoints;
             var regen0 = new List<Vector2>(n0);
             var rad0 = new List<Vector2>(n0);
@@ -308,14 +367,14 @@ namespace ProcEngines
             for (int i = innerRegen.Count - 2; i >= 0; i--) bb.Line(innerRegen[i], soot, -1);
             bb.Line(new Vector2(0, yThroat), throatCap);
 
-            // hat bands: stiffening rings on long regen bells
+            // hat bands: a few wide, brazed hat-section stiffeners on long regen bells, only a little proud of the tubes
             float regenLen = yThroat - g.RegenEndY;
-            int bands = regenLen > 5 * rt ? Mathf.Clamp(Mathf.RoundToInt(regenLen / (4.5f * rt)), 1, 4) : 0;
-            float bandW = 0.12f * rt + 0.005f, bandT = 0.03f * rt + 0.002f;
+            int bands = regenLen > 5 * rt ? Mathf.Clamp(Mathf.RoundToInt(regenLen / (7f * rt)), 1, 3) : 0;
+            float bandW = 0.22f * rt + 0.008f, bandT = 0.05f * rt + 0.0035f;
             for (int k = 0; k < bands; k++)
             {
                 float yb = yThroat - regenLen * (0.35f + 0.5f * (k + 0.5f) / bands);
-                Ring(bb, g, yb + bandW * 0.5f, yb - bandW * 0.5f, bandT, bellSteel, bellSteel);
+                HatBand(bb, g, yb + bandW * 0.5f, yb - bandW * 0.5f, bandT, bellSteel);
             }
 
             // coolant manifold: at the joint above the extension flange, or just above the exit of an all-regen bell
@@ -364,6 +423,26 @@ namespace ProcEngines
             pb.Line(new Vector2(rB + t, yBottom), side, edge);
             pb.Line(new Vector2(rB, yBottom), face, weld);
             pb.Line(new Vector2(g.BellRadiusAt(yBottom - leg) - inset, yBottom - leg), face);
+        }
+
+        /// <summary>A hat-section stiffener on the bell wall, crown from yTop to yBottom standing t proud. Its brims
+        /// (0.35 t thick) reach 0.2 of the crown width beyond it on each side, so the foot is 1.4x the crown: a weld
+        /// fillet where each brim meets the tubes, a shallow brim, a fillet into the web, a rounded crown.</summary>
+        static void HatBand(ProfileBuilder pb, EngineGeometry g, float yTop, float yBottom, float t, Style s)
+        {
+            float h = Mathf.Max(yTop - yBottom, 1e-4f);
+            float foot = 0.2f * h, web = 0.05f * h, tb = 0.35f * t;
+            float yA = yTop + foot, yB = yBottom - foot;
+            float weld = 0.6f * tb, inner = 0.4f * tb, edge = 0.3f * Mathf.Min(t, h);
+            float leg = 1.4f * weld, inset = 0.12f * weld;
+            pb.Move(new Vector2(g.BellRadiusAt(yA + leg) - inset, yA + leg));
+            pb.Line(new Vector2(g.BellRadiusAt(yA), yA), s, weld);
+            pb.Line(new Vector2(g.BellRadiusAt(yTop + web) + tb, yTop + web), s, inner);
+            pb.Line(new Vector2(g.BellRadiusAt(yTop) + t, yTop), s, edge);
+            pb.Line(new Vector2(g.BellRadiusAt(yBottom) + t, yBottom), s, edge);
+            pb.Line(new Vector2(g.BellRadiusAt(yBottom - web) + tb, yBottom - web), s, inner);
+            pb.Line(new Vector2(g.BellRadiusAt(yB), yB), s, weld);
+            pb.Line(new Vector2(g.BellRadiusAt(yB - leg) - inset, yB - leg), s);
         }
 
         // ------------------------------------------------------------------ contour sampling
@@ -458,6 +537,23 @@ namespace ProcEngines
             }
         }
 
+        /// <summary>Re-map V of segments that share one Style to a heat coordinate by height: vTop at yTop, vBottom at
+        /// the last point of the last segment, linear in y in between. Each segment's V spans exactly its own share, so
+        /// V runs on continuously across the runs a band interrupts and meets the next section's V where it ends.</summary>
+        static void HeatByHeight(List<ProfileSegment> segs, float yTop, float vTop, float vBottom)
+        {
+            if (segs == null || segs.Count == 0) return;
+            List<Vector2> last = segs[segs.Count - 1].Points;
+            float yBottom = last[last.Count - 1].y, span = Mathf.Max(yTop - yBottom, 1e-4f);
+            float V(float y) => Mathf.Lerp(vTop, vBottom, Mathf.Clamp01((yTop - y) / span));
+            foreach (ProfileSegment s in segs)
+            {
+                float v0 = V(s.Points[0].y), v1 = V(s.Points[s.Points.Count - 1].y), arc = Mathf.Max(ArcLength(s.Points), 1e-4f);
+                s.VOffset = v0;
+                s.VLength = Mathf.Abs(v1 - v0) > 1e-4f ? arc / (v1 - v0) : span / (vBottom - vTop);
+            }
+        }
+
         static float ArcLength(List<Vector2> pts)
         {
             float a = 0;
@@ -478,6 +574,15 @@ namespace ProcEngines
             public float U = 1, V = 1, VOffset;
             /// <summary>Where styles meet at a rounded corner, the fillet goes to the higher priority side.</summary>
             public int Priority = 1;
+            /// <summary>When set, collects the segments made with this style (for a mapping fixed up after Emit).</summary>
+            public List<ProfileSegment> Made;
+
+            public ProfileSegment Make(List<Vector2> pts)
+            {
+                ProfileSegment s = MakeSegment(pts);
+                Made?.Add(s);
+                return s;
+            }
 
             /// <summary>Physical tiling (ASSETS.md 5): EngineMaterials.SteelTile square, whole tiles around the
             /// segment's largest radius.</summary>
@@ -485,7 +590,7 @@ namespace ProcEngines
             /// <summary>One bolt head per U repeat, ~1.6x as wide as the straight rim is high; V 0 at the top, 1 at the bottom.</summary>
             public static Style Bolts(int mat) => new Style { Mat = mat, Kind = Uv.Bolts, Priority = 0 };
 
-            public ProfileSegment Make(List<Vector2> pts)
+            ProfileSegment MakeSegment(List<Vector2> pts)
             {
                 float rmax = 0;
                 for (int i = 0; i < pts.Count; i++) rmax = Mathf.Max(rmax, pts[i].x);
@@ -639,12 +744,13 @@ namespace ProcEngines
 
         // ------------------------------------------------------------------ mesh
 
-        /// <summary>Revolve profile segments around Y into one mesh, one submesh per material (MeshBuilder.Lathe).</summary>
+        /// <summary>Revolve profile segments around Y into one mesh, one submesh per material (MeshBuilder.Lathe), in a
+        /// pooled builder (slot 2 for the static mesh, 3 for the bell; main thread only, Build copies the data).</summary>
         public static void Lathe(Mesh mesh, List<ProfileSegment> segments, int materialCount, int ringSegments, float yOffset)
         {
             int rows = 0;
             for (int i = 0; i < segments.Count; i++) rows += segments[i].Points.Count;
-            var mb = new MeshBuilder(materialCount, rows * (ringSegments + 1));
+            MeshBuilder mb = MeshBuilder.Pooled(materialCount, materialCount == BellMaterials ? 3 : 2, rows * (ringSegments + 1));
             mb.Lathe(segments, ringSegments, yOffset);
             mb.Build(mesh);
         }

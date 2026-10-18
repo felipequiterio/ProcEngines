@@ -1,6 +1,8 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using HarmonyLib;
 using PreFlightTests;
 using UnityEngine;
@@ -52,14 +54,27 @@ namespace ProcEngines
         }
     }
 
+    /// <summary>The plugin's one persistent addon (created at startup, kept across scenes): applies the Harmony
+    /// patches, and runs the mesh cache's sweep every frame, so released engine meshes go after their grace even when
+    /// no ProcEngine part is loaded to run it (Sweep returns at once when nothing is waiting).</summary>
     [KSPAddon(KSPAddon.Startup.Instantly, true)]
     public class HarmonyLoader : MonoBehaviour
     {
         void Awake()
         {
+            DontDestroyOnLoad(this);
+            try { Patch(); }
+            catch (Exception e) { Debug.LogError("[ProcEngines] Harmony patching failed: " + e); }
+        }
+
+        // separate, so a missing or broken Harmony fails here (caught) and the addon still lives for the sweep
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        static void Patch()
+        {
             new Harmony("procengines").PatchAll(typeof(HarmonyLoader).Assembly);
             Debug.Log("[ProcEngines] Harmony patches applied: " + string.Join(", ", Harmony.GetAllPatchedMethods().Where(m => Harmony.GetPatchInfo(m).Owners.Contains("procengines")).Select(m => m.Name)));
-            DontDestroyOnLoad(this);
         }
+
+        void Update() => EngineMeshCache.Sweep();
     }
 }

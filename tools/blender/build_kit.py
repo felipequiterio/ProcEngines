@@ -2,14 +2,34 @@
 ProcEngines kit pieces: modelled, UV-atlased, baked and exported headless from Blender (5.2).
 
     blender -b --factory-startup -P tools/blender/build_kit.py -- [--out DIR] [--size 2048] [--quality 1.0]
-        Build every piece from this script, unwrap, bake, export, and save tools/blender/kit.blend.
+        Build every piece from this script, unwrap, bake, export, and save tools/blender/kit.blend (or, with --out
+        elsewhere than the shipped Kit directory, DIR/kit.blend, so the shipped kit and kit.blend stay in step).
     blender -b tools/blender/kit.blend -P tools/blender/build_kit.py -- --export-only [--unwrap] [--out DIR]
-        Bake and export the scene as it is in kit.blend (after hand edits in Blender). --unwrap redoes the atlas UVs.
-    Other options: --only NAME[,NAME] builds just those pieces (quick look, does not save kit.blend);
-                   --no-bake exports meshes against the existing atlas; --quality F scales the bake samples;
-                   --debug-maps also writes the intermediate mask / colour / roughness maps to DIR.
-    A full build takes about 2 minutes on a CPU (most of it the four 2048 bakes).
-    Review the result with tools/blender/preview.py.
+        Bake and export the scene as it is in kit.blend (after hand edits in Blender). --unwrap redoes the atlas UVs
+        (and the inverted variants from their bases) and saves kit.blend again; it needs the bake. Without --unwrap,
+        an inverted variant that no longer matches its base (moved vertices or anchors, a changed modifier) is
+        rebuilt from it with its own atlas UVs kept (and kit.blend saved, unless the run is partial); a topology
+        change needs --unwrap.
+        Faces added by extruding an unrolled surface inherit pe_wrap = 1 with collapsed UVs: --unwrap detects them
+        and Smart-UV-projects them (or set their pe_wrap face attribute to 0 by hand).
+    blender -b -t 1 tools/blender/kit.blend -P tools/blender/build_kit.py -- --export-only --no-bake
+        Re-export kit.blend's .pem files with their UVs unchanged, against the atlas already written, on one thread.
+        Blender's MikkTSpace goes multi-threaded on the big pieces (the pumps), so their tangents carry ~1e-7 of
+        float noise that changes from run to run and the .pem bytes churn; with -t 1 (--threads 1) every export is
+        byte-reproducible. -t 1 also makes the bake single-threaded (slow), so follow a full build or a bake with
+        this pass. Writing to the shipped kit without -t 1 logs a warning.
+    Other options: --only NAME[,NAME] builds just those pieces (a quick look: the atlas holds only them, so the
+                   output goes to a scratch directory, cleared of earlier runs first, unless --out is given, and
+                   kit.blend is not saved; the log prints the matching preview.py command);
+                   --no-bake skips the bake. With --export-only it exports kit.blend's UVs against the existing
+                   atlas; a fresh build always repacks the UVs, so there it is only a geometry look (preview.py
+                   --clay) and is refused for the shipped kit. --quality F scales the bake samples;
+                   --debug-maps also writes the intermediate mask / colour / roughness maps and the bake
+                   coverage (debug_valid.png) to DIR.
+    A full build takes about 3 minutes on a CPU (most of it the four 2048 bakes).
+    Nothing is written until every piece (LOD0 and LOD1) has passed the export check; the atlas and .pem files are
+    then written to a staging directory inside DIR and moved in together, so a failed run leaves DIR as it was.
+    Review the result with tools/blender/preview.py and tools/blender/check_kit.py.
 
 The contract with the plugin is ASSETS.md (sections 2-4). In short:
   * Blender +Z = up (Unity +Y), +X = radially outward from the engine axis, +Y = tangential.
@@ -19,6 +39,9 @@ The contract with the plugin is ASSETS.md (sections 2-4). In short:
       kit_atlas.png    RGBA: RGB = base colour with wear x ambient occlusion (sRGB), A = gloss (1 - roughness, shaped)
       kit_atlas_n.png  RGB: tangent-space normal map, OpenGL convention (green = +V)
   * <piece>.pem (version 2) and <piece>.lod1.pem (Decimate collapse of the final LOD0 mesh, <= ~30 % triangles).
+    The export fails (exit code 1, nothing written for any piece) if a tangent frame does not follow the UVs, or
+    if an inverted variant's triangles or anchors differ from its base's.
+  * turbopump_dual_inv / turbopump_single_inv: the same pumps baked hanging upside down (see VARIANTS).
 
 How a piece is made:
   1. bmesh modelling with the Builder below: lathes with filleted profiles, swept tubes with chamfered ends,
@@ -31,14 +54,21 @@ How a piece is made:
      which gives the bevels hard-surface shading.
   4. Procedural "wear" materials (node graphs built by wear_material) baked in four passes:
      masks (AO, convex edges, crevices) -> colour -> roughness -> normal (bevel shader + bump).
+     Drips start under overhangs (vertex attribute pe_drip, ray cast against the piece along world up).
+     The padding between islands is filled from the islands (push-pull), so mip levels never average in black.
 """
-import bpy, bmesh, math, os, random, struct, sys, time
+import bpy, bmesh, math, os, random, shutil, struct, sys, tempfile, time
 from contextlib import contextmanager
 from mathutils import Vector, Matrix
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
+SHIPPED = os.path.join(REPO, "GameData", "ProcEngines", "PluginData", "Kit")
+SCRATCH = os.path.join(tempfile.gettempdir(), "procengines_kit_only")    # default output of --only
+PREVIEW_OUT = os.path.join(tempfile.gettempdir(), "procengines_kit_preview")   # in the printed preview.py command
+STAGE_PREFIX = ".pe_stage_"   # staging directory inside the output, moved in once everything is written
+OLD_SUFFIX = ".pe_old"        # an output file being replaced, renamed aside during that move
 T0 = time.time()
 
 
@@ -48,11 +78,11 @@ def log(msg):
 
 def args():
     a = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
-    o = {"out": os.path.join(REPO, "GameData", "ProcEngines", "PluginData", "Kit"), "size": 2048, "quality": 1.0,
+    o = {"out": SHIPPED, "out_given": False, "size": 2048, "quality": 1.0,
          "export_only": False, "unwrap": False, "only": None, "bake": True, "debug": False}
     i = 0
     while i < len(a):
-        if a[i] == "--out": o["out"] = a[i + 1]; i += 1
+        if a[i] == "--out": o["out"] = a[i + 1]; o["out_given"] = True; i += 1
         elif a[i] == "--size": o["size"] = int(a[i + 1]); i += 1
         elif a[i] in ("--quality", "--samples"): o["quality"] = float(a[i + 1]); i += 1
         elif a[i] == "--export-only": o["export_only"] = True
@@ -72,23 +102,27 @@ def args():
 #   soot     soot deposits                cast    sand-cast surface bump  turned lathe tool marks (local v)
 #   grime    dirt in crevices + streaks   pattern special normal/colour detail: weld, braid, knurl, text
 
+# Values: castings and machined parts are a light worn grey (so they sit with the code-generated steel in game,
+# where KSP's shader shows albedo nearly as is), the turbine end and hot ducts are dark sooty accents, painted
+# parts (actuator barrels, solenoid boxes) are black with chipped edges, chrome is dull, B-nuts are gold.
 MATERIALS = [
-    ("cast",      dict(base=(0.19, 0.19, 0.185), var=0.22, rough=0.60, metal=1, cast=1.0, grime=1.0)),
-    ("machined",  dict(base=(0.215, 0.215, 0.22), var=0.13, rough=0.36, metal=1, turned=1.0, grime=0.85)),
-    ("bolt",      dict(base=(0.22, 0.205, 0.17), var=0.15, rough=0.42, metal=1, grime=1.0)),
+    ("cast",      dict(base=(0.28, 0.275, 0.265), var=0.22, rough=0.68, metal=1, cast=1.0, grime=1.0)),
+    ("machined",  dict(base=(0.26, 0.26, 0.265), var=0.13, rough=0.36, metal=1, turned=1.0, grime=0.85)),
+    ("bolt",      dict(base=(0.26, 0.245, 0.21), var=0.15, rough=0.42, metal=1, grime=1.0)),
     ("dark",      dict(base=(0.035, 0.035, 0.037), var=0.12, rough=0.58, paint=(0.20, 0.20, 0.205), grime=0.6)),
-    ("turbine",   dict(base=(0.15, 0.135, 0.12), var=0.25, rough=0.55, metal=1, heat=0.85, soot=0.7, cast=0.6, grime=0.7)),
-    ("hot",       dict(base=(0.18, 0.165, 0.15), var=0.22, rough=0.48, metal=1, heat=0.55, soot=0.45, grime=0.7)),
-    ("paint",     dict(base=(0.27, 0.27, 0.255), var=0.08, rough=0.50, paint=(0.11, 0.11, 0.11), grime=1.0)),
+    ("turbine",   dict(base=(0.075, 0.068, 0.06), var=0.25, rough=0.55, metal=1, heat=0.85, soot=0.7, cast=0.6, grime=0.7)),
+    ("hot",       dict(base=(0.10, 0.092, 0.085), var=0.22, rough=0.48, metal=1, heat=0.55, soot=0.45, grime=0.7)),
+    ("paint",     dict(base=(0.05, 0.05, 0.052), var=0.08, rough=0.50, paint=(0.30, 0.30, 0.29), grime=1.0)),
     ("connector", dict(base=(0.07, 0.075, 0.04), var=0.12, rough=0.45, paint=(0.24, 0.22, 0.17), grime=0.7, pattern="knurl")),
     ("cable",     dict(base=(0.026, 0.024, 0.022), var=0.15, rough=0.78, grime=0.5, pattern="braid")),
-    ("chrome",    dict(base=(0.45, 0.45, 0.46), var=0.04, rough=0.14, metal=1, grime=0.45)),
+    ("chrome",    dict(base=(0.30, 0.30, 0.31), var=0.04, rough=0.24, metal=1, grime=0.45)),
     ("plate",     dict(base=(0.40, 0.40, 0.38), var=0.06, rough=0.38, metal=1, grime=0.6, pattern="text")),
     ("weld",      dict(base=(0.14, 0.125, 0.11), var=0.25, rough=0.62, metal=1, heat=0.5, grime=0.8, pattern="weld")),
+    ("fitting",   dict(base=(0.32, 0.22, 0.06), var=0.10, rough=0.35, metal=1, grime=0.8)),   # gold-anodised B-nuts
 ]
 M = {name: i for i, (name, _) in enumerate(MATERIALS)}
-CAST, MACH, BOLT, DARK, TURB, HOT, PAINT, CONN, CABLE, CHROME, PLATE, WELD = (M[n] for n in (
-    "cast", "machined", "bolt", "dark", "turbine", "hot", "paint", "connector", "cable", "chrome", "plate", "weld"))
+CAST, MACH, BOLT, DARK, TURB, HOT, PAINT, CONN, CABLE, CHROME, PLATE, WELD, FIT = (M[n] for n in (
+    "cast", "machined", "bolt", "dark", "turbine", "hot", "paint", "connector", "cable", "chrome", "plate", "weld", "fitting"))
 
 GRIME = (0.030, 0.024, 0.018)      # oily dirt in cavities and drips
 FILM = (0.085, 0.075, 0.060)       # dull handling / test-stand film over everything
@@ -243,14 +277,16 @@ def wear_material(name, p):
     mot = g.add(mot, g.mul(g.sub(fine, 0.5), 0.7 * p["var"]))
     col = g.mixc(1.0, base, g.add(1.0, mot), "MULTIPLY")
     hue = g.smooth(g.noise(P, 0.9, 2.0, 0.5), 0.3, 0.7)
-    col = g.mixc(1.0, col, g.mixc(hue, (0.95, 0.985, 1.05), (1.05, 1.0, 0.92)), "MULTIPLY")
+    col = g.mixc(1.0, col, g.mixc(hue, (0.98, 0.99, 1.01), (1.03, 1.0, 0.96)), "MULTIPLY")
     rough = g.add(p["rough"], g.add(g.mul(g.sub(mid, 0.5), 0.22), g.mul(g.sub(fine, 0.5), 0.12)))
     height = g.mul(g.sub(fine, 0.5), 0.15)
 
     # ---- heat tint (straw -> bronze -> plum -> blue -> grey) in irregular, muted patches
+    # (the ramp is for a mid-grey metal: scaled by the base's value, so dark sooty parts stay dark accents)
     if p.get("heat"):
         ht = g.add(g.mul(g.noise(P, 1.4, 3.0, 0.6), 1.15 * p["heat"]), g.mul(g.sub(mid, 0.5), 0.4))
-        tint = g.mixc(1.0, g.ramp(g.clamp(ht), HEAT_RAMP), g.add(0.85, g.mul(fine, 0.3)), "MULTIPLY")
+        val = min(1.0, max(0.3, (0.2126 * base[0] + 0.7152 * base[1] + 0.0722 * base[2]) / 0.19))
+        tint = g.mixc(1.0, g.ramp(g.clamp(ht), HEAT_RAMP), g.add(0.85 * val, g.mul(fine, 0.3 * val)), "MULTIPLY")
         col = g.mixc(g.mul(g.smooth(ht, 0.08, 0.4), 0.45 + 0.35 * p["heat"]), col, tint)
 
     # ---- paint and chipping: chips follow worn edges and also appear as sparse dings on flat areas
@@ -316,14 +352,16 @@ def wear_material(name, p):
         dents = g.voronoi(P, 9.0, "SMOOTH_F1")
         height = g.add(height, g.mul(dents, 1.6 * p["cast"]))
     if p.get("turned"):
-        rings = g.math("SINE", g.mul(lv, g.mul(texel, 500.0)))
+        rings = g.math("SINE", g.mul(lv, g.mul(texel, 300.0)))     # ~3 px per ring at 2048: no moire
         height = g.add(height, g.mul(rings, 0.05 * p["turned"]))
         col = g.mixc(g.mul(g.add(rings, 1.0), 0.03), col, g.mixc(1.0, col, (1.4, 1.4, 1.4), "MULTIPLY"))
 
-    # ---- grime: a dull film in patches, dirt packed into crevices and cavities, streaks and drips running down
-    # (object -Z) the vertical faces, dust on up-facing surfaces
+    # ---- grime: a dull film in patches, dirt packed into crevices and cavities, streaks along the vertical faces,
+    # drips running down from overhangs (flanges, bosses, bolt heads), dust on up-facing surfaces. "Up" is the
+    # world +Z of the bake: the normal for dust, and the pe_drip vertex attribute (drip_sources) for the drips, so
+    # a piece that hangs upside down in game is baked as an inverted variant with its object rotated.
     gr = p.get("grime", 0.0)
-    film = g.mul(g.smooth(g.noise(P, 2.2, 4.0, 0.6), 0.38, 0.72), 0.45 * gr)
+    film = g.mul(g.smooth(g.noise(P, 2.2, 4.0, 0.6), 0.38, 0.72), 0.30 * gr)
     col = g.mixc(film, col, g.mixc(0.5, col, FILM))
     rough = g.mixf(film, rough, g.add(rough, 0.12))
     cav = g.mx(g.mul(g.sub(1.0, occl), 0.95), crevice)
@@ -332,7 +370,15 @@ def wear_material(name, p):
     drip_n = g.noise(g.mapping(P, scale=(18.0, 18.0, 0.7)), 1.0, 3.0, 0.55, distortion=0.1)
     streak = g.mul(g.smooth(drip_n, 0.50, 0.64), g.smooth(g.noise(P, 1.6, 2.0, 0.5), 0.38, 0.6))
     drip_f = g.noise(g.mapping(P, scale=(60.0, 60.0, 2.5)), 1.0, 2.0, 0.5)
-    drips = g.mx(g.mul(streak, 0.5), g.mul(g.smooth(drip_f, 0.6, 0.68), g.smooth(g.noise(P, 4.0, 2.0, 0.5), 0.5, 0.65)))
+    # pe_drip: 1 right under an overhang, falling off with the distance below it; a per-column noise varies
+    # where each run ends
+    src = g.node("ShaderNodeAttribute", attribute_type="GEOMETRY", attribute_name="pe_drip").outputs["Fac"]
+    col_n = g.noise(g.mapping(P, scale=(30.0, 30.0, 0.5)), 1.0, 2.0, 0.5)
+    under = g.smooth(g.add(src, g.mul(g.sub(col_n, 0.5), 0.8)), 0.1, 0.9)
+    run_n = g.noise(g.mapping(P, scale=(22.0, 22.0, 1.2)), 1.0, 2.0, 0.5)      # runs ~7 mm wide on a 0.3 m pump
+    runs = g.mul(g.smooth(run_n, 0.54, 0.64), g.smooth(g.noise(P, 3.0, 2.0, 0.5), 0.3, 0.55))
+    drips = g.mx(g.mul(streak, 0.4), g.mul(g.smooth(drip_f, 0.6, 0.68), g.smooth(g.noise(P, 4.0, 2.0, 0.5), 0.5, 0.65)))
+    drips = g.mx(drips, g.mul(runs, g.mul(under, 0.75)))
     drips = g.mul(drips, side)
     grime = g.clamp(g.mul(g.mx(cav, drips), gr))
     col = g.mixc(g.mul(grime, 0.88), col, GRIME)
@@ -366,6 +412,8 @@ def make_materials():
 
 
 # ================================================================================================ modelling helpers
+
+POLE_UV = 0.02     # radius of the tiny UV circle the corners of a pole fan are spread over (fraction of the ring)
 
 def frame(axis, ref=None):
     """Right-handed basis (a, b, w) with w along axis; a is ref projected onto the plane (or any perpendicular)."""
@@ -539,12 +587,14 @@ class Builder:
                 j2, u0, u1 = (j + 1) % segs, j / segs, (j + 1) / segs
                 k = j // m_sec
                 a0 = lambda jj, r, sv: (tau * (jj / segs - (k + 0.5) / nsec) * r, sv)
+                # a pole corner gets its own UV (on a tiny circle, POLE_UV of the ring radius), so MikkTSpace does
+                # not weld the whole fan into one vertex whose tangents cancel out
                 if len(A) == 1:
                     self.face([A[0], B[j], B[j2]], m, [((u0 + u1) / 2, s[i]), (u0, s[i + 1]), (u1, s[i + 1])],
-                              [a0(j + 0.5, 0, s[i]), a0(j, rb, s[i + 1]), a0(j + 1, rb, s[i + 1])] if wrap else None)
+                              [a0(j + 0.5, POLE_UV * rb, s[i]), a0(j, rb, s[i + 1]), a0(j + 1, rb, s[i + 1])] if wrap else None)
                 elif len(B) == 1:
                     self.face([A[j], B[0], A[j2]], m, [(u0, s[i]), ((u0 + u1) / 2, s[i + 1]), (u1, s[i])],
-                              [a0(j, ra, s[i]), a0(j + 0.5, 0, s[i + 1]), a0(j + 1, ra, s[i])] if wrap else None)
+                              [a0(j, ra, s[i]), a0(j + 0.5, POLE_UV * ra, s[i + 1]), a0(j + 1, ra, s[i])] if wrap else None)
                 else:
                     self.face([A[j], B[j], B[j2], A[j2]], m, [(u0, s[i]), (u0, s[i + 1]), (u1, s[i + 1]), (u1, s[i])],
                               [a0(j, ra, s[i]), a0(j, rb, s[i + 1]), a0(j + 1, rb, s[i + 1]), a0(j + 1, ra, s[i])] if wrap else None)
@@ -608,21 +658,23 @@ class Builder:
                 c = chamfer * radii[end]
                 rr = radii[end] * (1 - chamfer)
                 ring = [self.bm.verts.new(pts[end] + (vv.co - pts[end]) * (1 - chamfer) + t * c) for vv in rings[end]]
-                # the cap unrolls like a lathe pole: a fan toward the centre point
+                # the cap unrolls like a lathe pole: a fan toward the centre point, which sits above the middle of
+                # the strip; each fan corner gets its own UV there (see POLE_UV)
                 ctr = self.bm.verts.new(pts[end] + t * c)
+                cu = lambda u0, u1: tau * rr * (0.5 + POLE_UV * ((u0 + u1) / 2 - 0.5))
                 if end:
                     band(rings[end], ring, s[end], s[end] + c, radii[end], rr)
                     se = s[end] + c - chunk * math.floor(s[end] / chunk + 1e-9)
                     for j in range(sides):
                         j2, u0, u1 = (j + 1) % sides, j / sides, (j + 1) / sides
                         self.face([ring[j], ring[j2], ctr], mat, None,
-                                  [(tau * u0 * rr, se), (tau * u1 * rr, se), (0, se + rr)] if wrap else None)
+                                  [(tau * u0 * rr, se), (tau * u1 * rr, se), (cu(u0, u1), se + rr)] if wrap else None)
                 else:
                     band(ring, rings[0], -c, 0.0, rr, radii[0])
                     for j in range(sides):
                         j2, u0, u1 = (j + 1) % sides, j / sides, (j + 1) / sides
                         self.face([ring[j2], ring[j], ctr], mat, None,
-                                  [(tau * u1 * rr, -c), (tau * u0 * rr, -c), (0, -c - rr)] if wrap else None)
+                                  [(tau * u1 * rr, -c), (tau * u0 * rr, -c), (cu(u0, u1), -c - rr)] if wrap else None)
         if record:
             self.tubes.append((np.array([tuple(p) for p in pts]), np.array(radii)))
 
@@ -1098,18 +1150,21 @@ def preburner():
     axis (-X)."""
     b = Builder(segs=56, rnd=0.008, seed=21, wrap_r=0.15)
     A = {}
-    dome = [(0.0, 1.074, MACH), (0.07, 1.074), (0.07, 1.052, HOT, 0.01)]
+    # the jacket runs clear from the base collar (z 0.195) to the head flange (z 0.81), so the 0.30 hot-gas outlet
+    # (z 0.2 .. 0.8) meets plain wall; the injector dome is a little flatter to keep the height
+    zf, hd = 0.88, 0.18          # head flange top = dome base, dome height
+    dome = [(0.0, 1.074, MACH), (0.07, 1.074), (0.07, 1.06, HOT, 0.01)]
     t0 = math.asin(0.075 / 0.43)
     for i in range(1, 7):
         t = t0 + (math.pi / 2 - t0) * i / 6
-        dome.append((0.43 * math.sin(t), 0.79 + 0.27 * math.cos(t)))
-    b.lathe(dome + [(0.48, 0.79, MACH), (0.48, 0.758), (0.466, 0.758, DARK, 0.0), (0.466, 0.752, MACH, 0.0), (0.48, 0.752),
-                    (0.48, 0.72), (0.425, 0.72, TURB, 0.02), (0.425, 0.27), (0.44, 0.265, MACH), (0.44, 0.225), (0.425, 0.22, TURB),
-                    (0.425, 0.14, MACH, 0.03), (0.53, 0.14), (0.53, 0.0), (0.0, 0.0)], HOT)
-    b.bolt_ring((0, 0, 0.79), (0, 0, 1), 0.456, 14, 0.013)
-    b.bolt_ring((0, 0, 0.72), (0, 0, -1), 0.456, 14, 0.013, washer=False, stud=True)
+        dome.append((0.43 * math.sin(t), zf + hd * math.cos(t)))
+    b.lathe(dome + [(0.48, zf, MACH), (0.48, zf - 0.032), (0.466, zf - 0.032, DARK, 0.0), (0.466, zf - 0.038, MACH, 0.0),
+                    (0.48, zf - 0.038), (0.48, zf - 0.07), (0.425, zf - 0.07, TURB, 0.02), (0.425, 0.20), (0.44, 0.195, MACH),
+                    (0.44, 0.14, None, 0.015), (0.53, 0.14), (0.53, 0.0), (0.0, 0.0)], HOT)
+    b.bolt_ring((0, 0, zf), (0, 0, 1), 0.456, 14, 0.013)
+    b.bolt_ring((0, 0, zf - 0.07), (0, 0, -1), 0.456, 14, 0.013, washer=False, stud=True)
     b.bolt_ring((0, 0, 0.14), (0, 0, 1), 0.49, 12, 0.018, stud=True)
-    dome_sdf = sdf_ellipsoid((0, 0, 0.79), 0.43, 0.27)
+    dome_sdf = sdf_ellipsoid((0, 0, zf), 0.43, hd)
     # feed inlets on the head: oxidizer and fuel, each a welded stub with a small bolted flange
     for name, x in (("ox_feed", 0.16), ("fuel_feed", -0.16)):
         p0 = Vector((x, 0.12, 0.96))
@@ -1119,12 +1174,12 @@ def preburner():
         b.lathe([(0, 0.035, MACH), (0.09, 0.035), (0.09, 0.0), (0.072, 0.0, None, 0.004), (0.062, -0.015)], MACH, 24, p1, (0, 0, 1), 0.004)
         b.bolt_ring(p1, (0, 0, -1), 0.078, 4, 0.0095, phase=0.5, washer=False)
         A[name] = (tuple(p1 + Vector((0, 0, 0.04))), (0, 0, 1))
-    # hot-gas outlet toward the engine axis
-    b.sweep([(-0.3, 0, 0.5), (-0.72, 0, 0.5)], 0.19, HOT, 32)
-    b.weld_junction((-0.3, 0, 0.5), (-1, 0, 0), 0.19, sdf_cyl(0.425), 0.014, n=32, sides=5)
-    b.lathe([(0.0, 0.07, MACH), (0.262, 0.07), (0.262, 0.0), (0.225, 0.0, HOT, 0.006), (0.2, -0.04, None, 0.01), (0.19, -0.06)],
-            MACH, 48, (-0.72, 0, 0.5), (-1, 0, 0), 0.005)
-    b.bolt_ring((-0.72, 0, 0.5), (1, 0, 0), 0.243, 10, 0.015, phase=0.5)
+    # hot-gas outlet toward the engine axis (radius 0.30, ASSETS D8): welded stub, bolted flange
+    b.sweep([(-0.15, 0, 0.5), (-0.44, 0, 0.5), (-0.72, 0, 0.5)], 0.30, HOT, 40)
+    b.weld_junction((-0.15, 0, 0.5), (-1, 0, 0), 0.30, sdf_cyl(0.425), 0.016, n=48, sides=5, reach=0.6)
+    b.lathe([(0.0, 0.07, MACH), (0.40, 0.07), (0.40, 0.0), (0.345, 0.0, HOT, 0.006), (0.315, -0.04, None, 0.01), (0.30, -0.06)],
+            MACH, 56, (-0.72, 0, 0.5), (-1, 0, 0), 0.005)
+    b.bolt_ring((-0.72, 0, 0.5), (1, 0, 0), 0.37, 12, 0.015, phase=0.5)
     A["hot_out"] = ((-0.8, 0, 0.5), (-1, 0, 0))
     # igniter on top, chamber pressure and wall temperature on the +X side, cables to a connector bracket
     # standing on the base flange
@@ -1222,7 +1277,7 @@ def valve():
         for sz in (-1, 1):
             q = Vector((0, sy * 0.66, sz * 0.66))
             b.cyl(Vector((1.85, 0, 0)) + q, Vector((3.5, 0, 0)) + q, 0.055, MACH, 8, rnd=0.0)
-            b.bolt(Vector((3.5, 0, 0)) + q, X, 0.09, stud=True)
+            b.bolt(Vector((3.5, 0, 0)) + q, X, 0.09, stud=True, mat=FIT)
     # position indicator on the end cap, solenoid box, connector and cable down to the body flange
     b.lathe([(0, 0.12, CHROME), (0.18, 0.1), (0.22, 0.0)], MACH, 32, (3.5, 0, 0), X, 0.02)
     b.box((2.55, 0, 1.0), (1.0, 0.7, 0.38), DARK, None, bevel=0.06)
@@ -1271,12 +1326,12 @@ def actuator():
     for sy in (-0.42, 0.42):
         for sz in (-1.3, -2.3):
             b.lathe([(0, 0.12), (0.1, 0.12), (0.12, 0.1), (0.12, 0.0)], BOLT, 12, (1.6, sy, sz), (1, 0, 0), 0.0)
-    for y in (-0.3, 0.3):
-        b.lathe([(0, 0.13), (0.15, 0.13), (0.17, 0.11), (0.17, 0.0)], BOLT, 6, (1.3, y, -1.2), (0, 0, 1), 0.0, phase=0.1)
-        b.lathe([(0, 0.32), (0.17, 0.32), (0.21, 0.28), (0.21, 0.17), (0.17, 0.13)], BOLT, 6, (1.3, y, -1.2), (0, 0, 1), 0.0, phase=0.4)
+    for y in (-0.3, 0.3):   # fittings and B-nuts: gold (cadmium / anodised) hardware
+        b.lathe([(0, 0.13), (0.15, 0.13), (0.17, 0.11), (0.17, 0.0)], FIT, 6, (1.3, y, -1.2), (0, 0, 1), 0.0, phase=0.1)
+        b.lathe([(0, 0.32), (0.17, 0.32), (0.21, 0.28), (0.21, 0.17), (0.17, 0.13)], FIT, 6, (1.3, y, -1.2), (0, 0, 1), 0.0, phase=0.4)
         path = b.pipe([(1.3, y, -0.9), (1.3, y, -0.7), (1.08, y, -0.47), (0.78, y * 1.35, -0.36)], 0.11, MACH, 12, per=5)
         t = (path[-1] - path[-2]).normalized()
-        b.lathe([(0, 0.0), (0.21, 0.0), (0.21, -0.2), (0.17, -0.24), (0.0, -0.24)], BOLT, 6, path[-1] + t * 0.18, t, 0.0, phase=0.2)
+        b.lathe([(0, 0.0), (0.21, 0.0), (0.21, -0.2), (0.17, -0.24), (0.0, -0.24)], FIT, 6, path[-1] + t * 0.18, t, 0.0, phase=0.2)
     co = b.connector(Vector((1.68, 0, -2.15)), (1, 0, 0), 0.16)
     b.cable([co, co + Vector((0.2, 0, 0.0)), Vector((2.12, 0.42, -1.85)), Vector((1.95, 0.66, -1.1)), Vector((1.4, 0.68, -0.62)),
              Vector((0.85, 0.66, -0.4))], 0.075, per=6)
@@ -1291,18 +1346,30 @@ def dome_inlet():
     """Oxidizer inlet on the injector dome (unit = line radius): a reinforcing boss welded into the dome (local +Z =
     dome normal), bolted cover, and a flanged elbow turning outward along +X."""
     b = Builder(segs=56, rnd=0.04, seed=61, wrap_r=0.3)
-    b.lathe([(0.0, 0.42, MACH), (1.74, 0.42), (1.82, 0.36, CAST, 0.04), (2.0, 0.18), (2.05, -0.9), (0.0, -0.9)], CAST)
-    b.bolt_ring((0, 0, 0.42), (0, 0, 1), 1.5, 10, 0.12, phase=0.5)
-    path = b.pipe([(0, 0, 0.3), (0, 0, 1.0), (0.25, 0, 1.75), (1.0, 0, 2.15), (2.0, 0, 2.15)], 1.0, CAST, 28, per=6)
+    # boss (r 1.52, ASSETS D8): small enough for the dome annulus between the gimbal block and the injector
+    # flange; its lower part is buried in the dome
+    b.lathe([(0.0, 0.42, MACH), (1.30, 0.42), (1.36, 0.36, CAST, 0.04), (1.48, 0.18), (1.52, -0.9), (0.0, -0.9)], CAST)
+    b.bolt_ring((0, 0, 0.42), (0, 0, 1), 1.16, 12, 0.075, phase=0.5)
+    # short-radius elbow (centreline bend radius 1.18 > the pipe radius, so the inside of the bend does not fold)
+    # rising straight out of the boss and turning outward at z 1.6, low enough to stay under the mount plate
+    Rb, z0, zc = 1.18, 0.42, 1.6
+    bend = [Vector((Rb - Rb * math.cos(t), 0, z0 + Rb * math.sin(t))) for t in np.linspace(0, math.pi / 2, 17)]
+    b.sweep([Vector((0, 0, 0.3))] + bend + [Vector((1.39, 0, zc)), Vector((1.6, 0, zc))], 1.0, CAST, 28)
     b.weld_ring((0, 0, 0.42), (0, 0, 1), 1.0, 0.09, 48, 5)
-    b.lathe([(0.0, 0.3, MACH), (1.4, 0.3), (1.4, 0.0), (1.16, 0.0, CAST, 0.03), (1.04, -0.2, None, 0.05), (1.0, -0.32)], MACH, 56,
-            (2.0, 0, 2.15), (1, 0, 0), 0.03)
-    b.weld_ring((1.69, 0, 2.15), (1, 0, 0), 1.0, 0.08, 48, 5)
-    b.bolt_ring((2.0, 0, 2.15), (-1, 0, 0), 1.25, 8, 0.11, phase=0.5)
-    out = b.sensor((-0.9, 0.9, 0.42), (0, 0, 1), 0.17)
-    b.cable([out, out + Vector((0, 0, 0.25)), Vector((-1.35, 1.35, 0.85)), Vector((-1.75, 1.6, 0.45)), Vector((-1.95, 1.7, -0.3))], 0.07,
-            clips=(0.82,), clip_dir=lambda p: (-p.x, -p.y, 0))
-    return b, {"in": ((2.35, 0, 2.15), (1, 0, 0))}
+    b.lathe([(0.0, 0.3, MACH), (1.3, 0.3), (1.3, 0.0), (1.10, 0.0, CAST, 0.03), (1.03, -0.16, None, 0.05), (1.0, -0.30)], MACH, 56,
+            (1.6, 0, zc), (1, 0, 0), 0.03)
+    b.weld_ring((1.29, 0, zc), (1, 0, 0), 1.0, 0.08, 48, 5)
+    b.bolt_ring((1.6, 0, zc), (-1, 0, 0), 1.17, 8, 0.095, phase=0.5)
+    # pressure transducer on the outside of the bend, its cable down the back of the elbow, across the boss
+    # between two bolts and down into the dome
+    t, phi = math.radians(45), math.radians(40)
+    cl = Vector((Rb - Rb * math.cos(t), 0, z0 + Rb * math.sin(t)))
+    d = Vector((-math.cos(t), 0, math.sin(t))) * math.cos(phi) + Vector((0, 1, 0)) * math.sin(phi)
+    out = b.sensor(cl + d * 0.99, d, 0.15)
+    P = lambda deg, r, z: Vector((r * math.cos(math.radians(deg)), r * math.sin(math.radians(deg)), z))
+    b.cable([out, out + d * 0.18, P(108, 1.3, 1.55), P(116, 1.24, 1.0), P(120, 1.2, 0.56), P(120, 1.42, 0.47), P(120, 1.6, 0.12),
+             P(120, 1.6, -0.5)], 0.065, clips=(0.78,), clip_dir=lambda p: (-p.x, -p.y, 0))
+    return b, {"in": ((1.95, 0, zc), (1, 0, 0))}
 
 
 def injector_ring():
@@ -1338,20 +1405,188 @@ def injector_ring():
     return b, {}
 
 
-# name, builder, texel weight (atlas share relative to model units: about the piece's unit size in game / 0.3 m)
+# name, builder, texel weight (atlas share relative to model units: about the piece's unit size in game / 0.3 m).
+# Pump-radius pieces are 0.8 (typical pumps are 0.16-0.24 m), so the two inverted pumps fit without starving the
+# small pieces; the injector ring (chamber radius) 0.9.
 PIECES = [
-    ("turbopump_dual", lambda: turbopump(True), 1.0),
-    ("turbopump_single", lambda: turbopump(False), 1.0),
-    ("preburner", preburner, 1.0),
-    ("gas_generator", gas_generator, 1.0),
+    ("turbopump_dual", lambda: turbopump(True), 0.8),
+    ("turbopump_single", lambda: turbopump(False), 0.8),
+    ("preburner", preburner, 0.8),
+    ("gas_generator", gas_generator, 0.8),
     ("valve", valve, 0.22),
     ("actuator", actuator, 0.13),
     ("dome_inlet", dome_inlet, 0.22),
-    ("injector_ring", injector_ring, 1.4),
+    ("injector_ring", injector_ring, 0.9),
 ]
+# Inverted variants (name -> base piece): the base's mesh and anchors with their own atlas islands, baked with the
+# object rotated 180 degrees about X, the way KitBuilder hangs a staged-combustion pump (turbine end up). The wear
+# material's "up" is world +Z, so drips run down from the in-game overhangs and dust lies on the in-game top faces.
+# KitBuilder uses the _inv piece whenever it places the pump upside down.
+VARIANTS = {"turbopump_dual_inv": "turbopump_dual", "turbopump_single_inv": "turbopump_single"}
+NAMES = [n for n, _, _ in PIECES] + list(VARIANTS)
+PIECE_TEXEL = {n: t for n, _, t in PIECES}
 BUDGET = {"turbopump_dual": 45000, "turbopump_single": 45000, "preburner": 15000, "gas_generator": 15000,
-          "valve": 8000, "actuator": 8000, "dome_inlet": 8000, "injector_ring": 12000}
+          "valve": 8000, "actuator": 8000, "dome_inlet": 8000, "injector_ring": 12000,
+          "turbopump_dual_inv": 45000, "turbopump_single_inv": 45000}
 LOD1_RATIO = 0.28
+PACK_MARGIN = 0.0015  # gap between atlas islands, as a fraction of the atlas (3 px at 2048)
+DRIP_REACH = 0.45     # how far (game-size units: object units x pe_texel) a drip runs below the overhang it comes from
+TANGENT_MIN = 0.9     # export check: area share of corners whose tangent frame follows the atlas UVs (now 0.97-1.0)
+
+
+def grid(i):
+    """Scene position of the i-th piece: apart, so the pieces never show in each other's bakes."""
+    return (16.0 * (i % 4), 16.0 * (i // 4), 0.0)
+
+
+def make_variant(name, base, i, keep_uvs=False):
+    """(Re)create an inverted variant from its base piece: a copy of the object (modifiers, custom properties,
+    material slots), of its mesh (atlas UVs, pe_wrap and all) and of its anchors, rotated 180 degrees about X.
+    Its UVs become its own islands when unwrap() packs it. keep_uvs: the topology is unchanged, so keep the old
+    variant's atlas UVs (its islands in the current atlas) and pack properties instead of the base's."""
+    old = bpy.data.objects.get(name)
+    kept = None
+    if old is not None and keep_uvs:
+        uv = np.empty(len(old.data.loops) * 2, np.float32)
+        old.data.uv_layers["atlas"].data.foreach_get("uv", uv)
+        kept = uv, {k: old[k] for k in ("pe_pack", "pe_uvscale") if k in old}
+    if old:
+        for ch in list(old.children): bpy.data.objects.remove(ch)
+        me_old = old.data
+        bpy.data.objects.remove(old)
+        if me_old is not None and me_old.users == 0: bpy.data.meshes.remove(me_old)
+    bpy.context.view_layer.update()
+    ob = base.copy()
+    ob.data = base.data.copy()
+    ob.name = ob.data.name = name
+    for c in base.users_collection or (bpy.context.scene.collection,):
+        c.objects.link(ob)
+    if kept:
+        if len(kept[0]) != 2 * len(ob.data.loops): raise RuntimeError(f"{name}: keep_uvs with a different topology")
+        ob.data.uv_layers["atlas"].data.foreach_set("uv", kept[0])
+        for k, v in kept[1].items(): ob[k] = v
+    add_modifiers(ob)
+    ob.location = grid(i)
+    ob.rotation_euler = (math.pi, 0.0, 0.0)
+    inv = base.matrix_world.inverted()
+    for ch in base.children:
+        if ch.type != "EMPTY" or not ch.name.startswith(base.name + "."): continue
+        e = bpy.data.objects.new(name + "." + ch.name[len(base.name) + 1:], None)
+        e.empty_display_type, e.empty_display_size = ch.empty_display_type, ch.empty_display_size
+        e.parent = ob
+        e.matrix_parent_inverse = Matrix.Identity(4)
+        e.matrix_basis = inv @ ch.matrix_world
+        bpy.context.scene.collection.objects.link(e)
+    return ob
+
+
+# mesh attributes a variant does not share with its base: its own atlas UVs and drips, and editor state
+VARIANT_OWN = {"atlas", "pe_drip"}
+TOPOLOGY = (".edge_verts", ".corner_vert", ".corner_edge")
+ATTR_KIND = {"FLOAT": (1, "value", np.float32), "INT": (1, "value", np.int32), "BOOLEAN": (1, "value", bool),
+             "INT8": (1, "value", np.int32), "FLOAT2": (2, "vector", np.float32), "INT32_2D": (2, "value", np.int32),
+             "FLOAT_VECTOR": (3, "vector", np.float32), "FLOAT_COLOR": (4, "color", np.float32),
+             "BYTE_COLOR": (4, "color", np.float32), "QUATERNION": (4, "value", np.float32)}
+MOD_UI = {"name", "rna_type", "is_active", "show_expanded", "show_on_cage", "show_in_editmode", "use_pin_to_last",
+          "is_override_data_editable", "persistent_uid", "execution_time"}
+
+
+def mesh_attrs(me):
+    """name -> (domain, type, values) of every mesh attribute that a variant shares with its base."""
+    out = {}
+    for a in me.attributes:
+        n = a.name
+        if n in VARIANT_OWN or (n.startswith(".") and n not in TOPOLOGY) or a.data_type not in ATTR_KIND: continue
+        k, prop, dt = ATTR_KIND[a.data_type]
+        v = np.empty(len(a.data) * k, dt)
+        try:
+            a.data.foreach_get(prop, v)
+        except (TypeError, RuntimeError):
+            v = np.array([tuple(getattr(d, prop)) if k > 1 else getattr(d, prop) for d in a.data]).ravel()
+        out[n] = (a.domain, a.data_type, v)
+    return out
+
+
+def modifier_stack(ob):
+    out = []
+    for m in ob.modifiers:
+        props = []
+        for p in m.bl_rna.properties:
+            if p.is_readonly or p.identifier in MOD_UI: continue
+            v = getattr(m, p.identifier, None)
+            if p.type in ("POINTER", "COLLECTION"): v = getattr(v, "name", None)
+            elif isinstance(v, set): v = tuple(sorted(v))
+            elif hasattr(v, "__len__") and not isinstance(v, str): v = tuple(v)
+            props.append((p.identifier, v))
+        out.append((m.name, m.type, tuple(props)))
+    return out
+
+
+def variant_diff(vo, bo):
+    """What an inverted variant (vo) no longer shares with its base (bo): mesh attributes (topology, positions,
+    pe_wrap, sharp edges, materials, the local UVs), material slots, modifiers and anchors. "" if nothing."""
+    out = []
+    mv, mb = vo.data, bo.data
+    av, ab = mesh_attrs(mv), mesh_attrs(mb)
+    if (len(mv.vertices), len(mv.edges), len(mv.polygons), len(mv.loops)) != (len(mb.vertices), len(mb.edges), len(mb.polygons), len(mb.loops)):
+        out.append("element counts")
+    else:
+        names = [n for n in sorted(set(av) | set(ab)) if n not in av or n not in ab or av[n][:2] != ab[n][:2]
+                 or not np.array_equal(av[n][2], ab[n][2])]
+        if names: out.append("attributes " + ", ".join(names))
+        ls = [np.empty(len(m.polygons), np.int32) for m in (mv, mb)]
+        for m, a in zip((mv, mb), ls): m.polygons.foreach_get("loop_start", a)
+        if not np.array_equal(*ls): out.append("polygon loops")
+    if [m.name if m else None for m in mv.materials] != [m.name if m else None for m in mb.materials]: out.append("materials")
+    if [(s.link, s.material.name if s.material else None) for s in vo.material_slots] != \
+            [(s.link, s.material.name if s.material else None) for s in bo.material_slots]: out.append("material slots")
+    if modifier_stack(vo) != modifier_stack(bo): out.append("modifiers")
+    if anchors_differ(piece_anchors(vo), piece_anchors(bo)): out.append("anchors")
+    return ", ".join(out)
+
+
+def anchors_differ(av, ab, tol=1e-5):
+    """Anchor lists (piece_anchors) that differ in names or by more than tol (as check_kit.variant_check)."""
+    return [a[0] for a in av] != [a[0] for a in ab] or any(
+        max(abs(x - y) for x, y in zip(p + d, q + e)) > tol for (_, p, d), (_, q, e) in zip(av, ab))
+
+
+def same_topology(mv, mb):
+    if (len(mv.vertices), len(mv.edges), len(mv.polygons), len(mv.loops)) != (len(mb.vertices), len(mb.edges), len(mb.polygons), len(mb.loops)):
+        return False
+    av, ab = mesh_attrs(mv), mesh_attrs(mb)
+    ls = [np.empty(len(m.polygons), np.int32) for m in (mv, mb)]
+    for m, a in zip((mv, mb), ls): m.polygons.foreach_get("loop_start", a)
+    return np.array_equal(*ls) and all(n in av and n in ab and np.array_equal(av[n][2], ab[n][2]) for n in TOPOLOGY)
+
+
+def sync_variants(names, shipped):
+    """--export-only without --unwrap: an inverted variant must still be its base's mesh (ASSETS.md 4), but only
+    --unwrap rebuilds it. After a hand edit of the base (moved vertices or anchors, a changed modifier, sharp edges)
+    the variant is rebuilt from the base here, keeping its own atlas UVs, which stay valid while the topology is the
+    same; a topology change needs --unwrap (new islands). Returns the rebuilt variants."""
+    done = []
+    bpy.context.view_layer.update()
+    for v, base in VARIANTS.items():
+        vo, bo = bpy.data.objects.get(v), bpy.data.objects.get(base)
+        if vo is None or bo is None or (v not in names and base not in names): continue
+        diff = variant_diff(vo, bo)
+        if not diff: continue
+        if v not in names:
+            msg = f"{v} no longer matches {base} ({diff}) and is not exported with it: add {v} to --only"
+            if shipped: fail(msg)
+            log("WARNING " + msg)
+            continue
+        if not same_topology(vo.data, bo.data):
+            fail(f"{v} no longer matches {base} and its topology changed ({diff}): rerun with --export-only --unwrap, "
+                 f"which rebuilds the variant with new atlas islands (it needs the bake)")
+        make_variant(v, bo, NAMES.index(v), keep_uvs=True)
+        bpy.context.view_layer.update()
+        left = variant_diff(bpy.data.objects[v], bo)
+        if left: fail(f"{v}: rebuilt from {base}, but still differs ({left})")
+        log(f"WARNING {v} was out of date with {base} ({diff}): rebuilt from it, its own atlas UVs kept")
+        done.append(v)
+    return done
 
 
 # ================================================================================================ atlas + bake
@@ -1362,10 +1597,78 @@ def select_only(obs):
     bpy.context.view_layer.objects.active = obs[0]
 
 
-def unwrap(obs):
+def loop_polygons(me):
+    """Polygon index of every loop."""
+    lstart = np.empty(len(me.polygons), np.int64); me.polygons.foreach_get("loop_start", lstart)
+    ltotal = np.empty(len(me.polygons), np.int64); me.polygons.foreach_get("loop_total", ltotal)
+    lp = np.empty(len(me.loops), np.int64)
+    first = np.repeat(np.cumsum(ltotal) - ltotal, ltotal)
+    lp[np.repeat(lstart, ltotal) + (np.arange(ltotal.sum()) - first)] = np.repeat(np.arange(len(me.polygons)), ltotal)
+    return lp
+
+
+def poly_areas(me):
+    """3D area and atlas UV area of every polygon, and the atlas UVs (loops x 2)."""
+    me.calc_loop_triangles()
+    nt = len(me.loop_triangles)
+    tri = np.empty(nt * 3, np.int32); me.loop_triangles.foreach_get("loops", tri); tri = tri.reshape(-1, 3)
+    poly = np.empty(nt, np.int32); me.loop_triangles.foreach_get("polygon_index", poly)
+    uv = np.empty(len(me.loops) * 2, np.float32); me.uv_layers["atlas"].data.foreach_get("uv", uv); uv = uv.reshape(-1, 2)
+    vi = np.empty(len(me.loops), np.int32); me.loops.foreach_get("vertex_index", vi)
+    co = np.empty(len(me.vertices) * 3, np.float32); me.vertices.foreach_get("co", co); co = co.reshape(-1, 3)
+    t3 = co[vi[tri]].astype(np.float64)
+    a3 = 0.5 * np.linalg.norm(np.cross(t3[:, 1] - t3[:, 0], t3[:, 2] - t3[:, 0]), axis=1)
+    t2 = uv[tri].astype(np.float64)
+    a2 = 0.5 * np.abs((t2[:, 1, 0] - t2[:, 0, 0]) * (t2[:, 2, 1] - t2[:, 0, 1]) - (t2[:, 2, 0] - t2[:, 0, 0]) * (t2[:, 1, 1] - t2[:, 0, 1]))
+    n = len(me.polygons)
+    return np.bincount(poly, a3, n), np.bincount(poly, a2, n), uv
+
+
+def prepare_repack(o):
+    """--export-only --unwrap: the unrolled faces (pe_wrap = 1) still carry the previous pack's UVs, i.e. object units
+    x the pe_texel of that pack x its pack scale, which unwrap() records as pe_uvscale. Bring them back to object
+    units, as a fresh build has them, so the texel step and the pack treat them like the Smart UV islands (otherwise
+    they shrink by the old factor on every run). Dividing by that recorded factor, not by the current pe_texel, is
+    what lets an edited pe_texel change the piece's whole share (unrolled and Smart UV faces alike).
+    Unrolled faces whose UVs have collapsed (an extrusion in Blender copies pe_wrap = 1 and duplicates the edge
+    UVs, leaving zero UV area) are handed to Smart UV Project instead."""
+    me = o.data
+    W = me.attributes.get("pe_wrap") or me.attributes.new("pe_wrap", "INT", "FACE")
+    wf = np.zeros(len(me.polygons), np.int32)
+    W.data.foreach_get("value", wf)
+    a3, a2, uv = poly_areas(me)
+    wrap = (wf == 1) & (a3 > 1e-12)
+    if not wrap.any(): return
+    med = float(np.median(a2[wrap] / a3[wrap]))
+    bad = wrap & (a2 < 1e-3 * med * a3)    # linear texel density below ~3 % of the piece's
+    if bad.any():
+        wf[bad] = 0
+        W.data.foreach_set("value", wf)
+        log(f"{o.name}: {int(bad.sum())} unrolled faces have collapsed UVs; Smart UV Project takes them")
+    keep = (wf == 1) & (a3 > 1e-12)
+    texel, pack, k = o.get("pe_texel", 1.0), o.get("pe_pack"), o.get("pe_uvscale")
+    if not k and pack:
+        # a kit.blend from before pe_uvscale: its last pack used the script's texel weight (a fresh build sets it)
+        then = PIECE_TEXEL.get(VARIANTS.get(o.name, o.name), texel)
+        if abs(then - texel) > 1e-9:
+            log(f"{o.name}: kit.blend predates pe_uvscale; taking its last pack's texel weight as the script's {then}")
+        k = pack * then
+    elif k and pack and abs(k / pack - texel) > 1e-6 * texel:
+        log(f"{o.name}: pe_texel changed from {k / pack:.4g} to {texel:.4g} since the last pack: the piece's whole "
+            f"atlas share follows it")
+    if not k: k = math.sqrt(a2[keep].sum() / max(a3[keep].sum(), 1e-12))
+    sel = (wf == 1)[loop_polygons(me)]
+    uv[sel] /= k
+    me.uv_layers["atlas"].data.foreach_set("uv", uv.ravel())
+
+
+def unwrap(obs, repack=False):
     """Smart UV Project the faces that were not unrolled while modelling (face attribute pe_wrap = 0), weight
-    every piece's islands by its texel share, and pack everything into the atlas."""
+    every piece's islands by its texel share, and pack everything into the atlas. The pack's scale is kept in
+    each object's pe_pack, so a later --export-only --unwrap can undo it (repack=True)."""
     for o in obs: o.data.uv_layers.active = o.data.uv_layers["atlas"]
+    if repack:
+        for o in obs: prepare_repack(o)
     select_only(obs)
     bpy.ops.object.mode_set(mode="EDIT")
     for o in obs:
@@ -1394,9 +1697,7 @@ def unwrap(obs):
         a3 = 0.5 * np.linalg.norm(np.cross(t3[:, 1] - t3[:, 0], t3[:, 2] - t3[:, 0]), axis=1).sum()
         t2 = uv[tri[smart]]
         a2 = 0.5 * np.abs((t2[:, 1, 0] - t2[:, 0, 0]) * (t2[:, 2, 1] - t2[:, 0, 1]) - (t2[:, 2, 0] - t2[:, 0, 0]) * (t2[:, 1, 1] - t2[:, 0, 1])).sum()
-        lstart = np.empty(len(me.polygons), np.int32); me.polygons.foreach_get("loop_start", lstart)
-        ltotal = np.empty(len(me.polygons), np.int32); me.polygons.foreach_get("loop_total", ltotal)
-        loop_smart = np.repeat(wf == 0, ltotal)
+        loop_smart = (wf == 0)[loop_polygons(me)]
         uv[loop_smart] *= math.sqrt(a3 / max(a2, 1e-12))
         me.uv_layers["atlas"].data.foreach_set("uv", uv.ravel())
     # texel weighting: a piece's share of the atlas follows its typical size in game, not its model units
@@ -1405,18 +1706,111 @@ def unwrap(obs):
         uv = np.empty(len(o.data.loops) * 2, np.float32)
         o.data.uv_layers["atlas"].data.foreach_get("uv", uv)
         o.data.uv_layers["atlas"].data.foreach_set("uv", uv * f)
+    before = sum(poly_areas(o.data)[1].sum() for o in obs)
     bpy.ops.object.mode_set(mode="EDIT")
     bpy.ops.mesh.select_all(action="SELECT")
-    bpy.ops.uv.pack_islands(rotate=True, scale=True, margin_method="FRACTION", margin=0.0022, shape_method="CONCAVE")
+    # 3 px between islands at 2048: the 1 px bake margin and the push-pull fill (bake) cover the gaps
+    bpy.ops.uv.pack_islands(rotate=True, scale=True, margin_method="FRACTION", margin=PACK_MARGIN, shape_method="CONCAVE")
     bpy.ops.object.mode_set(mode="OBJECT")
+    after = sum(poly_areas(o.data)[1].sum() for o in obs)
+    k = math.sqrt(after / max(before, 1e-12))
+    for o in obs:
+        o["pe_pack"] = k
+        o["pe_uvscale"] = k * o.get("pe_texel", 1.0)   # the whole factor on the unrolled UVs, for prepare_repack
+    log(f"packed: scale {k:.4f}, islands cover {100 * after:.1f} % of the atlas")
+
+
+def drip_sources(ob):
+    """Per-vertex attribute pe_drip for the wear material: 1 right under an overhang (flange, boss, scroll, bolt
+    head), falling linearly to 0 at DRIP_REACH below it, 0 with nothing above and on up/down-facing surfaces.
+    "Above" is world +Z for the object's current rotation, so an inverted variant gets drips running the other way.
+    Four rays per vertex against the piece itself: straight up, and tilted 17 degrees outward and to both sides in
+    the vertex's own frame (never inward, where a ray would graze the same convex surface). Two smoothing passes
+    over the mesh edges keep neighbouring columns from jumping (which shows as grime gores)."""
+    from mathutils.bvhtree import BVHTree
+    me = ob.data
+    texel = max(float(ob.get("pe_texel", 1.0)), 0.02)
+    reach, eps = DRIP_REACH / texel, 0.003 / texel
+    up = (ob.matrix_world.to_3x3().inverted() @ Vector((0, 0, 1))).normalized()
+    bvh = BVHTree.FromPolygons([v.co for v in me.vertices], [tuple(p.vertices) for p in me.polygons])
+    ct, st = math.cos(math.radians(17)), math.sin(math.radians(17))
+    vals = np.zeros(len(me.vertices), np.float32)
+    for i, v in enumerate(me.vertices):
+        n = v.normal
+        if abs(n.dot(up)) > 0.85: continue
+        h = (n - up * n.dot(up)).normalized()       # outward, horizontal
+        t = up.cross(h)
+        o = v.co + n * eps
+        acc = 0.0
+        for d in (up, up * ct + h * st, up * ct + t * st, up * ct - t * st):
+            hit = bvh.ray_cast(o, d, reach)
+            if hit[0] is not None: acc += 1.0 - hit[3] / reach
+        vals[i] = acc / 4
+    ev = np.empty(len(me.edges) * 2, np.int64); me.edges.foreach_get("vertices", ev); ev = ev.reshape(-1, 2)
+    deg = np.bincount(ev.ravel(), minlength=len(vals)).astype(np.float32)
+    for _ in range(2):
+        nb = np.bincount(ev[:, 0], vals[ev[:, 1]], len(vals)) + np.bincount(ev[:, 1], vals[ev[:, 0]], len(vals))
+        vals = np.where(deg > 0, 0.5 * vals + 0.5 * nb / np.maximum(deg, 1), vals).astype(np.float32)
+    attr = me.attributes.get("pe_drip")
+    if attr is None or attr.domain != "POINT" or attr.data_type != "FLOAT":
+        if attr is not None: me.attributes.remove(attr)
+        attr = me.attributes.new("pe_drip", "FLOAT", "POINT")
+    attr.data.foreach_set("value", vals)
+    return float((vals > 0.05).mean())
+
+
+def push_pull(img, valid):
+    """Fill the texels where `valid` is False from the valid ones (push-pull): average down a 2x2 pyramid with
+    weight 0 on empty texels, then on the way back up fill each level's empty texels from the next coarser level
+    (bilinear). The valid texels are returned unchanged. Every mip level the plugin builds then stays close to
+    the island colours, instead of averaging toward the black, fully glossy padding."""
+    def down(a):
+        if a.shape[0] % 2: a = np.concatenate([a, a[-1:]], axis=0)
+        if a.shape[1] % 2: a = np.concatenate([a, a[:, -1:]], axis=1)
+        return a.reshape(a.shape[0] // 2, 2, a.shape[1] // 2, 2, *a.shape[2:]).sum(axis=(1, 3))
+
+    def up(a, shape):
+        for ax in (0, 1):
+            p = np.concatenate([a.take([0], axis=ax), a, a.take([-1], axis=ax)], axis=ax)
+            n = a.shape[ax]
+            lo = 0.75 * p.take(range(1, n + 1), axis=ax) + 0.25 * p.take(range(0, n), axis=ax)
+            hi = 0.75 * p.take(range(1, n + 1), axis=ax) + 0.25 * p.take(range(2, n + 2), axis=ax)
+            a = np.stack([lo, hi], axis=ax + 1).reshape(*a.shape[:ax], 2 * n, *a.shape[ax + 1:])
+        return a[:shape[0], :shape[1]]
+
+    w = valid.astype(np.float64)
+    c = np.where(valid[..., None], img, 0.0).astype(np.float64)
+    levels = [(c, w)]
+    while min(c.shape[:2]) > 1:
+        c, w = down(c), down(w)
+        levels.append((c, w))
+    c, w = levels[-1]
+    filled = c / np.maximum(w, 1e-12)[..., None]
+    for c, w in reversed(levels[:-1]):
+        filled = np.where((w > 0)[..., None], c / np.maximum(w, 1e-12)[..., None], up(filled, c.shape))
+    out = np.array(img, dtype=np.float32, copy=True)
+    out[~valid] = filled[~valid]
+    return out
+
+
+def drips(obs):
+    """The bake's first step (pe_drip), run before the export streams are taken, as when they were taken after
+    the bake (the attribute is not exported)."""
+    for o in obs:
+        share = drip_sources(o)
+        log(f"{o.name}: drip sources on {100 * share:.0f} % of the vertices")
 
 
 def bake(obs, size, quality, out_dir, debug=False):
+    """Bake the atlas of obs (drips() has run) and write kit_atlas.png / kit_atlas_n.png (and the debug maps) to
+    out_dir."""
     sc = bpy.context.scene
     sc.render.engine = "CYCLES"
     sc.cycles.device = "CPU"
     sc.cycles.use_denoising = False
-    sc.render.bake.margin = max(4, size // 256)
+    # Blender extends each object's islands by the margin on its own, over any other object's texels in reach, so
+    # the margin stays under half the gap between islands (1 px at 2048); push_pull fills the rest of the padding
+    sc.render.bake.margin = max(1, int(PACK_MARGIN * size / 2))
     mats = {m for o in obs for m in o.data.materials if m and m.node_tree.nodes.get("pe_emit")}
     imgs = {}
     for k in ("mask", "color", "rough", "normal"):
@@ -1468,16 +1862,27 @@ def bake(obs, size, quality, out_dir, debug=False):
         save_png(os.path.join(out_dir, "debug_color.png"), np.where(lin_c <= 0.0031308, lin_c * 12.92, 1.055 * np.power(lin_c, 1 / 2.4) - 0.055))
         save_png(os.path.join(out_dir, "debug_rough.png"), np.repeat(np.clip(rough[..., 0:1], 0, 1), 3, axis=2))
     ao = np.clip(mask[..., 0:1], 0, 1)
-    shade = 0.38 + 0.62 * ao ** 1.3                         # baked ambient occlusion
+    shade = 0.55 + 0.45 * ao ** 1.3                         # baked ambient occlusion, with a light floor
     lin = np.clip(col[..., :3] * shade, 0, 1)
     srgb = np.where(lin <= 0.0031308, lin * 12.92, 1.055 * np.power(lin, 1 / 2.4) - 0.055)
     r = np.clip(rough[..., 0:1], 0, 1)
     gloss = np.clip((0.9 - r) / 0.78, 0, 1) ** 1.25            # bare metal glossy, grime and soot matte
-    save_png(os.path.join(out_dir, "kit_atlas.png"), np.concatenate([srgb, gloss], axis=2))
-    n = np.clip(nrm[..., :3], 0, 1)
-    empty = (nrm[..., 3] <= 0) | (np.abs(nrm[..., :3]).sum(axis=2) < 1e-6)
-    n[empty] = (0.5, 0.5, 1.0)
-    save_png(os.path.join(out_dir, "kit_atlas_n.png"), n)
+    # texels outside the islands and their bake margin: filled from the islands (push-pull), so they are neither
+    # black nor fully glossy in the mip levels
+    valid = (col[..., 3] > 0) & (rough[..., 3] > 0)
+    if debug:
+        save_png(os.path.join(out_dir, "debug_valid.png"), np.stack([valid, col[..., 3] > 0, rough[..., 3] > 0], axis=2).astype(np.float32))
+    lum = 0.2126 * srgb[..., 0] + 0.7152 * srgb[..., 1] + 0.0722 * srgb[..., 2]
+    log(f"atlas: islands + margin cover {100 * valid.mean():.1f} %; used-texel median {np.median(lum[valid]):.3f} sRGB, "
+        f"gloss median {np.median(gloss[..., 0][valid]):.2f}")
+    save_png(os.path.join(out_dir, "kit_atlas.png"), push_pull(np.concatenate([srgb, gloss], axis=2), valid))
+    nv = np.clip(nrm[..., :3], 0, 1) * 2 - 1
+    nvalid = (nrm[..., 3] > 0) & (np.abs(nrm[..., :3]).sum(axis=2) > 1e-6)
+    nv = push_pull(nv, nvalid)
+    fill = nv[~nvalid]
+    fill[:, 2] = np.maximum(fill[:, 2], 0.2)
+    nv[~nvalid] = fill / np.linalg.norm(fill, axis=1, keepdims=True)
+    save_png(os.path.join(out_dir, "kit_atlas_n.png"), np.clip(nv * 0.5 + 0.5, 0, 1))
 
 
 def save_png(path, arr):
@@ -1493,10 +1898,14 @@ def save_png(path, arr):
     sc.render.image_settings.color_mode = "RGBA" if c == 4 else "RGB"
     img.save()
     bpy.data.images.remove(img)
-    log(f"wrote {path}")
+    log(f"wrote {os.path.basename(path)}")
 
 
 # ================================================================================================ export
+
+class ExportError(Exception):
+    pass
+
 
 def mesh_streams(me):
     """Deduplicated vertex streams (Unity axes) and triangle indices (Unity winding) of an evaluated mesh,
@@ -1534,6 +1943,39 @@ def mesh_streams(me):
     return pos, n_u, t_u, uv[first], idx.ravel().astype(np.int32)
 
 
+def tangent_frame_check(streams):
+    """How Unity will use the exported frame (ASSETS.md 2): tangent.xyz along +U and binormal = cross(N, T) * w along
+    +V. Returns the area-weighted share of triangle corners that agree, for U and for V (UV-degenerate triangles
+    are skipped). A flipped w or an unswapped axis scores about 0 to 0.5."""
+    pos, nor, tan, uv, idx = streams
+    t = idx.reshape(-1, 3)
+    p, u = pos.astype(np.float64), uv.astype(np.float64)
+    e1, e2 = p[t[:, 1]] - p[t[:, 0]], p[t[:, 2]] - p[t[:, 0]]
+    d1, d2 = u[t[:, 1]] - u[t[:, 0]], u[t[:, 2]] - u[t[:, 0]]
+    det = d1[:, 0] * d2[:, 1] - d2[:, 0] * d1[:, 1]
+    ok = np.abs(det) > 1e-12
+    e1, e2, d1, d2, det, t = e1[ok], e2[ok], d1[ok], d2[ok], det[ok], t[ok]
+    dpdu = (d2[:, 1:2] * e1 - d1[:, 1:2] * e2) / det[:, None]
+    dpdv = (d1[:, 0:1] * e2 - d2[:, 0:1] * e1) / det[:, None]
+    area = 0.5 * np.linalg.norm(np.cross(e1, e2), axis=1)
+    fu = fv = 0.0
+    for k in range(3):
+        T, w, N = tan[t[:, k], :3].astype(np.float64), tan[t[:, k], 3].astype(np.float64), nor[t[:, k]].astype(np.float64)
+        B = np.cross(N, T) * w[:, None]
+        fu += (area * (np.sum(T * dpdu, axis=1) > 0)).sum()
+        fv += (area * (np.sum(B * dpdv, axis=1) > 0)).sum()
+    tot = 3 * area.sum()
+    return fu / max(tot, 1e-30), fv / max(tot, 1e-30)
+
+
+def checked(name, streams):
+    fu, fv = tangent_frame_check(streams)
+    if fu < TANGENT_MIN or fv < TANGENT_MIN:
+        raise ExportError(f"{name}: the tangent frame does not follow the atlas UVs (T along +U {100 * fu:.1f} %, "
+                          f"B along +V {100 * fv:.1f} %, need {100 * TANGENT_MIN:.0f} %): nothing was written")
+    return f"T along +U {100 * fu:.1f} %, B along +V {100 * fv:.1f} %"
+
+
 def piece_anchors(ob):
     out = []
     inv = ob.matrix_world.inverted()
@@ -1542,7 +1984,8 @@ def piece_anchors(ob):
         m = inv @ ch.matrix_world
         p = m.translation
         d = (m.to_3x3() @ Vector((0, 0, 1))).normalized()
-        out.append((ch.name[len(ob.name) + 1:], (p.x, p.z, p.y), (d.x, d.z, d.y)))
+        r6 = lambda *v: tuple(round(x, 6) + 0.0 for x in v)    # drop float noise (and -0.0): variants match exactly
+        out.append((ch.name[len(ob.name) + 1:], r6(p.x, p.z, p.y), r6(d.x, d.z, d.y)))
     return out
 
 
@@ -1561,77 +2004,261 @@ def write_pem(path, streams, anchors):
             f.write(struct.pack("<6f", *p, *d))
 
 
-def export_piece(ob, out_dir):
+def piece_streams(ob):
+    """The LOD0 and LOD1 streams and the anchors of a piece, both levels through the export check (ExportError).
+    Nothing is written here: main() checks every piece before it bakes or writes anything. The streams depend only
+    on the meshes and their atlas UVs, not on the baked images."""
     dg = bpy.context.evaluated_depsgraph_get()
     eo = ob.evaluated_get(dg)
     me = eo.to_mesh()
     s0 = mesh_streams(me)
     eo.to_mesh_clear()
     anchors = piece_anchors(ob)
-    write_pem(os.path.join(out_dir, ob.name + ".pem"), s0, anchors)
+    frame0 = checked(ob.name, s0)
     tris0 = len(s0[4]) // 3
     budget = BUDGET.get(ob.name)
-    log(f"{ob.name}: {len(s0[0])} verts, {tris0} tris (budget {budget}), anchors {[a[0] for a in anchors]}")
+    log(f"{ob.name}: {len(s0[0])} verts, {tris0} tris (budget {budget}), {frame0}, anchors {[a[0] for a in anchors]}")
     if budget and tris0 > budget: log(f"WARNING {ob.name} is over its triangle budget")
-    # LOD1: Decimate (collapse) a copy of the final LOD0 mesh; UVs follow, tangents are recomputed
+    # LOD1: Decimate (collapse) a copy of the final LOD0 mesh; UVs follow, tangents are recomputed. The temporary
+    # object sits at the origin, so it must be gone before the bake whatever happens
     lod_me = bpy.data.meshes.new_from_object(eo, preserve_all_data_layers=True, depsgraph=dg)
     tmp = bpy.data.objects.new(ob.name + "_lod1", lod_me)
     bpy.context.scene.collection.objects.link(tmp)
-    dec = tmp.modifiers.new("pe_decimate", "DECIMATE")
-    dec.decimate_type, dec.use_collapse_triangulate = "COLLAPSE", True
-    wn = tmp.modifiers.new("pe_weighted", "WEIGHTED_NORMAL")
-    wn.mode, wn.weight, wn.keep_sharp = "FACE_AREA", 50, True
-    ratio = LOD1_RATIO
-    for _ in range(4):
-        dec.ratio = ratio
-        dg = bpy.context.evaluated_depsgraph_get()
-        et = tmp.evaluated_get(dg)
-        m1 = et.to_mesh()
-        s1 = mesh_streams(m1)
-        et.to_mesh_clear()
-        if len(s1[4]) // 3 <= 0.30 * tris0: break
-        ratio *= 0.9
-    write_pem(os.path.join(out_dir, ob.name + ".lod1.pem"), s1, anchors)
-    log(f"{ob.name}.lod1: {len(s1[0])} verts, {len(s1[4]) // 3} tris ({100.0 * len(s1[4]) / max(1, len(s0[4])):.0f} %)")
-    bpy.data.objects.remove(tmp)
-    bpy.data.meshes.remove(lod_me)
+    try:
+        dec = tmp.modifiers.new("pe_decimate", "DECIMATE")
+        dec.decimate_type, dec.use_collapse_triangulate = "COLLAPSE", True
+        wn = tmp.modifiers.new("pe_weighted", "WEIGHTED_NORMAL")
+        wn.mode, wn.weight, wn.keep_sharp = "FACE_AREA", 50, True
+        ratio = LOD1_RATIO
+        for _ in range(4):
+            dec.ratio = ratio
+            dg = bpy.context.evaluated_depsgraph_get()
+            et = tmp.evaluated_get(dg)
+            m1 = et.to_mesh()
+            s1 = mesh_streams(m1)
+            et.to_mesh_clear()
+            if len(s1[4]) // 3 <= 0.30 * tris0: break
+            ratio *= 0.9
+    finally:
+        bpy.data.objects.remove(tmp)
+        bpy.data.meshes.remove(lod_me)
+    frame1 = checked(ob.name + ".lod1", s1)
+    log(f"{ob.name}.lod1: {len(s1[0])} verts, {len(s1[4]) // 3} tris ({100.0 * len(s1[4]) / max(1, len(s0[4])):.0f} %), {frame1}")
+    return s0, s1, anchors
+
+
+def variant_streams_check(streams):
+    """check_kit.variant_check on the streams about to be written: an inverted variant has its base's triangles
+    (positions, normals) and anchors, and atlas UVs of its own."""
+    for v, base in VARIANTS.items():
+        if v not in streams or base not in streams: continue
+        (pv, nv, _, uvv, iv), _, av = streams[v]
+        (pb, nb, _, uvb, ib), _, ab = streams[base]
+        if len(iv) != len(ib): err = "triangle count"
+        elif np.abs(pv[iv] - pb[ib]).max() > 1e-5: err = "positions"
+        elif np.abs(nv[iv] - nb[ib]).max() > 2e-3: err = "normals"
+        elif anchors_differ(av, ab): err = "anchors"
+        elif np.abs(uvv[iv] - uvb[ib]).max() < 1e-4: err = "it shares the base's atlas UVs"
+        else: continue
+        raise ExportError(f"{v} does not match its base {base} ({err}): nothing was written; rebuild the variant "
+                          f"with --export-only --unwrap")
+
+
+def write_piece(out_dir, name, s0, s1, anchors):
+    write_pem(os.path.join(out_dir, name + ".pem"), s0, anchors)
+    write_pem(os.path.join(out_dir, name + ".lod1.pem"), s1, anchors)
 
 
 # ================================================================================================ main
 
+def fail(msg):
+    log("ERROR " + msg)
+    sys.stdout.flush()
+    sys.exit(1)
+
+
+def same_path(a, b):
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def single_threaded():
+    """Started with -t 1 / --threads 1 (Blender's own arguments, before "--"), which keeps MikkTSpace on one thread."""
+    a = sys.argv[:sys.argv.index("--")] if "--" in sys.argv else sys.argv
+    return any(x in ("-t", "--threads") and i + 1 < len(a) and a[i + 1] == "1" for i, x in enumerate(a))
+
+
+def clear_scratch():
+    """--only into the default scratch directory: remove what earlier runs left there (their pieces would be shaded
+    with this run's atlas, which no longer holds their islands). Only ever SCRATCH, never a directory given by --out."""
+    gone = 0
+    for f in os.listdir(SCRATCH):
+        piece = f.endswith(".pem") and f.split(".")[0] in NAMES
+        if piece or f in ("kit_atlas.png", "kit_atlas_n.png", "kit.blend") or (f.startswith("debug_") and f.endswith(".png")):
+            os.remove(os.path.join(SCRATCH, f))
+            gone += 1
+    if gone: log(f"cleared {gone} files of earlier runs from {SCRATCH}")
+
+
+def clear_stages(out):
+    """Staging directories left by a run that was killed before it could clean up (and a warning for files a
+    killed commit left renamed aside)."""
+    for f in os.listdir(out):
+        if f.startswith(STAGE_PREFIX) and os.path.isdir(os.path.join(out, f)):
+            shutil.rmtree(os.path.join(out, f), ignore_errors=True)
+            log(f"removed the stale staging directory {f}")
+        elif f.endswith(OLD_SUFFIX):
+            log(f"WARNING {f} in {out} was left by an interrupted run: the previous version of {f[:-len(OLD_SUFFIX)]}")
+
+
+def blend_atlas():
+    """Where the atlas that kit.blend's UVs belong to lives: the shipped kit for tools/blender/kit.blend, else the
+    directory of the open .blend (a --out build saves DIR/kit.blend next to its atlas). None if there is none."""
+    bf = bpy.data.filepath
+    if not bf: return None
+    d = SHIPPED if same_path(bf, os.path.join(HERE, "kit.blend")) else os.path.dirname(bf)
+    return d if os.path.exists(os.path.join(d, "kit_atlas.png")) else None
+
+
+def commit(stage, out):
+    """Move every file of the staging directory into the output (the same volume, so these are renames). The files
+    they replace are first renamed aside; if one cannot be (Windows: open in another program), the others are put
+    back and nothing changes."""
+    files = sorted(os.listdir(stage))
+    aside = []
+    try:
+        for f in files:
+            t = os.path.join(out, f)
+            if os.path.exists(t):
+                os.replace(t, t + OLD_SUFFIX)
+                aside.append(t)
+    except OSError as e:
+        for t in reversed(aside): os.replace(t + OLD_SUFFIX, t)
+        raise RuntimeError(f"cannot replace {e.filename} (open in another program?): {out} is left as it was") from e
+    for f in files:
+        os.replace(os.path.join(stage, f), os.path.join(out, f))
+    for t in aside: os.remove(t + OLD_SUFFIX)
+    log(f"moved {len(files)} files into {out}")
+
+
 def main():
     o = args()
+    shipped = same_path(o["out"], SHIPPED)
+    unknown = [n for n in (o["only"] or []) if n not in NAMES]
+    if unknown: fail(f"unknown piece(s) {unknown}; the pieces are {NAMES}")
+    names = [n for n in NAMES if not o["only"] or n in o["only"]]
+    if o["unwrap"] and not o["bake"]:
+        fail("--unwrap moves the atlas islands, so it needs the bake: drop --no-bake")
+    partial = bool(o["only"])
+    scratch = partial and not o["out_given"]
+    if scratch:
+        o["out"], shipped = SCRATCH, False
+        log(f"--only: writing to {SCRATCH}, the shipped kit is left alone (--out picks another directory)")
+    if not o["bake"] and not o["export_only"]:
+        if shipped:
+            fail("a fresh build always repacks the atlas UVs, so without the bake its .pem files would not match the "
+                 "shipped atlas: drop --no-bake, re-export kit.blend's own UVs with --export-only --no-bake, or pass "
+                 "--out DIR for a geometry look (preview.py --clay)")
+        if not scratch and os.path.exists(os.path.join(o["out"], "kit_atlas.png")):
+            log(f"WARNING a fresh build without the bake repacks the UVs: the .pem files written to {o['out']} need "
+                f"not match the kit_atlas.png there")
+
+    def refuse_partial():
+        # a partial bake clears the other pieces' texels; a partial fresh build packs its pieces over the whole atlas
+        if partial and shipped and (o["bake"] or not o["export_only"]):
+            fail("a partial build (--only, or pieces missing from kit.blend) into the shipped kit would clear every "
+                 "other piece's atlas texels (the bake) or repack the selected pieces over the whole atlas (a fresh "
+                 "build): pass --out DIR")
+
+    refuse_partial()
     os.makedirs(o["out"], exist_ok=True)
-    pieces = [p for p in PIECES if not o["only"] or p[0] in o["only"]]
+    clear_stages(o["out"])
+    if scratch: clear_scratch()
+    if shipped and not single_threaded():
+        log("WARNING writing to the shipped kit without -t 1: MikkTSpace runs multi-threaded on the pumps, so their "
+            "tangents change by ~1e-7 from run to run and the .pem bytes churn (rendering is unaffected); for "
+            "byte-reproducible files run blender -b -t 1 tools/blender/kit.blend -P tools/blender/build_kit.py -- "
+            "--export-only --no-bake afterwards")
+    resynced = []
     if o["export_only"]:
-        obs = [bpy.data.objects[n] for n, _, _ in pieces if n in bpy.data.objects]
-        for ob in obs: add_modifiers(ob)
+        if o["unwrap"]:   # the variants follow any hand edit of their base
+            for v, base in VARIANTS.items():
+                if v in names and base in bpy.data.objects:
+                    make_variant(v, bpy.data.objects[base], NAMES.index(v))
+        missing = [n for n in names if n not in bpy.data.objects]
+        if missing:
+            partial = True
+            log(f"WARNING kit.blend has no {missing}: they are not exported, and a bake clears their atlas texels"
+                + (" (an inverted variant is created from its base by --unwrap)" if any(m in VARIANTS for m in missing) else ""))
+            refuse_partial()
+        for n in names:
+            if n in bpy.data.objects: add_modifiers(bpy.data.objects[n])
         bpy.context.view_layer.update()
-        if o["unwrap"]: unwrap(obs)
+        if not o["unwrap"]: resynced = sync_variants(names, shipped)
+        obs = [bpy.data.objects[n] for n in names if n in bpy.data.objects]
+        if o["unwrap"]: unwrap(obs, repack=True)
     else:
         bpy.ops.wm.read_factory_settings(use_empty=True)
         mats = make_materials()
-        obs = []
-        for i, (n, fn, texel) in enumerate(pieces):
+        made = {}
+        need = set(names) | {VARIANTS[v] for v in names if v in VARIANTS}
+        for n, fn, texel in PIECES:
+            if n not in need: continue
             b, anchors = fn()
             ob = b.to_object(n, mats)
             ob["pe_texel"] = texel
             for k, (pos, d) in anchors.items():
                 anchor(ob, k, pos, d)
-            ob.location = (16.0 * (i % 4), 16.0 * (i // 4), 0)   # apart, so pieces don't occlude each other in the AO bake
-            obs.append(ob)
+            ob.location = grid(NAMES.index(n))
+            made[n] = ob
             log(f"modelled {n}: {len(ob.data.polygons)} faces")
         bpy.context.view_layer.update()
+        for v, base in VARIANTS.items():
+            if v in names: made[v] = make_variant(v, made[base], NAMES.index(v))
+        bpy.context.view_layer.update()
+        obs = [made[n] for n in names]
         unwrap(obs)
-        log("unwrapped")
-    if o["bake"]:
-        bake(obs, o["size"], o["quality"], o["out"], o["debug"])
-    for ob in obs:
-        export_piece(ob, o["out"])
-    if not o["export_only"] and not o["only"]:
-        bpy.ops.wm.save_as_mainfile(filepath=os.path.join(HERE, "kit.blend"), compress=True)
+    if not obs: fail("nothing to export")
+    if o["bake"]: drips(obs)
+    # every piece's streams (both levels), checked before anything is baked or written
+    try:
+        streams = {ob.name: piece_streams(ob) for ob in obs}
+        variant_streams_check(streams)
+    except ExportError as e:
+        fail(str(e))
+    # write everything to a staging directory inside the output, and move it in only once it is complete
+    stage = tempfile.mkdtemp(prefix=STAGE_PREFIX, dir=o["out"])
+    try:
+        if o["bake"]:
+            bake(obs, o["size"], o["quality"], stage, o["debug"])
+        for ob in obs:
+            write_piece(stage, ob.name, *streams[ob.name])
+        commit(stage, o["out"])
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+    # keep a kit.blend that matches the atlas and .pem files just written: tools/blender/kit.blend for the shipped
+    # kit, a copy next to the output otherwise
+    if not partial and (not o["export_only"] or o["unwrap"] or resynced):
+        path = os.path.join(HERE, "kit.blend") if shipped else os.path.join(o["out"], "kit.blend")
+        bpy.ops.wm.save_as_mainfile(filepath=path, compress=True, copy=not shipped)
+        log(f"saved {path}")
+    # how to look at it: these .pem files belong to the atlas just baked, to kit.blend's (an export without the
+    # bake keeps its UVs) or to none (a fresh build without the bake)
+    atlas = o["out"] if o["bake"] else (blend_atlas() if o["export_only"] else None)
+    cmd = f'blender -b --factory-startup -P tools/blender/preview.py -- "{PREVIEW_OUT}" --kit "{o["out"]}"'
+    if partial: cmd += " --only " + ",".join(ob.name for ob in obs)
+    if atlas is None: cmd += " --clay"
+    elif not same_path(atlas, o["out"]): cmd += f' --atlas "{atlas}"'
+    log("review: " + cmd)
+    if not partial: log(f'check:  python tools/blender/check_kit.py "{o["out"]}"')
+    if shipped and not single_threaded():
+        log("WARNING (again) not started with -t 1: the pump .pem files carry run-to-run tangent noise")
     log("done")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:   # Blender exits 0 after an uncaught exception in a -P script: make every failure exit 1
+        import traceback
+        traceback.print_exc()
+        fail("unexpected error (traceback above); the output directory only changes in the final move")

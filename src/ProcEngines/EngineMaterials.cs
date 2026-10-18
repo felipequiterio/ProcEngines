@@ -9,8 +9,10 @@ namespace ProcEngines
     /// Shared materials and their textures (DESIGN.md 8.4, ASSETS.md 5). Every surface loads from
     /// GameData/ProcEngines/PluginData/Surfaces (`name.png` = sRGB albedo + gloss in alpha -> DXT5,
     /// `name_n.png` = OpenGL normal map -> linear, swizzled, DXT5); a missing file falls back, per file, to a texture
-    /// generated here. Textures and materials are created on first use only (carbon-carbon, for example, only when a
-    /// Late-tech bell asks for it). Tiling is baked into the UVs, so one shared material serves every engine and
+    /// generated here (regen_k falls back to the regen textures first). Every surface texture is loaded during LOADING
+    /// (<see cref="Warm"/>, after the first prefab build), so none stalls a scene later; materials are created on
+    /// first use (carbon-carbon only when a Late-tech bell asks for it, the jacket only for a channel-wall engine).
+    /// Tiling is baked into the UVs, so one shared material serves every engine and
     /// identical engines batch. The heat glow is a per-material property block on the glowing slots (KSP
     /// instantiates part materials and keeps its own renderer-wide block, so writing a material won't show).
     ///
@@ -21,12 +23,19 @@ namespace ProcEngines
     public static class EngineMaterials
     {
         public const float RadiativeTile = 0.8f;   // metres per texture repeat on the radiative extension (ASSETS.md 5)
-        public const int TubesPerTile = 16;        // cooling tubes per U repeat of the regen texture
+        public const int TubesPerTile = 32;        // cooling tubes (jacket: lands) per U repeat of regen / regen_k / jacket
         public const float SteelTile = 0.6f;       // metres per texture repeat on steel surfaces
-        public const int CarbonTowsPerTile = 32;   // carbon-carbon twill tows per tile (2.5 cm at the 0.8 m tile)
+        public const int CarbonTowsPerTile = 64;   // carbon-carbon twill tows per tile (12.5 mm at the 0.8 m tile)
 
-        /// <summary>The ASSETS.md 5 surfaces.</summary>
-        public static readonly string[] Surfaces = { "regen", "steel", "bolts", "soot", "niobium", "carbon", "foil", "hotduct", "lines" };
+        /// <summary>The ASSETS.md 5 surfaces. regen_k (kerolox tube wall: regen plus exterior soot toward the exit)
+        /// falls back to regen when its files are missing; jacket (channel wall) has its own generated fallback.</summary>
+        public static readonly string[] Surfaces = { "regen", "regen_k", "jacket", "steel", "bolts", "soot", "niobium", "carbon", "foil", "hotduct", "lines" };
+
+        /// <summary>Positive mip bias on the tube-wall textures: with ~20 mm tubes the 64-texel tube pitch reaches 2-4
+        /// screen pixels at mid range, where the groove / crown pattern sits at the sampling limit and shimmers
+        /// (moire, worst near the silhouettes where anisotropic sampling runs out). Half a mip level blends in the
+        /// next coarser level there; up close the texture is magnified and the bias changes nothing.</summary>
+        public const float TubeMipBias = 0.5f;
 
         public static string ShaderReport = "";
 
@@ -34,50 +43,69 @@ namespace ProcEngines
         public static string TextureReport => string.Join("; ", report.ToArray());
 
         static Shader bumped, emissive;
-        static Material steel, bolts, machine, lines, foil, hotDuct, niobium, carbon, authored;
-        static readonly Dictionary<string, Material> regen = new Dictionary<string, Material>(), soot = new Dictionary<string, Material>();
+        static Material steel, bolts, machine, lines, structure, foil, niobium, carbon, authored;
+        static readonly Dictionary<string, Material> walls = new Dictionary<string, Material>(), soot = new Dictionary<string, Material>(),
+            bellSteel = new Dictionary<string, Material>(), hotDuct = new Dictionary<string, Material>();
         static readonly Dictionary<string, Texture2D> textures = new Dictionary<string, Texture2D>();
         static readonly List<string> report = new List<string>();
         static Texture2D flatNormal, white, glowRamp;
 
         // ------------------------------------------------------------------ public API
 
-        /// <summary>Chamber, mount and convergent: EngineGeometry.MatSteel, MatRegenStatic, MatBolts.</summary>
-        public static Material[] Static(string propellant)
+        /// <summary>Chamber, mount and convergent: EngineGeometry.MatSteel, MatRegenStatic, MatBolts. The wall slot is
+        /// the tube wall (`regen`; never the sooted kerolox variant: the chamber's heat coordinate is 1 at the
+        /// injector, where no plume soot reaches) or, with `channel`, the brazed channel-wall jacket.</summary>
+        public static Material[] Static(string propellant, bool channel = false)
         {
             EnsureShaders();
-            return new[] { Steel(), Regen(propellant), Bolts() };
+            return new[] { Steel(), Wall(WallSurface(false, propellant, channel), propellant), Bolts() };
         }
 
-        /// <summary>Bell: regen tubes, the extension (niobium, or carbon-carbon at the Late tech level), the inside, steel, bolts.</summary>
-        public static Material[] Bell(string techLevel, string propellant)
+        /// <summary>The surface of the cooled wall: the channel-wall `jacket`, else the tube wall, which on a kerolox
+        /// bell that ends in its own exit lip is the sooted `regen_k` and everywhere else (the chamber, and a bell with
+        /// a radiative extension, whose regen section ends at the joint flange, where `regen_k`'s dense band at V = 1
+        /// would sit) the plain `regen`.</summary>
+        public static string WallSurface(bool bell, string propellant, bool channel, bool extension = false) =>
+            channel ? "jacket" : bell && !extension && propellant == "Kerolox" ? "regen_k" : "regen";
+
+        /// <summary>Bell: the regen section (tubes, sooted toward the exit for kerolox without an extension; or the
+        /// channel-wall jacket), the extension (niobium, or carbon-carbon at the Late tech level), the inside, the
+        /// propellant-tinted steel of the hat bands / manifold / joint flange, bolts. `extension`: the built bell
+        /// has a radiative extension (EngineGeometry.HasExtension).</summary>
+        public static Material[] Bell(string techLevel, string propellant, bool channel = false, bool extension = false)
         {
             EnsureShaders();
-            return new[] { Regen(propellant), techLevel == "Late" ? Carbon() : Niobium(), Soot(propellant), Steel(), Bolts() };
+            return new[] { Wall(WallSurface(true, propellant, channel, extension), propellant), techLevel == "Late" ? Carbon() : Niobium(), Soot(propellant), BellSteel(propellant), Bolts() };
         }
 
         /// <summary>Kit: KitBuilder.MatStructure, MatMachine, MatLines, MatHot, MatFoil, MatAuthored (the baked
-        /// atlas of the Blender pieces with its normal map; plain machine steel if the atlas is missing).</summary>
-        public static Material[] Kit()
+        /// atlas of the Blender pieces with its normal map; plain machine steel if the atlas is missing). The hot
+        /// duct is tinted per propellant (sooty for kerosene).</summary>
+        public static Material[] Kit(string propellant = null)
         {
             EnsureShaders();
-            return new[] { Steel(), Machine(), Lines(), HotDuct(), Foil(), Authored() };
+            return new[] { Structure(), Machine(), Lines(), HotDuct(propellant), Foil(), Authored() };
         }
 
-        /// <summary>Approximate blackbody colour of hot metal (K), scaled to read against daylit albedo. Above ~1 a
-        /// channel saturates, so the hottest metal also goes whiter.</summary>
+        static readonly Color[] glowStops = { new Color(0.45f, 0.02f, 0f), new Color(0.95f, 0.2f, 0.02f), new Color(1f, 0.4f, 0.08f), new Color(1f, 0.58f, 0.22f) };
+
+        /// <summary>Approximate blackbody colour of hot metal (K) for _EmissiveColor: dull red at 750 K to orange-yellow
+        /// at ~2000 K. No channel exceeds 1 and alpha is 1 (the shader multiplies by it), so the glow added over
+        /// sunlit metal doesn't wash out to white.</summary>
         public static Color Glow(float tempK)
         {
             if (tempK < 750) return Color.black;
-            float t = (tempK - 750) / 1450f;   // 750 K dull red .. 2200 K yellow-white
-            Color c = Ramp(t, new Color(0.5f, 0.04f, 0f), new Color(1f, 0.25f, 0.04f), new Color(1f, 0.52f, 0.18f), new Color(1f, 0.8f, 0.55f));
-            float brightness = Mathf.Pow(Mathf.Clamp01(t * 1.5f), 1.5f) * 1.15f;
-            return c * brightness;
+            float t = (tempK - 750) / 1450f;   // 750 K .. 2200 K
+            Color c = Ramp(t, glowStops);
+            c *= Mathf.Pow(Mathf.Clamp01(t * 1.25f), 1.6f);
+            c.a = 1f;
+            return c;
         }
 
         // ------------------------------------------------------------------ materials (created on first use)
-        // Gloss maps now scale the specular per texel (mostly 0.2-0.7), so _SpecColor sits higher than it did with
-        // the old opaque albedos (gloss 1 everywhere); the average highlight is similar, with variation.
+        // Gloss maps scale the specular per texel (mostly 0.2-0.7). In-game (gamma colour space) the tint multiplies
+        // the sRGB albedo directly. Metals take a dim, slightly tinted highlight; the tube walls keep a tight lobe so
+        // the highlight follows each tube instead of spreading over several.
 
         static void EnsureShaders()
         {
@@ -104,30 +132,44 @@ namespace ProcEngines
         /// <summary>Primitive machinery (pump housings, COPVs, valves when their pieces are missing): darker cast steel.</summary>
         static Material Machine() { if (machine == null) machine = MakeSurface("machine", bumped, "steel", new Color(0.5f, 0.51f, 0.55f), 0.3f, new Color(0.55f, 0.55f, 0.57f)); return machine; }
 
-        static Material Lines() { if (lines == null) lines = MakeSurface("lines", bumped, "lines", Color.white, 0.45f, new Color(0.85f, 0.85f, 0.86f)); return lines; }
+        /// <summary>Propellant lines: worn, dull stainless (not polished chrome).</summary>
+        static Material Lines() { if (lines == null) lines = MakeSurface("lines", bumped, "lines", new Color(0.9f, 0.9f, 0.91f), 0.45f, new Color(0.52f, 0.52f, 0.53f)); return lines; }
 
-        static Material Foil() { if (foil == null) foil = MakeSurface("foil", bumped, "foil", Color.white, 0.2f, new Color(1f, 0.86f, 0.56f)); return foil; }
+        /// <summary>Kit structure (struts and their end balls, tube flanges, bolt heads, collars, bands): the `lines`
+        /// texture, which is authored for the kit's per-circumference mapping (ASSETS.md 5; the 0.6 m steel tile
+        /// would be squeezed around every strut), tinted a little darker and cooler than the lines, with a duller,
+        /// broader highlight, so structure and plumbing read as different steel.</summary>
+        static Material Structure() { if (structure == null) structure = MakeSurface("structure", bumped, "lines", new Color(0.8f, 0.81f, 0.84f), 0.32f, new Color(0.44f, 0.44f, 0.46f)); return structure; }
 
-        static Material HotDuct()
+        /// <summary>Gold MLI on hydrogen lines: large planar facets with pinpoint glints (tight lobe).</summary>
+        static Material Foil() { if (foil == null) foil = MakeSurface("foil", bumped, "foil", Color.white, 0.6f, new Color(1f, 0.86f, 0.56f)); return foil; }
+
+        /// <summary>Uncooled turbine exhaust / hot-gas duct: heat-tinted Inconel, darkened by soot for kerosene.</summary>
+        static Material HotDuct(string propellant)
         {
-            if (hotDuct != null) return hotDuct;   // Unity null check
-            hotDuct = MakeSurface("hotduct", emissive, "hotduct", Color.white, 0.26f, new Color(0.58f, 0.56f, 0.55f));
-            Glowing(hotDuct, White());
-            return hotDuct;
+            propellant = propellant ?? "";
+            if (hotDuct.TryGetValue(propellant, out Material m) && m != null) return m;   // Unity null check
+            Color tint = propellant == "Kerolox" ? new Color(0.62f, 0.58f, 0.55f) : propellant == "Methalox" ? new Color(0.85f, 0.83f, 0.81f) : Color.white;
+            m = MakeSurface("hotduct-" + PropName(propellant), emissive, "hotduct", tint, 0.26f, new Color(0.4f, 0.39f, 0.38f));
+            Glowing(m, White());
+            hotDuct[propellant] = m;
+            return m;
         }
 
+        /// <summary>Silicide-coated niobium: dark charcoal with a slight sheen.</summary>
         static Material Niobium()
         {
             if (niobium != null) return niobium;
-            niobium = MakeSurface("niobium", emissive, "niobium", Color.white, 0.13f, new Color(0.42f, 0.41f, 0.45f));
+            niobium = MakeSurface("niobium", emissive, "niobium", Color.white, 0.25f, new Color(0.35f, 0.35f, 0.37f));
             Glowing(niobium, GlowRamp());
             return niobium;
         }
 
+        /// <summary>Carbon-carbon: matte charcoal; the weave lives mostly in the normal map.</summary>
         static Material Carbon()
         {
             if (carbon != null) return carbon;
-            carbon = MakeSurface("carbon", emissive, "carbon", Color.white, 0.2f, new Color(0.4f, 0.4f, 0.42f));
+            carbon = MakeSurface("carbon", emissive, "carbon", Color.white, 0.2f, new Color(0.3f, 0.3f, 0.31f));
             Glowing(carbon, GlowRamp());
             return carbon;
         }
@@ -140,15 +182,39 @@ namespace ProcEngines
             return authored;
         }
 
-        /// <summary>Regen tube tint: kerolox engines run their tubes darker and more copper-coloured.</summary>
-        static Material Regen(string propellant)
+        static string PropName(string propellant) => string.IsNullOrEmpty(propellant) ? "default" : propellant;
+
+        /// <summary>
+        /// The cooled wall: `regen` / `regen_k` (brazed tubes) or `jacket` (smooth channel wall), tinted per propellant.
+        /// Kerosene runs the wall to dark oxidised bronze, methane to a warm grey, hydrogen leaves it near neutral.
+        /// The specular is dim and only half tinted (a fired wall has no polished copper left), with a tight lobe on
+        /// the tubes so the highlight runs along each crown; the smooth jacket takes a dimmer, broader sheen.
+        /// </summary>
+        static Material Wall(string surface, string propellant)
         {
             propellant = propellant ?? "";
-            if (regen.TryGetValue(propellant, out Material m) && m != null) return m;
-            Color tint = propellant == "Kerolox" ? new Color(1f, 0.88f, 0.76f) : propellant == "Methalox" ? new Color(1f, 0.95f, 0.9f) : Color.white;
-            Color spec = new Color(0.86f * tint.r, 0.76f * tint.g, 0.64f * tint.b);   // metal: the highlight takes its colour
-            m = MakeSurface("regen-" + (propellant.Length > 0 ? propellant : "default"), bumped, "regen", tint, 0.32f, spec);
-            regen[propellant] = m;
+            string key = surface + "-" + PropName(propellant);
+            if (walls.TryGetValue(key, out Material m) && m != null) return m;
+            bool jacket = surface == "jacket";
+            Color tint = jacket
+                ? (propellant == "Kerolox" ? new Color(0.68f, 0.6f, 0.53f) : propellant == "Methalox" ? new Color(0.84f, 0.81f, 0.78f) : new Color(0.92f, 0.92f, 0.93f))
+                : (propellant == "Kerolox" ? new Color(0.78f, 0.66f, 0.55f) : propellant == "Methalox" ? new Color(0.86f, 0.83f, 0.8f) : new Color(0.92f, 0.92f, 0.92f));
+            Color spec = Color.Lerp(Color.white, tint, 0.5f) * (jacket ? 0.4f : 0.48f);
+            spec.a = 1;
+            m = MakeSurface(key, bumped, surface, tint, jacket ? 0.35f : 0.45f, spec);
+            walls[key] = m;
+            return m;
+        }
+
+        /// <summary>Hat bands, the coolant manifold and the joint flange: steel that shares the bell's firing history
+        /// (bronzed and grimy for kerosene), duller than the clean chamber steel.</summary>
+        static Material BellSteel(string propellant)
+        {
+            propellant = propellant ?? "";
+            if (bellSteel.TryGetValue(propellant, out Material m) && m != null) return m;
+            Color tint = propellant == "Kerolox" ? new Color(0.72f, 0.62f, 0.54f) : propellant == "Methalox" ? new Color(0.78f, 0.76f, 0.74f) : new Color(0.85f, 0.85f, 0.86f);
+            m = MakeSurface("bellsteel-" + PropName(propellant), bumped, "steel", tint, 0.3f, new Color(0.45f, 0.45f, 0.46f));
+            bellSteel[propellant] = m;
             return m;
         }
 
@@ -158,9 +224,25 @@ namespace ProcEngines
             propellant = propellant ?? "";
             if (soot.TryGetValue(propellant, out Material m) && m != null) return m;
             Color tint = propellant == "Kerolox" ? new Color(0.07f, 0.065f, 0.06f) : propellant == "Methalox" ? new Color(0.2f, 0.18f, 0.16f) : new Color(0.42f, 0.32f, 0.26f);
-            m = MakeSurface("soot-" + (propellant.Length > 0 ? propellant : "default"), bumped, "soot", tint, 0.3f, new Color(0.16f, 0.16f, 0.16f));
+            m = MakeSurface("soot-" + PropName(propellant), bumped, "soot", tint, 0.3f, new Color(0.16f, 0.16f, 0.16f));
             soot[propellant] = m;
             return m;
+        }
+
+        static bool warmed;
+
+        /// <summary>LOADING, after the first prefab build: load every surface texture now (decode, mipmaps, DXT5:
+        /// ~125 ms per 2048x1024 file), so a design that first needs one (the channel-wall jacket, carbon-carbon) doesn't
+        /// stall the editor or a vessel load. The default design already loaded most of them; about 8 MiB of VRAM for
+        /// the rest. Materials stay created on first use (cheap once their textures exist).</summary>
+        internal static void Warm()
+        {
+            if (warmed) return;
+            warmed = true;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            int before = textures.Count;
+            foreach (string s in Surfaces) { Surface(s, false); Surface(s, true); }
+            Debug.Log($"[ProcEngines] surfaces warmed: {textures.Count - before} more textures in {sw.Elapsed.TotalMilliseconds:F0} ms");
         }
 
         static Material MakeSurface(string name, Shader sh, string surface, Color tint, float shininess, Color spec) =>
@@ -186,22 +268,66 @@ namespace ProcEngines
 
         // ------------------------------------------------------------------ textures
 
-        /// <summary>A surface's albedo (normal = false) or normal map: the file if it loads, else generated.</summary>
+        /// <summary>Surfaces whose V is clamped: the tube walls' V is the heat coordinate, the bolts tile spans the rim.</summary>
+        public static bool ClampsV(string surface) => surface == "regen" || surface == "regen_k" || surface == "jacket" || surface == "bolts";
+
+        /// <summary>The surface whose textures stand in when `surface`'s own file is missing (regen_k -> regen); null
+        /// when the code-generated fallback is used instead.</summary>
+        public static string FallbackSurface(string surface) => surface == "regen_k" ? "regen" : null;
+
+        /// <summary>Mip bias for a surface's textures (see <see cref="TubeMipBias"/>). The jacket's lands are too faint
+        /// to alias, so it keeps full sharpness.</summary>
+        public static float MipBias(string surface) => surface == "regen" || surface == "regen_k" ? TubeMipBias : 0f;
+
+        /// <summary>The file that would provide a surface's albedo (normal = false) or normal map.</summary>
+        public static string SurfacePath(string surface, bool normal) => Path.Combine(KitAssets.SurfaceDirectory, (normal ? surface + "_n" : surface) + ".png");
+
+        /// <summary>Where <see cref="Surface"/> takes a texture from, judged by which files exist (for tools and tests;
+        /// a file that exists but fails to decode also falls through in game): the path of the surface's own file
+        /// or of its fallback surface's (regen_k -> regen), or null for the code-generated texture of
+        /// `GeneratedSurface(surface)`.</summary>
+        public static string TextureSource(string surface, bool normal)
+        {
+            for (string s = surface; s != null; s = FallbackSurface(s))
+            {
+                string p = SurfacePath(s, normal);
+                if (File.Exists(p)) return p;
+            }
+            return null;
+        }
+
+        /// <summary>The surface whose generated pixels stand in when no file exists along the fallback chain.</summary>
+        public static string GeneratedSurface(string surface)
+        {
+            string s = surface;
+            while (FallbackSurface(s) != null) s = FallbackSurface(s);
+            return s;
+        }
+
+        /// <summary>A surface's albedo (normal = false) or normal map: the file if it loads, else the fallback
+        /// surface's texture (regen_k -> regen), else generated. Each file falls back on its own.</summary>
         static Texture2D Surface(string name, bool normal)
         {
             string key = normal ? name + "_n" : name;
             if (textures.TryGetValue(key, out Texture2D t) && t != null) return t;
-            bool clampV = name == "regen" || name == "bolts";   // regen V is the heat coordinate; bolts span the rim
-            TextureWrapMode wv = clampV ? TextureWrapMode.Clamp : TextureWrapMode.Repeat;
-            t = KitAssets.LoadTexture(Path.Combine(KitAssets.SurfaceDirectory, key + ".png"), normal, TextureWrapMode.Repeat, wv, normal ? -1 : DefaultGloss(name));
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            TextureWrapMode wv = ClampsV(name) ? TextureWrapMode.Clamp : TextureWrapMode.Repeat;
+            float bias = MipBias(name);
+            t = KitAssets.LoadTexture(SurfacePath(name, normal), normal, TextureWrapMode.Repeat, wv, normal ? -1 : DefaultGloss(name), bias);
             string source = "file";
-            if (t == null)
+            string other = t == null ? FallbackSurface(name) : null;
+            if (other != null)
+            {
+                t = Surface(other, normal);
+                source = "-> " + other;
+            }
+            else if (t == null)
             {
                 Color[] px = FallbackPixels(name, normal, out int w, out int h);
-                t = Upload("ProcEngines/" + key + " (generated)", px, w, h, normal, TextureWrapMode.Repeat, wv, true);
+                t = Upload("ProcEngines/" + key + " (generated)", px, w, h, normal, TextureWrapMode.Repeat, wv, true, bias);
                 source = "generated";
             }
-            report.Add($"{key} {source} {t.width}x{t.height} {t.format}");
+            report.Add($"{key} {source} {t.width}x{t.height} {t.format}{(t.mipMapBias != 0 ? $" bias {t.mipMapBias:F2}" : "")} {sw.Elapsed.TotalMilliseconds:F0} ms");
             textures[key] = t;
             return t;
         }
@@ -217,17 +343,19 @@ namespace ProcEngines
                 case "hotduct": return 0.35f;
                 case "foil": return 0.65f;
                 case "lines": return 0.55f;
+                case "jacket": return 0.38f;
                 default: return 0.45f;
             }
         }
 
-        static Texture2D Upload(string name, Color[] px, int w, int h, bool linear, TextureWrapMode wrapU, TextureWrapMode wrapV, bool compress)
+        static Texture2D Upload(string name, Color[] px, int w, int h, bool linear, TextureWrapMode wrapU, TextureWrapMode wrapV, bool compress, float mipBias = 0)
         {
-            var t = new Texture2D(w, h, TextureFormat.RGBA32, true, linear) { name = name, wrapModeU = wrapU, wrapModeV = wrapV, filterMode = FilterMode.Trilinear, anisoLevel = 4 };
+            var t = new Texture2D(w, h, TextureFormat.RGBA32, true, linear) { name = name, wrapModeU = wrapU, wrapModeV = wrapV, filterMode = FilterMode.Trilinear, anisoLevel = 4, mipMapBias = mipBias };
             t.SetPixels(px);
             t.Apply(true, false);
             if (compress && (w & 3) == 0 && (h & 3) == 0) t.Compress(true);
             t.Apply(false, true);
+            t.mipMapBias = mipBias;
             return t;
         }
 
@@ -243,17 +371,25 @@ namespace ProcEngines
             return white;
         }
 
-        /// <summary>Emissive ramp along the radiative extension (V = 0 at the joint, 1 at the exit): the wall is hottest
-        /// where it meets the regen section and cools toward the exit, reddening as it goes. Uncompressed (smooth).</summary>
+        /// <summary>Emissive ramp along the radiative extension (V = 0 at the joint, 1 at the exit; U = the extension's
+        /// 0.8 m tiles around, wrapping): the wall is hottest where it meets the regen section and falls off
+        /// exponentially toward the exit (0.32 at v = 0.3, 0.15 at v = 0.5), reddening as it goes, with faint axial hot
+        /// streaks (8 per tile, wandering a little). Uncompressed (smooth).</summary>
         static Texture2D GlowRamp()
         {
             if (glowRamp == null)
-                glowRamp = Upload("ProcEngines/glow_ramp", Fill(4, 64, (u, v) =>
-                {
-                    float b = Mathf.Pow(1 - 0.92f * v, 2.6f);
-                    return new Color(b, b * (1 - 0.6f * v), b * (1 - 0.85f * v), 1);
-                }), 4, 64, false, TextureWrapMode.Clamp, TextureWrapMode.Clamp, false);
+                glowRamp = Upload("ProcEngines/glow_ramp", Fill(64, 64, GlowRampTexel), 64, 64, false, TextureWrapMode.Repeat, TextureWrapMode.Clamp, false);
             return glowRamp;
+        }
+
+        /// <summary>One texel of the emissive ramp (public for tools; touches no engine state).</summary>
+        public static Color GlowRampTexel(float u, float v)
+        {
+            float b = Mathf.Exp(-3.8f * v);
+            float phase = 8 * u + 0.6f * (Noise(u, v, 16, 3, 71) - 0.5f);   // periodic in u: the streaks tile around
+            float streak = 1 + 0.12f * Mathf.Sin(2 * Mathf.PI * phase) * (0.75f + 0.5f * Noise(u, 0.5f, 8, 1, 73));
+            b *= streak;
+            return new Color(Mathf.Clamp01(b), Mathf.Clamp01(b * (1 - 0.7f * v)), Mathf.Clamp01(b * (1 - 0.92f * v)), 1);
         }
 
         /// <summary>DXT5nm-style texel for a tangent-space normal (nx, ny, 1): x in alpha, y in green, R = B = 1 (see
@@ -273,8 +409,13 @@ namespace ProcEngines
             switch (name)
             {
                 case "regen":
-                    if (normal) { w = 512; h = 64; return RegenNormal(w, h); }
-                    w = 512; h = 256; return Fill(w, h, RegenAlbedo);
+                case "regen_k":   // in game regen_k uses the regen textures when its own files are missing
+                    // 32 texels per tube (the files carry 64)
+                    if (normal) { w = 32 * TubesPerTile; h = 128; return RegenNormal(w, h); }
+                    w = 32 * TubesPerTile; h = 256; return Fill(w, h, RegenAlbedo);
+                case "jacket":
+                    if (normal) { w = 16 * TubesPerTile; h = 128; return JacketNormal(w, h); }
+                    w = 16 * TubesPerTile; h = 256; return Fill(w, h, JacketAlbedo);
                 case "steel":
                     w = 256; h = 256;
                     return normal ? FromHeight(w, h, SteelHeight, 2f, true) : Fill(w, h, SteelAlbedo);
@@ -288,11 +429,11 @@ namespace ProcEngines
                     w = 256; h = 256;
                     return normal ? FromHeight(w, h, NiobiumHeight, 3f, true) : Fill(w, h, NiobiumAlbedo);
                 case "carbon":
-                    w = 256; h = 256;
+                    w = h = 8 * CarbonTowsPerTile;   // 8 texels per tow
                     return Fill(w, h, normal ? (Func<float, float, Color>)CarbonNormal : CarbonAlbedo);
                 case "foil":
                     w = 256; h = 256;
-                    return normal ? FromHeight(w, h, FoilHeight, 14f, true) : Fill(w, h, FoilAlbedo);
+                    return normal ? FromHeight(w, h, FoilHeight, 10f, true) : Fill(w, h, FoilAlbedo);
                 case "hotduct":
                     w = 256; h = 256;
                     return normal ? FromHeight(w, h, HotDuctHeight, 6f, true) : Fill(w, h, HotDuctAlbedo);
@@ -394,16 +535,25 @@ namespace ProcEngines
             return best;
         }
 
-        static Color Ramp(float t, params Color[] stops)
+        /// <summary>Piecewise-linear ramp through `stops` (no allocation: pass a cached array).</summary>
+        static Color Ramp(float t, Color[] stops)
         {
             t = Mathf.Clamp01(t) * (stops.Length - 1);
             int i = Mathf.Min(Mathf.FloorToInt(t), stops.Length - 2);
             return Color.Lerp(stops[i], stops[i + 1], t - i);
         }
 
+        // heat tint stops after the bare metal: straw, bronze, purple, blue, grey
+        static readonly Color[] heatStops = { Color.clear, new Color(0.74f, 0.63f, 0.42f), new Color(0.56f, 0.4f, 0.26f),
+            new Color(0.42f, 0.3f, 0.36f), new Color(0.33f, 0.36f, 0.48f), new Color(0.36f, 0.36f, 0.38f) };
+
         /// <summary>Heat tint of stainless/Inconel by how hot it ran: bare, straw, bronze, purple, blue, grey.</summary>
-        static Color HeatTint(Color bare, float heat) => Ramp(heat, bare, new Color(0.74f, 0.63f, 0.42f), new Color(0.56f, 0.4f, 0.26f),
-            new Color(0.42f, 0.3f, 0.36f), new Color(0.33f, 0.36f, 0.48f), new Color(0.36f, 0.36f, 0.38f));
+        static Color HeatTint(Color bare, float heat)
+        {
+            float t = Mathf.Clamp01(heat) * (heatStops.Length - 1);
+            if (t < 1) return Color.Lerp(bare, heatStops[1], t);
+            return Ramp(heat, heatStops);
+        }
 
         static Color WithGloss(Color c, float gloss) { c.a = Mathf.Clamp01(gloss); return c; }
 
@@ -416,16 +566,17 @@ namespace ProcEngines
             float x = 2 * (tu - tube) - 1;
             float crown = Mathf.Sqrt(Mathf.Max(1 - x * x, 0));
             float streak = Noise(tube / (float)TubesPerTile, v, TubesPerTile, 10, 7);
-            float heat = Mathf.Pow(1 - v, 1.6f) * 0.95f + (streak - 0.5f) * 0.2f + (Hash(tube, 0, 3) - 0.5f) * 0.12f;
-            Color bare = new Color(0.68f, 0.63f, 0.56f) * (0.92f + 0.12f * Hash(tube, 1, 5));
+            // a graded, streaky heat band near the throat, irregular per tube
+            float heat = Mathf.Pow(1 - v, 2.6f) * 0.95f + (streak - 0.5f) * 0.22f + (Hash(tube, 0, 3) - 0.5f) * 0.1f;
+            Color bare = new Color(0.66f, 0.62f, 0.56f) * (0.95f + 0.07f * Hash(tube, 1, 5));
             Color c = HeatTint(bare, heat);
-            float grime = Fbm(u, v, 64, 4, 9, 3);                           // streaks running along the tubes
-            float dent = Smooth(0.72f, 0.8f, Fbm(u, v, 32, 8, 13, 3));       // small dents and handling marks
-            c *= (0.86f + 0.2f * grime) * (1 - 0.12f * dent);
-            c *= 0.55f + 0.45f * crown;                                      // dark grooves between tubes
+            float grime = Fbm(u, v, 2 * TubesPerTile, 4, 9, 3);              // streaks running along the tubes
+            float dent = Smooth(0.72f, 0.8f, Fbm(u, v, TubesPerTile, 8, 13, 3));   // small dents and handling marks
+            c *= (0.88f + 0.16f * grime) * (1 - 0.1f * dent);
+            c *= 0.7f + 0.3f * crown;                                         // grooves between tubes (soft AO)
             bool fillet = Mathf.Abs(x) > 0.86f;
-            if (fillet) c = Color.Lerp(c, new Color(0.6f, 0.52f, 0.38f), 0.5f) * (0.8f + 0.2f * grime);   // braze fillet
-            float gloss = fillet ? 0.2f : 0.22f + 0.5f * crown * crown;
+            if (fillet) c = Color.Lerp(c, new Color(0.56f, 0.5f, 0.4f), 0.45f) * (0.85f + 0.15f * grime);   // braze fillet
+            float gloss = fillet ? 0.18f : 0.2f + 0.4f * crown * crown;
             gloss *= (0.75f + 0.4f * grime) * (1 - 0.3f * Mathf.Clamp01(heat)) * (1 - 0.3f * dent);
             return WithGloss(c, gloss);
         }
@@ -433,7 +584,7 @@ namespace ProcEngines
         static Color[] RegenNormal(int w, int h)
         {
             // dents: a small height field; the tube profile itself is analytic (convex: tilts toward +U on the +U side)
-            var px = FromHeight(w, h, (u, v) => -Smooth(0.72f, 0.8f, Fbm(u, v, 32, 8, 13, 3)) * 0.5f, 1.5f, false);
+            var px = FromHeight(w, h, (u, v) => -Smooth(0.72f, 0.8f, Fbm(u, v, TubesPerTile, 8, 13, 3)) * 0.5f, 1.5f, false);
             for (int y = 0; y < h; y++)
                 for (int x = 0; x < w; x++)
                 {
@@ -448,6 +599,52 @@ namespace ProcEngines
         }
 
         static float Sq(float x) => x * x;
+
+        // ---- jacket: channel-wall jacket (staged combustion, full flow, Late gas generator). Same UV contract as
+        // regen: TubesPerTile milled lands per U repeat, V = heat coordinate (clamped). A smooth brazed sheet, neutral
+        // grey (the propellant tint multiplies it), faint pillowing over the lands, one seam weld per tile, a
+        // desaturated heat band near the throat at about half the tubes' strength, grime streaks toward the exit.
+
+        const float JacketSeamU = 12.5f / TubesPerTile;   // the seam runs along the middle of one land per tile
+
+        static float JacketSeam(float u) => Smooth(0.006f, 0.0015f, Mathf.Abs(u - JacketSeamU));
+
+        static Color JacketAlbedo(float u, float v)
+        {
+            float mottle = Fbm(u, v, 4, 4, 81);
+            float streak = Noise(u, v, 3 * TubesPerTile, 3, 82);
+            float heat = 0.5f * (Mathf.Pow(1 - v, 3.5f) * 0.95f + (Noise(u, v, TubesPerTile, 8, 83) - 0.5f) * 0.16f);
+            Color hot = HeatTint(new Color(0.6f, 0.6f, 0.6f), heat) * (0.44f / 0.6f);   // heat colours at the sheet's brightness
+            float lum = (hot.r + hot.g + hot.b) / 3;
+            Color c = Color.Lerp(hot, new Color(lum, lum, lum), 0.45f) * (0.92f + 0.16f * mottle);   // desaturated heat
+            float tu = u * TubesPerTile, x = 2 * (tu - Mathf.Floor(tu)) - 1;
+            c *= 0.975f + 0.03f * (1 - x * x);                                                       // faint pillowing
+            float grime = streak * Smooth(0.3f, 1f, v) * Smooth(0.35f, 0.7f, Fbm(u, v, 6, 2, 84, 2));   // toward the exit
+            c *= 1 - 0.3f * grime;
+            float seam = JacketSeam(u);
+            c = Color.Lerp(c, new Color(0.38f, 0.33f, 0.27f), 0.65f * seam);                          // weld bead
+            float gloss = 0.4f + 0.08f * (mottle - 0.5f) - 0.12f * grime - 0.1f * Mathf.Clamp01(2 * heat) - 0.12f * seam;
+            return WithGloss(c, gloss);
+        }
+
+        static Color[] JacketNormal(int w, int h)
+        {
+            // small dents (height field), then the analytic land pillowing (about a tenth of a tube crown's slope) and
+            // the raised seam bead
+            var px = FromHeight(w, h, (u, v) => -0.5f * Smooth(0.74f, 0.8f, Fbm(u, v, TubesPerTile / 2, 8, 85, 3)), 1f, false);
+            for (int y = 0; y < h; y++)
+                for (int x = 0; x < w; x++)
+                {
+                    float u = (x + 0.5f) / w, tu = u * TubesPerTile, xt = 2 * (tu - Mathf.Floor(tu)) - 1;
+                    Color c = px[y * w + x];
+                    float nz = Mathf.Sqrt(Mathf.Max(1 - Sq(c.a * 2 - 1) - Sq(c.g * 2 - 1), 1e-4f));
+                    float nx = (c.a * 2 - 1) / nz + 0.06f * xt, ny = (c.g * 2 - 1) / nz;
+                    float d = u - JacketSeamU;
+                    if (Mathf.Abs(d) < 0.006f) nx += 0.45f * d / 0.006f;   // rounded bead: tilts away from its centre
+                    px[y * w + x] = Normal(nx, ny);
+                }
+            return px;
+        }
 
         // ---- steel: worn stainless / Inconel at SteelTile; circumferential turning marks, mottling, grime down the profile
 
@@ -516,7 +713,8 @@ namespace ProcEngines
             return WithGloss(new Color(k, k, k), 0.08f + 0.18f * flake);
         }
 
-        // ---- niobium: C103 with silicide coating; matte grey-violet, mottled, flow streaks along V, coating chips
+        // ---- niobium: C103 with silicide coating; dark charcoal with a violet cast, mottled, flow streaks along V,
+        // coating chips
 
         static float NiobiumChips(float u, float v) => Smooth(0.76f, 0.8f, Fbm(u, v, 12, 12, 27, 3)) * Smooth(0.4f, 0.6f, Noise(u, v, 4, 4, 28));
 
@@ -527,10 +725,10 @@ namespace ProcEngines
             float m = Fbm(u, v, 4, 4, 23);
             float streak = Noise(u, v, 32, 2, 29);
             float k = 0.84f + 0.16f * m + 0.06f * streak;
-            Color c = new Color(0.5f * k, 0.48f * k, 0.53f * k);
+            Color c = new Color(0.26f * k, 0.255f * k, 0.275f * k);
             float chip = NiobiumChips(u, v);
-            c = Color.Lerp(c, new Color(0.64f, 0.63f, 0.62f), chip);   // bare metal where the coating chipped
-            return WithGloss(c, 0.16f + 0.06f * (m - 0.5f) + 0.3f * chip);
+            c = Color.Lerp(c, new Color(0.58f, 0.57f, 0.56f), chip);   // bare metal where the coating chipped
+            return WithGloss(c, 0.2f + 0.06f * (m - 0.5f) + 0.3f * chip);
         }
 
         // ---- carbon-carbon: 2/2 twill, CarbonTowsPerTile tows per tile; fibre sheen, resin-rich patches
@@ -544,8 +742,9 @@ namespace ProcEngines
             float fibre = Mathf.Sin(across * Mathf.PI);
             float lines = warp ? Noise(u, v, 256, 8, 35) : Noise(u, v, 8, 256, 36);   // individual fibres along the tow
             float resin = Smooth(0.55f, 0.75f, Fbm(u, v, 4, 4, 39, 3));
-            float k = (warp ? 0.165f : 0.13f) * (0.82f + 0.18f * fibre) * (0.9f + 0.14f * lines) * (0.92f + 0.12f * Noise(u, v, 8, 8, 37)) * (1 - 0.25f * resin);
-            return WithGloss(new Color(k, k, k * 1.06f), 0.2f + 0.22f * fibre * (0.6f + 0.4f * lines) + 0.18f * resin);
+            float big = Fbm(u, v, 3, 3, 38, 3);   // large-scale mottling and coating haze
+            float k = 0.16f * (warp ? 1f : 0.88f) * (0.9f + 0.1f * fibre) * (0.94f + 0.08f * lines) * (0.88f + 0.24f * big) * (1 - 0.2f * resin);
+            return WithGloss(new Color(k, k, k * 1.05f), (warp ? 0.34f : 0.28f) * (0.85f + 0.15f * fibre * lines) + 0.12f * resin);
         }
 
         static Color CarbonNormal(float u, float v)
@@ -554,7 +753,7 @@ namespace ProcEngines
             int i = Mathf.FloorToInt(u * tows), j = Mathf.FloorToInt(v * tows);
             bool warp = ((i + j) & 3) < 2;
             float across = 2 * (warp ? u * tows - i : v * tows - j) - 1;   // -1..1 across the tow, convex
-            return warp ? Normal(across * 0.55f, 0) : Normal(0, across * 0.55f);
+            return warp ? Normal(across * 0.8f, 0) : Normal(0, across * 0.8f);
         }
 
         // ---- foil: gold MLI on hydrogen lines; crinkle, tape wraps across U (bands of constant V), a seam along V
@@ -567,32 +766,34 @@ namespace ProcEngines
 
         static float FoilHeight(float u, float v)
         {
-            float crinkle = 1 - Mathf.Abs(2 * Fbm(u, v, 8, 8, 43, 4) - 1);   // ridged: sharp creases
+            float crinkle = 1 - Mathf.Abs(2 * Fbm(u, v, 5, 5, 43, 3) - 1);   // ridged: sharp creases between large facets
             float seam = Smooth(0.012f, 0f, Mathf.Abs(u - 0.5f));            // overlap edge running along V
             return 0.6f * crinkle * (1 - 0.7f * FoilTape(v)) + 0.4f * FoilTape(v) + 0.25f * seam;
         }
 
         static Color FoilAlbedo(float u, float v)
         {
-            float crinkle = 1 - Mathf.Abs(2 * Fbm(u, v, 8, 8, 43, 4) - 1);
-            float k = 0.72f + 0.38f * crinkle;
+            float crinkle = 1 - Mathf.Abs(2 * Fbm(u, v, 5, 5, 43, 3) - 1);
+            float k = 0.8f + 0.24f * crinkle;
             float tape = FoilTape(v);
-            Color c = Color.Lerp(new Color(0.86f * k, 0.66f * k, 0.3f * k), new Color(0.7f, 0.68f, 0.62f) * (0.9f + 0.1f * crinkle), tape);   // tape: duller, silvery
+            Color c = Color.Lerp(new Color(0.8f * k, 0.7f * k, 0.46f * k), new Color(0.7f, 0.68f, 0.62f) * (0.9f + 0.1f * crinkle), tape);   // pale gold; tape: duller, silvery
             float grime = Smooth(0.6f, 0.85f, Fbm(u, v, 4, 4, 45, 3));
             c *= 1 - 0.18f * grime;
             return WithGloss(c, Mathf.Lerp(0.55f + 0.35f * crinkle, 0.35f, tape) - 0.2f * grime);
         }
 
-        // ---- hot duct: uncooled turbine exhaust duct, heat-tinted Inconel mottled straw / blue / purple / brown, soot
+        // ---- hot duct: uncooled turbine exhaust duct, dark heat-tinted Inconel (muted straw / bronze / blue), soot
 
         static float HotDuctHeight(float u, float v) => 0.5f * Fbm(u, v, 6, 6, 51, 4);
 
         static Color HotDuctAlbedo(float u, float v)
         {
             float heat = 0.2f + 0.8f * Fbm(u, v, 3, 3, 47);
-            Color c = HeatTint(new Color(0.6f, 0.6f, 0.62f), heat);
-            float sootMask = Smooth(0.55f, 0.75f, Fbm(u, v, 4, 2, 49, 3)) * (0.6f + 0.4f * Noise(u, v, 32, 2, 50));
-            c = Color.Lerp(c, new Color(0.12f, 0.11f, 0.1f), 0.7f * sootMask);
+            Color c = HeatTint(new Color(0.46f, 0.46f, 0.47f), heat);
+            float lum = (c.r + c.g + c.b) / 3;
+            c = Color.Lerp(c, new Color(lum, lum, lum), 0.35f) * 0.85f;   // muted, darker heat colours
+            float sootMask = Smooth(0.4f, 0.75f, Fbm(u, v, 4, 2, 49, 3)) * (0.6f + 0.4f * Noise(u, v, 32, 2, 50));
+            c = Color.Lerp(c, new Color(0.1f, 0.09f, 0.08f), 0.75f * sootMask);
             return WithGloss(c, 0.34f + 0.1f * (heat - 0.5f) - 0.25f * sootMask);
         }
 
@@ -609,7 +810,7 @@ namespace ProcEngines
             float scratch = Scratches(u, v, 5, 63, 0.004f);
             float k = (0.94f + 0.07f * brush) * (0.92f + 0.12f * mottle) * (1 - 0.12f * smudge) * (1 - 0.15f * grime);
             Color c = new Color(0.7f, 0.7f, 0.71f) * k + new Color(0.08f, 0.08f, 0.08f) * scratch;
-            return WithGloss(c, 0.56f + 0.12f * (brush - 0.5f) - 0.18f * smudge - 0.2f * grime + 0.2f * scratch);
+            return WithGloss(c, 0.45f + 0.08f * (brush - 0.5f) - 0.15f * smudge - 0.25f * grime + 0.2f * scratch);
         }
     }
 }

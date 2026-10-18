@@ -9,7 +9,13 @@ namespace ProcEngines
     /// <summary>Soft integrations, all verified in the Phase 0 spike (SPIKE_RESULTS.md 4, 5).</summary>
     public static class Integrations
     {
-        /// <summary>FAR re-voxelizes on this message; without FAR, render a fresh stock drag cube.</summary>
+        /// <summary>
+        /// FAR re-voxelizes on this message; without FAR, render a fresh stock drag cube. KSPCommunityFixes' drag-cube
+        /// patch renders the live part (stock renders a clone) and takes each renderer's bounds through
+        /// MeshFilter.mesh, which makes Unity copy every shared render mesh into a per-filter "&lt;name&gt; Instance" and
+        /// point the filter at it. The filters under the model are put back afterwards, and the copies (used only for
+        /// their bounds, which equal the originals') destroyed, also when the render throws.
+        /// </summary>
         public static void NotifyAero(Part part)
         {
             if (KspData.FarPresent)
@@ -18,12 +24,33 @@ namespace ProcEngines
                 return;
             }
             if (DragCubeSystem.Instance == null) return;
-            DragCube cube = DragCubeSystem.Instance.RenderProceduralDragCube(part);
+            Transform model = part.transform.Find("model");
+            MeshFilter[] filters = model != null ? model.GetComponentsInChildren<MeshFilter>(true) : new MeshFilter[0];
+            var meshes = new Mesh[filters.Length];
+            for (int i = 0; i < filters.Length; i++) meshes[i] = filters[i].sharedMesh;
+            DragCube cube;
+            try { cube = DragCubeSystem.Instance.RenderProceduralDragCube(part); }
+            finally { PutBack(filters, meshes); }
             part.DragCubes.ClearCubes();
             part.DragCubes.Cubes.Add(cube);
             part.DragCubes.ResetCubeWeights();
             part.DragCubes.ForceUpdate(true, true, false);
             part.DragCubes.SetDragWeights();
+        }
+
+        /// <summary>Every filter whose mesh changed gets its own back; the mesh it had instead is destroyed unless it is
+        /// one of the snapshot's (only a copy made during the call can be new).</summary>
+        static void PutBack(MeshFilter[] filters, Mesh[] meshes)
+        {
+            for (int i = 0; i < filters.Length; i++)
+            {
+                MeshFilter f = filters[i];
+                if (f == null) continue;
+                Mesh now = f.sharedMesh;
+                if (now == meshes[i]) continue;
+                if (now != null && Array.IndexOf(meshes, now) < 0) UnityEngine.Object.Destroy(now);
+                f.sharedMesh = meshes[i];
+            }
         }
 
         /// <summary>

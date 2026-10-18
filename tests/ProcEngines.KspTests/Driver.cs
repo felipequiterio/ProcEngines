@@ -350,6 +350,34 @@ namespace ProcEngines.KspTests
             Check("nodes", g0 < 1e-3f && g1 < 1e-3f && moved > 0.1f && drift < 1e-3f, $"gap {g0:F5} -> {g1:F5}, decoupler pushed {moved:F3} m, back to start drift {drift:F6} m");
             yield return Shot("stack");
 
+            // mesh cache: two engines with the same design share their render meshes; changing one gives it its own
+            {
+                string tankName = FirstAvailable("fuelTankSmallFlat", "fuelTankSmall", "fuelTank");
+                string probeName = FirstAvailable("probeCoreOcto", "probeCoreOcto.v2");
+                yield return LoadCraft(WriteCraft("PE_Pair", new List<CP>
+                {
+                    new CP(probeName),
+                    new CP(PartName) { parent = 0, pNode = "bottom", myNode = "top" },
+                    new CP(tankName) { parent = 1, pNode = "bottom", myNode = "top" },
+                    new CP(PartName) { parent = 2, pNode = "bottom", myNode = "top" },
+                }));
+                var pair = EditorLogic.fetch.ship.parts.SelectMany(pp => pp.FindModulesImplementing<ModuleProcEngine>()).ToList();
+                EngineDesign same = D("Kerolox", "GasGenerator", 400, 90, 18);
+                foreach (ModuleProcEngine pe in pair) pe.SetDesign(same);
+                yield return new WaitForSecondsRealtime(2f);
+                Mesh Mesh0(ModuleProcEngine pe, string path) => pe.part.transform.Find("model/peRoot/" + path).GetComponent<MeshFilter>().sharedMesh;
+                bool shared = pair.Count == 2 && Mesh0(pair[0], "peKit") == Mesh0(pair[1], "peKit") && Mesh0(pair[0], "peGimbal/peBell") == Mesh0(pair[1], "peGimbal/peBell")
+                              && Mesh0(pair[0], "peChamberLod1") == Mesh0(pair[1], "peChamberLod1");
+                pair[1].SetDesign(D("Kerolox", "GasGenerator", 400, 90, 30));
+                yield return new WaitForSecondsRealtime(2f);
+                bool split = pair.Count == 2 && Mesh0(pair[0], "peGimbal/peBell") != Mesh0(pair[1], "peGimbal/peBell") && Mesh0(pair[0], "peGimbal/peBell") != null
+                             && Mesh0(pair[0], "peGimbal/peBell").vertexCount > 0 && Mesh0(pair[1], "peGimbal/peBell").vertexCount > 0;
+                // nothing (e.g. KSPCF's drag-cube patch reading MeshFilter.mesh) may have replaced our meshes with copies
+                var copies = pair.SelectMany(pe => pe.part.transform.Find("model/peRoot").GetComponentsInChildren<MeshFilter>(true))
+                    .Where(f => f.sharedMesh != null && f.sharedMesh.name.Contains("Instance")).Select(f => f.name).ToList();
+                Check("mesh.cache", shared && split && copies.Count == 0, $"{pair.Count} engines; identical designs share meshes {shared}; after changing one, separate and intact {split}; mesh copies on [{string.Join(", ", copies)}]; far {KspData.FarPresent}");
+            }
+
             // flight: hydrolox upper-ish engine on a small stack, Waterfall + readouts from STATS
             yield return LoadCraft(WriteCraft("PE_Flight", Stack(false)));
             m = Engine(EditorLogic.fetch.ship.parts);
@@ -360,6 +388,7 @@ namespace ProcEngines.KspTests
             EngineStats editorStats = m.Stats;
             FlightDriver.StartWithNewLaunch(flightPath, "Squad/Flags/default", "LaunchPad", new VesselCrewManifest());
             yield return WaitScene(GameScenes.FLIGHT);
+            yield return WaitMeshesReady();
             float tf = Time.realtimeSinceStartup;
             while ((FlightGlobals.ActiveVessel == null || FlightGlobals.ActiveVessel.packed) && Time.realtimeSinceStartup - tf < 60) yield return null;
             yield return new WaitForSecondsRealtime(4f);
@@ -394,6 +423,7 @@ namespace ProcEngines.KspTests
         {
             FlightDriver.StartWithNewLaunch(craftPath, "Squad/Flags/default", "LaunchPad", new VesselCrewManifest());
             yield return WaitScene(GameScenes.FLIGHT);
+            yield return WaitMeshesReady();
             float t0 = Time.realtimeSinceStartup;
             while ((FlightGlobals.ActiveVessel == null || FlightGlobals.ActiveVessel.packed) && Time.realtimeSinceStartup - t0 < 60) yield return null;
             yield return new WaitForSecondsRealtime(3f);
@@ -598,6 +628,24 @@ namespace ProcEngines.KspTests
             Info("lmp", $"scene {HighLogic.LoadedScene}, mode {HighLogic.CurrentGame?.Mode}, vessels {FlightGlobals.Vessels.Count}");
         }
 
+        /// <summary>Flight builds LOD0 a few frames after OnStart (ModuleProcEngine.Lod0Pending): wait until every
+        /// loaded engine has its full meshes, so mesh readouts compare like with like.</summary>
+        IEnumerator WaitMeshesReady(float timeout = 20f)
+        {
+            float t0 = Time.realtimeSinceStartup;
+            while (Time.realtimeSinceStartup - t0 < timeout)
+            {
+                bool pending = false;
+                foreach (Vessel v in FlightGlobals.VesselsLoaded)
+                    foreach (Part p in v.parts)
+                        foreach (ModuleProcEngine e in p.FindModulesImplementing<ModuleProcEngine>())
+                            pending |= e.Lod0Pending;
+                if (!pending) yield break;
+                yield return null;
+            }
+            Info("meshes", $"LOD0 still pending after {timeout:F0} s");
+        }
+
         static string Describe(ModuleProcEngine m)
         {
             var e = m.part.FindModuleImplementing<ModuleEnginesFX>();
@@ -625,6 +673,7 @@ namespace ProcEngines.KspTests
             EditorLogic.fetch.ship.SaveShip().Save(path);
             FlightDriver.StartWithNewLaunch(path, "Squad/Flags/default", "LaunchPad", new VesselCrewManifest());
             yield return WaitScene(GameScenes.FLIGHT);
+            yield return WaitMeshesReady();
             float t0 = Time.realtimeSinceStartup;
             while ((FlightGlobals.ActiveVessel == null || FlightGlobals.ActiveVessel.packed) && Time.realtimeSinceStartup - t0 < 60) yield return null;
             yield return new WaitForSecondsRealtime(4f);
@@ -666,6 +715,7 @@ namespace ProcEngines.KspTests
             int idx = HighLogic.CurrentGame.flightState.protoVessels.FindIndex(p => p.vesselID == id);
             FlightDriver.StartAndFocusVessel("persistent", idx);
             yield return WaitScene(GameScenes.FLIGHT, 120);
+            yield return WaitMeshesReady();
             t0 = Time.realtimeSinceStartup;
             while ((FlightGlobals.ActiveVessel == null || FlightGlobals.ActiveVessel.packed) && Time.realtimeSinceStartup - t0 < 60) yield return null;
             yield return new WaitForSecondsRealtime(4f);
@@ -710,6 +760,7 @@ namespace ProcEngines.KspTests
             EditorLogic.fetch.ship.SaveShip().Save(lockPath);
             FlightDriver.StartWithNewLaunch(lockPath, "Squad/Flags/default", "LaunchPad", new VesselCrewManifest());
             yield return WaitScene(GameScenes.FLIGHT);
+            yield return WaitMeshesReady();
             float tl = Time.realtimeSinceStartup;
             while ((FlightGlobals.ActiveVessel == null || FlightGlobals.ActiveVessel.packed) && Time.realtimeSinceStartup - tl < 60) yield return null;
             yield return new WaitForSecondsRealtime(4f);

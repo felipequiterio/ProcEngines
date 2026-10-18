@@ -7,7 +7,8 @@ ProcEngines surface textures: the seamless albedo+gloss and normal maps of the c
 
 Options:
     --out DIR       output directory (default GameData/ProcEngines/PluginData/Surfaces)
-    --only a,b      build only these surfaces (regen, steel, bolts, soot, niobium, carbon, foil, hotduct, lines)
+    --only a,b      build only these surfaces (regen, regen_k, jacket, steel, bolts, soot, niobium, carbon, foil,
+                    hotduct, lines)
     --sheets DIR    also write review sheets: 2x2 tiled albedo / normal / gloss / lit, plus a full-resolution
                     crop across the tile corner, so seams can be checked by eye
     --render DIR    (inside Blender only) render lit Cycles previews of the written textures on engine-like
@@ -15,9 +16,11 @@ Options:
                     with --no-build
     --no-build      do not regenerate the textures (use with --render)
     --samples N     Cycles samples for --render (default 48)
+    --shots a,b     render only these previews (names in SHOTS, without .png)
 
 Output per surface: <name>.png (RGBA, 8-bit: sRGB albedo, A = gloss, 0 matte .. 1 full specular) and
-<name>_n.png (RGB tangent-space normal, n * 0.5 + 0.5, OpenGL convention: green = +V). The PNGs are written
+<name>_n.png (RGB tangent-space normal, n * 0.5 + 0.5, OpenGL convention: green = +V; none for the SHARED_NORMAL
+surfaces, e.g. regen_k uses regen_n.png in game and in the previews). The PNGs are written
 here with zlib + struct and carry no gamma or colour-profile chunks, so the bytes are exactly the values below.
 
 Array convention in this file: images are float arrays indexed [j, i]; i is the U texel, j the V texel with
@@ -25,15 +28,28 @@ j = 0 at v = 0 (the bottom row as Unity's Texture2D.LoadImage places it). The PN
 PNG stores its top row (v = 1) first.
 
 Every random field is periodic over the tile (FFT-filtered noise on the tile's own lattice, stamps written with
-wrap-around indices), so every texture tiles in U and in V; regen and bolts clamp V in game, so their V content
-is unique instead (heat coordinate; rim top -> bottom).
+wrap-around indices), so every texture tiles in U and in V; regen, regen_k, jacket and bolts clamp V in game, so
+their V content is unique instead (heat coordinate; rim top -> bottom). The seam check compares the wrap edge with
+the interior twice: the mean difference across the edge (a break in the pattern), and the mean signed value of the
+edge columns/rows (a step that both edge columns share, which the difference cannot see).
 """
 import math, os, struct, sys, time, zlib
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
-SURFACES = ["regen", "steel", "bolts", "soot", "niobium", "carbon", "foil", "hotduct", "lines"]
+SURFACES = ["regen", "regen_k", "jacket", "steel", "bolts", "soot", "niobium", "carbon", "foil", "hotduct", "lines"]
+# Surfaces without their own _n.png -> the surface whose normal map they use (identical relief; the same fallback as
+# EngineMaterials.FallbackSurface). build() writes no _n.png for them and checks that the relief still matches;
+# the --render previews load the fallback's _n.png, as the plugin does.
+SHARED_NORMAL = {"regen_k": "regen"}
+
+# Tube-wall surfaces (ASSETS.md 5, round 2): 32 tubes (or jacket lands) per U tile, 64 texels each, 1024 rows of
+# heat coordinate. EngineMaterials.TubesPerTile must equal TUBES.
+TUBES, TUBE_PX, HEAT_ROWS = 32, 64, 1024
+# A V texel is ~4 U texels long: V spans the regen section (0.5 of it on the convergent, 0.5 on the chamber), the
+# tubes are ~20 mm wide at the regen end (EngineGeometry sizes the tube count from there) and narrower upstream.
+TUBE_A = 4.0
 
 try:
     import bpy  # noqa: F401  (only for --render)
@@ -45,7 +61,7 @@ except ImportError:
 def args():
     a = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else sys.argv[1:]
     o = {"out": os.path.join(REPO, "GameData", "ProcEngines", "PluginData", "Surfaces"), "only": SURFACES,
-         "sheets": None, "render": None, "build": True, "samples": 48}
+         "sheets": None, "render": None, "build": True, "samples": 48, "shots": None}
     i = 0
     while i < len(a):
         if a[i] == "--out": o["out"] = a[i + 1]; i += 1
@@ -53,10 +69,13 @@ def args():
         elif a[i] == "--sheets": o["sheets"] = a[i + 1]; i += 1
         elif a[i] == "--render": o["render"] = a[i + 1]; i += 1
         elif a[i] == "--samples": o["samples"] = int(a[i + 1]); i += 1
+        elif a[i] == "--shots": o["shots"] = [s for s in a[i + 1].split(",") if s]; i += 1
         elif a[i] == "--no-build": o["build"] = False
         i += 1
     for s in o["only"]:
         if s not in SURFACES: raise SystemExit("unknown surface " + s)
+    for s in o["shots"] or []:
+        if s not in SHOTS: raise SystemExit("unknown shot " + s)
     return o
 
 
@@ -268,20 +287,44 @@ HEAT_STOPS = [
 
 # ============================================================================================== surfaces
 
-def tex_regen():
-    """Brazed tube wall. U: 16 tubes per tile, each centred in its 1/16, braze fillets at the boundaries.
-    V: heat coordinate (clamped), 0 = throat (hottest) .. 1 = end of the regen section (coolest)."""
-    N, T = 1024, 16
-    tw = N / T
-    A = 3.0                 # a V texel is ~3 U texels long on a typical bell (V spans the whole regen section)
-    sh = (N, N)
+def heat_ramp(heat, desat):
+    """HEAT_STOPS oxide colour for a heat field, pulled toward its own grey by `desat` (fired tube walls read as
+    a graded, muted band; the hot duct keeps the stronger colours)."""
+    ht = ramp(heat, HEAT_STOPS)
+    return lerp(ht, ht.mean(-1, keepdims=True), desat)
+
+
+def vscratches(shape, key, count, lmin, lmax, A, wmin=0.4, wmax=0.8, angle=None, spread=math.pi):
+    """scratches() drawn in physical space on a texture whose V texels are A times longer than its U texels."""
+    R = rng(key)
+    h, w = shape
+    out = np.zeros(shape)
+    for _ in range(count):
+        L = R.uniform(lmin, lmax)
+        th = R.uniform(0, 2 * math.pi) if angle is None else angle + R.uniform(-spread, spread)
+        c = np.array([R.uniform(0, w), R.uniform(0, h)])
+        d = np.array([math.cos(th), math.sin(th) / A])
+        bend = np.array([-d[1] * A, d[0] / A]) * R.uniform(-0.12, 0.12) * L
+        pts = [c - d * L / 2, c - d * L / 4 + bend * 0.75, c + bend, c + d * L / 4 + bend * 0.75, c + d * L / 2]
+        polyline(out, pts, R.uniform(wmin, wmax), R.uniform(0.35, 1.0))
+    return out
+
+
+def regen_fields():
+    """The brazed tube wall shared by regen and regen_k (ASSETS.md 5). U: TUBES tubes per tile, each centred in its
+    TUBE_PX texels, braze fillets at the boundaries. V: heat coordinate (clamped), 0 = throat (hottest) .. 1 = end
+    of the regen section (coolest); the convergent runs 0.5 -> 0 and the chamber 1.0 (injector) -> 0.5.
+    Returns col, gloss, normal, meta and a dict of fields for the variants."""
+    T, tw, H, A = TUBES, float(TUBE_PX), HEAT_ROWS, TUBE_A
+    W = T * TUBE_PX
+    sh = (H, W)
     R = rng("regen")
     jj, ii = np.indices(sh)
     ui = ii + 0.5
-    v = (jj + 0.5) / N
+    v = (jj + 0.5) / H
 
     # tubes are hand-fitted: the boundaries wander a texel or so along the length
-    wob = fnoise1(T, N, "regen.wob", 300, 30, 1.2) * 0.5
+    wob = fnoise1(T, H, "regen.wob", 300, 30, 1.2) * 0.5
     b = np.arange(-1, T + 2)
     bpos = b[:, None] * tw + wob[b % T]                 # boundary k at row k + 1
     k = (ui // tw).astype(int)
@@ -293,10 +336,10 @@ def tex_regen():
 
     t_shade = R.normal(0, 1, T); t_heat = R.normal(0, 1, T); t_hue = R.normal(0, 1, T)
     t_h = 0.80 + 0.03 * R.normal(0, 1, T)               # slightly oval tubes
-    kink = fnoise1(T, N, "regen.kink", 160, 16, 1.0)
-    heatn = fnoise1(T, N, "regen.heatn", 300, 8, 1.3)
-    shaden = fnoise1(T, N, "regen.shaden", 200, 6, 0.8)
-    filn = fnoise1(T, N, "regen.filn", 120, 6, 0.9)
+    kink = fnoise1(T, H, "regen.kink", 160, 16, 1.0)
+    heatn = fnoise1(T, H, "regen.heatn", 300, 8, 1.3)
+    shaden = fnoise1(T, H, "regen.shaden", 200, 6, 0.8)
+    filn = fnoise1(T, H, "regen.filn", 120, 6, 0.9)
 
     # ---- height (texels)
     crown = np.sqrt(np.clip(1 - x * x, 0, 1))
@@ -312,14 +355,14 @@ def tex_regen():
     hgt = prof - 0.35 * seam + fillet * 0.35 * lumps
 
     dent = np.zeros(sh)
-    for _ in range(110):                                # handling dings on the crowns
-        kt = int(R.integers(T)); x0 = R.uniform(-0.55, 0.55); cy = R.uniform(0, N)
+    for _ in range(220):                                # handling dings on the crowns
+        kt = int(R.integers(T)); x0 = R.uniform(-0.55, 0.55); cy = R.uniform(0, H)
         ru = R.uniform(2.5, 8.0); rv = ru / A * R.uniform(0.9, 1.8); depth = R.uniform(0.2, 0.7) * ru / 5
         stamp(dent, kt * tw + tw / 2 + x0 * tw / 2, cy, ru, rv,
               lambda dx, dy: -depth * np.exp(-(dx / ru) ** 2 - (dy / rv) ** 2), mask=(tid, kt))
     for kt in range(T):                                 # kinks: shallow creases across a tube
         for _ in range(int(R.integers(0, 3))):
-            cy = R.uniform(0, N); rv = R.uniform(1.5, 3.0); depth = R.uniform(0.2, 0.55)
+            cy = R.uniform(0, H); rv = R.uniform(1.2, 2.4); depth = R.uniform(0.2, 0.55)
             ru = tw * 0.45
             stamp(dent, kt * tw + tw / 2, cy, ru, rv,
                   lambda dx, dy: -depth * np.exp(-(dy / rv) ** 2) * np.exp(-(dx / ru) ** 4), mask=(tid, kt), ext=1.2)
@@ -329,46 +372,157 @@ def tex_regen():
     hgt = hgt + dent + 0.05 * micro + 0.02 * grain
     nrm = normal_map(hgt, vs=A, wrap_v=False, strength=0.85)
 
-    # ---- albedo: warm metallic grey (the propellant tint multiplies it)
-    mott = fnoise(sh, "regen.mott", 500, 25, 1.2, ev=1 / A)
+    # ---- albedo: warm metallic grey (the propellant tint multiplies it). Per-tube shade is kept small, so the
+    # wall reads as one fired part rather than planks; the tube read comes from the lighting.
+    mott = fnoise(sh, "regen.mott", 800, 25, 1.2, ev=1 / A)
     streak = fnoise(sh, "regen.streak", 160, 3, 0.8, ev=14 / A)
     crownness = smoothstep(0.4, 0.75, hn)
-    shade = 1 + 0.055 * t_shade[tid] + 0.015 * shaden[tid, jj] + 0.03 * mott + 0.008 * streak
+    shade = 1 + 0.025 * t_shade[tid] + 0.010 * shaden[tid, jj] + 0.03 * mott + 0.008 * streak
     col = rgb(0.575, 0.565, 0.545) * shade[..., None] + (t_hue[tid] * 0.01)[..., None] * rgb(1, 0.4, -0.8)
 
-    # heat discoloration near the throat: irregular per tube and in patches, a faint warm haze further down
-    hp = (1 - smoothstep(0.0, 0.30, v)) ** 1.2
-    blot = fnoise(sh, "regen.blot", 260, 16, 1.2, ev=5 / A)
-    mfine = fnoise(sh, "regen.mfine", 80, 6, 1.0, ev=4 / A)
+    # heat discoloration: a band graded along the flow near the throat, streaked per tube (the per-tube offsets
+    # and the along-tube noise carry the irregularity; the patches are narrow and run with the flow), muted
+    hp = (1 - smoothstep(0.0, 0.26, v)) ** 1.3
+    blot = fnoise(sh, "regen.blot", 120, 16, 1.2, ev=24 / A)
+    mfine = fnoise(sh, "regen.mfine", 80, 6, 1.0, ev=16 / A)
     haze = 0.13 * (1 - smoothstep(0.10, 0.55, v)) * (0.55 + 0.45 * blot)
-    env = 0.95 * hp + haze                              # zero beyond the haze, so no stray tint further down
-    heat = env * (1 + 0.32 * t_heat[tid] + 0.26 * heatn[tid, jj] + 0.30 * blot + 0.10 * mfine) + 0.05 * fillet * hp
+    env = 0.85 * hp + haze                              # zero beyond the haze, so no stray tint further down
+    heat = env * (1 + 0.32 * t_heat[tid] + 0.22 * heatn[tid, jj] + 0.12 * blot + 0.05 * mfine) + 0.05 * fillet * hp
     tint_w = smoothstep(0.04, 0.18, heat) * 0.9
-    col = lerp(col, ramp(heat, HEAT_STOPS) * shade[..., None], tint_w)
+    col = lerp(col, heat_ramp(heat, 0.35) * shade[..., None], tint_w)
 
     braze = rgb(0.55, 0.52, 0.46) * (0.96 + 0.05 * lumps)[..., None]
     col = lerp(col, braze, fillet * 0.4)
     flux = fillet * smoothstep(1.7, 2.5, fnoise(sh, "regen.flux", 40, 3, 0.8, ev=4 / A))
     col = lerp(col, rgb(0.30, 0.25, 0.20), flux * 0.5)
 
-    ao = 0.6 + 0.4 * smoothstep(0.12, 0.8, hn) ** 0.8
+    ao = 0.78 + 0.22 * smoothstep(0.12, 0.8, hn) ** 0.8
     col = col * (ao * (1 + 0.2 * np.clip(dent, -1, 0)))[..., None]
 
-    cover = smoothstep(-0.4, 1.4, fnoise(sh, "regen.cover", 420, 30, 1.2, ev=3 / A))
+    cover = smoothstep(-0.4, 1.4, fnoise(sh, "regen.cover", 700, 30, 1.2, ev=3 / A))
     gstreak = smoothstep(0.2, 2.2, fnoise(sh, "regen.gstreak", 260, 12, 1.0, ev=20 / A))
     gv = 0.08 + 0.6 * smoothstep(0.35, 1.0, v)
-    grime = np.clip(gv * cover * (0.55 * (1 - crownness) + 0.45 * gstreak), 0, 0.75)
+    grime = np.clip(gv * cover * (0.25 * (1 - crownness) + 0.45 * gstreak), 0, 0.75)
     col = lerp(col, rgb(0.22, 0.20, 0.18), grime * 0.75)
     speck = smoothstep(2.6, 3.3, fnoise(sh, "regen.speck", 8, 1.5, 0.3, ev=1 / A)) * smoothstep(0.6, 1.0, v)
     col = lerp(col, rgb(0.12, 0.11, 0.10), speck * 0.6)
 
     # ---- gloss: crowns shiny, fillets matte, oxide scale and grime dull
-    g = 0.15 + 0.68 * smoothstep(0.35, 0.85, hn)
+    g = 0.28 + 0.45 * smoothstep(0.35, 0.85, hn)
     g = g * (1 + 0.10 * micro + 0.05 * streak)
     g = g * (1 - 0.35 * tint_w * smoothstep(0.85, 1.0, heat))
-    g = lerp(g, 0.22, fillet * 0.4)
+    g = lerp(g, 0.24, fillet * 0.4)
     g = g * (1 - 0.85 * grime) * (1 - 0.6 * speck)
-    return col, g, nrm, {"wrap_v": False, "vs": A, "phase_u": 64}
+    meta = {"wrap_v": False, "vs": A, "phase_u": TUBE_PX}
+    return col, g, nrm, meta, {"sh": sh, "v": v, "crownness": crownness, "grain": grain, "tid": tid, "jj": jj}
+
+
+def tex_regen():
+    """Brazed tube wall (hydrolox and methalox; the propellant tint multiplies it)."""
+    col, g, nrm, meta, _ = regen_fields()
+    return col, g, nrm, meta
+
+
+def tex_regen_k():
+    """Kerolox tube wall: regen plus the soot a test-fired kerosene engine leaves on the outside of its nozzle,
+    deposited by the recirculating plume. Dense in a band at the lip (V = 1), thinning upstream in runs along the
+    tubes, the crowns a little cleaner. The dense band stays in the last ~8 % of the coordinate and the runs fade
+    by V ~0.8. (The chamber maps V 1 -> 0.5 from the injector down, so if a chamber ever used regen_k it would get
+    a dark rim under the injector flange; EngineMaterials gives the chamber plain regen.)"""
+    col, g, nrm, meta, f = regen_fields()
+    sh, v, A, T, H = f["sh"], f["v"], TUBE_A, TUBES, HEAT_ROWS
+    runs = fnoise(sh, "regen.ksoot", 300, 10, 1.0, ev=20 / A)
+    patch = fnoise(sh, "regen.ksoot2", 700, 40, 1.2, ev=3 / A)
+    tube_reach = fnoise1(T, H, "regen.kreach", 300, 20, 1.0)[f["tid"], f["jj"]]
+    reach = v + 0.025 * runs + 0.02 * tube_reach + 0.015 * patch
+    streaky = smoothstep(-0.4, 1.4, runs + 0.5 * patch)
+    soot = 0.8 * smoothstep(0.88, 0.985, reach) ** 1.3 + 0.4 * smoothstep(0.80, 0.94, reach) * streaky
+    soot = np.clip(soot * (1 - 0.15 * f["crownness"]), 0, 1)
+    fleck = smoothstep(2.0, 2.8, fnoise(sh, "regen.kfleck", 10, 1.5, 0.4, ev=1.5 / A)) * soot   # flaked spots
+    soot = soot * (1 - 0.6 * fleck)
+    col = lerp(col, rgb(0.06, 0.055, 0.05) * (1 + 0.15 * f["grain"])[..., None], 0.78 * soot)
+    g = g * (1 - 0.8 * soot)
+    return col, g, nrm, meta
+
+
+def tex_jacket():
+    """Channel-wall jacket (staged combustion, full flow, Late gas generator): a smooth sheet brazed over milled
+    coolant channels. Same UV contract as regen: U = TUBES lands per tile (TUBE_PX texels apart, on the tube
+    boundaries), V = heat coordinate (clamped). Neutral grey (~0.44 sRGB, the propellant tint multiplies it),
+    faint pillowing between the lands, one longitudinal seam weld per tile, the heat band near the throat at about
+    half the tube wall's (the copper liner takes the heat), grime streaks toward V = 1. Gloss 0.30-0.45."""
+    T, P, H, A = TUBES, TUBE_PX, HEAT_ROWS, TUBE_A
+    W = T * P
+    sh = (H, W)
+    R = rng("jacket")
+    jj, ii = np.indices(sh)
+    ui = ii + 0.5
+    v = (jj + 0.5) / H
+
+    # ---- height (texels): pillows between the lands (coolant pressure bows the sheet out a hair), a fine crease
+    # on each land, the seam weld
+    cid = (ui // P).astype(int) % T
+    xl = (ui / P) % 1.0 * 2 - 1                         # -1 .. 1 across a channel, lands at +-1
+    pil_n = fnoise1(T, H, "jk.pil", 260, 20, 1.0)
+    pillow = (1 - xl * xl) * (1 + 0.2 * pil_n[cid, jj])
+    dland = (1 - np.abs(xl)) * P / 2                    # texels from the nearest land
+    land = np.exp(-(dland / 1.1) ** 2)
+    u0 = 0.30 * W + 0.8 * fnoise1(1, H, "jk.weld", 200, 10, 1.0)[0][jj]
+    du = ii + 0.5 - u0
+    duw = (du + W / 2) % W - W / 2
+    bead = np.sqrt(np.clip(1 - (duw / 3.6) ** 2, 0, 1))
+    ripple = np.sin(2 * math.pi * (jj + 0.18 * duw ** 2 / 3.6) / 2.2)
+    haz = np.exp(-(np.abs(duw) / 14) ** 1.4)
+    grind = np.exp(-(duw / 9) ** 2) * (1 - bead)
+    mott = fnoise(sh, "jk.mott", 900, 30, 1.25, ev=1 / A)
+    mott2 = fnoise(sh, "jk.mott2", 160, 8, 1.0, ev=1 / A)
+    wave = fnoise(sh, "jk.wave", 700, 60, 1.6, ev=1 / A)   # the sheet is not perfectly true
+    grain = fnoise(sh, "jk.grain", 6, 1.2, 0.0, ev=1 / A)
+    brushx = fnoise(sh, "jk.brushx", 60, 1.2, 0.3, eu=8, ev=0.25 / A)   # grinding marks across the weld (along U)
+    scr = vscratches(sh, "jk.scr", 90, 15, 90, A)
+    dings = np.zeros(sh)
+    for _ in range(120):
+        r = R.uniform(1.5, 4.0); dpt = R.uniform(0.1, 0.3) * r
+        stamp(dings, R.uniform(0, W), R.uniform(0, H), r, r / A, lambda dx, dy: -dpt * np.exp(-(dx / r) ** 2 - (dy * A / r) ** 2))
+    hgt = 3.0 * pillow - 0.9 * land + 1.0 * wave + 0.06 * mott2 + 0.03 * grain + dings - 0.22 * scr
+    hgt = hgt + 1.5 * bead + 0.12 * ripple * bead + 0.10 * brushx * grind
+    nrm = normal_map(hgt, vs=A, wrap_v=False, strength=0.55)
+
+    # ---- albedo
+    hue = fnoise(sh, "jk.hue", 1200, 100, 1.5, ev=1 / A)
+    streak = fnoise(sh, "jk.streak", 200, 3, 0.8, ev=16 / A)
+    k = 1 + 0.028 * mott + 0.015 * mott2 + 0.012 * grain + 0.015 * streak + 0.015 * pillow - 0.06 * land
+    col = rgb(0.44, 0.44, 0.44) * k[..., None] + hue[..., None] * rgb(0.006, 0.002, -0.006)
+    # heat band: the regen philosophy at half amplitude, streaked by the injector pattern rather than per tube
+    hp = (1 - smoothstep(0.0, 0.24, v)) ** 1.5
+    t_heat = R.normal(0, 1, T)
+    heatn = fnoise1(T, H, "jk.heatn", 300, 8, 1.3)
+    inj = fnoise(sh, "jk.inj", 400, 40, 1.2, ev=30 / A)     # injector streaks: a few channels wide, along the flow
+    mfine = fnoise(sh, "jk.mfine", 80, 6, 1.0, ev=16 / A)
+    haze = 0.07 * (1 - smoothstep(0.10, 0.55, v)) * (0.55 + 0.45 * inj)
+    heat = 0.5 * (0.95 * hp) * (1 + 0.12 * t_heat[cid] + 0.10 * heatn[cid, jj] + 0.20 * inj + 0.05 * mfine) + haze
+    heat = np.maximum(heat, 0.16 * haz * (1 - 0.6 * smoothstep(0.3, 1.0, v)))   # the weld's own heat tint
+    tint_w = smoothstep(0.03, 0.14, heat) * 0.8
+    col = lerp(col, heat_ramp(heat, 0.45) * (k * 0.44 / 0.575)[..., None], tint_w)
+    # the weld bead: darker, slightly bronze; ground metal either side a little brighter
+    col = lerp(col, rgb(0.36, 0.35, 0.34) * (1 + 0.08 * ripple)[..., None], bead * 0.8)
+    col = col * (1 + 0.05 * grind * (1 + 0.5 * brushx))[..., None]
+    col = col + (0.05 * scr)[..., None]
+    col = col * (1 + 0.6 * np.clip(dings, -0.5, 0))[..., None]
+    # grime: runs along the flow, heavier toward V = 1, a little in the land creases
+    cover = smoothstep(-0.4, 1.4, fnoise(sh, "jk.cover", 800, 30, 1.2, ev=3 / A))
+    gstreak = smoothstep(0.2, 2.2, fnoise(sh, "jk.gstreak", 260, 12, 1.0, ev=20 / A))
+    gv = 0.05 + 0.38 * smoothstep(0.4, 1.0, v)
+    grime = np.clip(gv * cover * (0.6 * gstreak + 0.15 * land + 0.1), 0, 0.5)
+    col = lerp(col, rgb(0.20, 0.185, 0.17), grime * 0.8)
+    speck = smoothstep(2.6, 3.3, fnoise(sh, "jk.speck", 8, 1.5, 0.3, ev=1 / A)) * smoothstep(0.55, 1.0, v)
+    col = lerp(col, rgb(0.12, 0.11, 0.10), speck * 0.5)
+
+    # ---- gloss 0.30-0.45: satin sheet, weld and oxide duller, scratches and ground metal brighter
+    g = 0.38 + 0.03 * mott + 0.02 * mott2 + 0.015 * streak
+    g = g - 0.06 * tint_w * smoothstep(0.3, 0.6, heat) - 0.07 * bead + 0.05 * grind + 0.12 * scr
+    g = g * (1 - 0.7 * grime) * (1 - 0.5 * speck)
+    return col, g, nrm, {"wrap_v": False, "vs": A, "phase_u": P}
 
 
 def tex_steel():
@@ -404,16 +558,17 @@ def tex_steel():
     cover = smoothstep(0.2, 1.6, fnoise(sh, "steel.cover", 500, 40, 1.2, ev=2))
     grime = np.clip(smoothstep(0.9, 2.6, runs) * cover * 0.32 + 0.06 * smoothstep(0.5, 2.0, mott2), 0, 0.4)
 
-    hgt = 0.08 * turn + 0.04 * turn2 + 0.025 * grain + 0.06 * peel + dings - 0.3 * scr - 0.18 * scuff
+    # turning marks kept faint (round 2): strong ones made every steel ring read as a brushed tin can
+    hgt = 0.05 * turn + 0.03 * turn2 + 0.025 * grain + 0.06 * peel + dings - 0.3 * scr - 0.18 * scuff
     nrm = down_normals(normal_map(hgt), 2)              # 512^2
 
-    k = 1 + 0.035 * mott + 0.02 * mott2 + 0.03 * turn + 0.01 * grain
-    col = rgb(0.55, 0.553, 0.56) * k[..., None] + hue[..., None] * rgb(0.008, 0.003, -0.006)
+    k = 1 + 0.035 * mott + 0.02 * mott2 + 0.01 * turn + 0.01 * grain
+    col = rgb(0.50, 0.503, 0.51) * k[..., None] + hue[..., None] * rgb(0.008, 0.003, -0.006)
     col = col * (1 - 0.06 * smud)[..., None]
-    col = lerp(col, rgb(0.30, 0.285, 0.265), grime)
+    col = lerp(col, rgb(0.28, 0.265, 0.245), grime)
     col = col + (0.08 * np.maximum(scr, scuff))[..., None]
 
-    g = 0.50 + 0.12 * turn + 0.04 * mott - 0.04 * mott2
+    g = 0.50 + 0.04 * turn + 0.04 * mott - 0.04 * mott2
     g = g - 0.16 * smud + 0.28 * np.maximum(scr, scuff)
     g = g * (1 - 0.7 * grime)
     return col, g, nrm, {"wrap_v": True, "vs": 1.0}
@@ -541,24 +696,27 @@ def tex_niobium():
     hgt = 0.18 * m3 + 0.08 * grain + 0.18 * sand + 0.14 * spin - 0.9 * chip
     nrm = normal_map(hgt, strength=0.9)
 
-    violet, neutral = rgb(0.415, 0.395, 0.435), rgb(0.43, 0.425, 0.42)
+    # dark silicide charcoal, bluish-black where cooler (round 2: the light lavender read as grey plastic)
+    violet, neutral = rgb(0.25, 0.245, 0.265), rgb(0.27, 0.265, 0.26)
     base = lerp(violet, neutral, smoothstep(-1.6, 1.6, hue))
-    k = 1 + 0.035 * m1 + 0.03 * m2 + 0.025 * m3 + 0.03 * flow + 0.025 * grain + 0.025 * sand
+    k = 1 + 0.045 * m1 + 0.035 * m2 + 0.03 * m3 + 0.035 * flow + 0.03 * grain + 0.03 * sand
     col = base * k[..., None]
-    col = lerp(col, rgb(0.35, 0.33, 0.36), 0.22 * smoothstep(1.0, 2.4, m1 + 0.6 * flow))   # darker heat-mottled areas
-    metal = rgb(0.62, 0.62, 0.63) * (1 + 0.04 * grain)[..., None]
+    col = lerp(col, rgb(0.19, 0.18, 0.20), 0.30 * smoothstep(1.0, 2.4, m1 + 0.6 * flow))   # darker heat-mottled areas
+    metal = rgb(0.56, 0.56, 0.57) * (1 + 0.04 * grain)[..., None]
     rim = np.clip(smoothstep(0.0, 0.4, chip) - smoothstep(0.4, 1.0, chip), 0, 1)
     col = lerp(col, metal, chip)
-    col = col * (1 - 0.2 * rim)[..., None]
-    g = 0.14 + 0.04 * m2 + 0.03 * flow + 0.02 * sand
+    col = col * (1 - 0.25 * rim)[..., None]
+    g = 0.22 + 0.05 * m2 + 0.04 * flow + 0.03 * sand - 0.04 * smoothstep(1.0, 2.4, m1 + 0.6 * flow)
     g = lerp(g, 0.6, chip)
     return col, g, nrm, {"wrap_v": True, "vs": 1.0}
 
 
 def tex_carbon():
-    """Carbon-carbon, 2/2 twill, 32 tows per 0.8 m tile: warp tows along V, weft along U. Flat, tightly packed
-    tows; the warp and weft catch the light differently (fibre sheen); resin-rich glossy patches."""
-    N, tows = 1024, 32
+    """Carbon-carbon, 2/2 twill, 64 tows per 0.8 m tile (12.5 mm tows, EngineMaterials.CarbonTowsPerTile): warp
+    tows along V, weft along U. Flat, tightly packed tows. The weave shows mostly through the relief (normal map),
+    only faintly in albedo and gloss: matte charcoal with large-scale mottling, coating haze and resin-rich patches,
+    as on RL10B-2 / Vinci extensions, not a glossy car-part checker."""
+    N, tows = 1024, 64
     c = N / tows
     sh = (N, N)
     jj, ii = np.indices(sh)
@@ -590,55 +748,109 @@ def tex_carbon():
     nrm = normal_map(hgt, strength=0.5)
 
     top = np.where(warp, cw, cf)
-    shade = np.where(warp, 1.0 + 0.05 * tw_shade[ic, jj] + 0.03 * w_off[ic], 0.74 + 0.05 * tf_shade[jc, ii] + 0.03 * f_off[jc])
-    k = 0.19 * shade * (1 + 0.04 * fib + 0.05 * big) * (0.8 + 0.2 * top)
+    shade = np.where(warp, 1.0 + 0.05 * tw_shade[ic, jj] + 0.03 * w_off[ic], 0.88 + 0.05 * tf_shade[jc, ii] + 0.03 * f_off[jc])
+    k = 0.19 * shade * (1 + 0.04 * fib + 0.12 * big) * (0.85 + 0.15 * top)
     col = np.stack([k, k * 1.0, k * 1.04], -1)
     col = lerp(col, rgb(0.13, 0.12, 0.115), resin * 0.45)
-    col = lerp(col, rgb(0.27, 0.27, 0.28), haze * 0.4)
+    col = lerp(col, rgb(0.27, 0.27, 0.28), haze * 0.6)
     ao = np.clip(cavity(hgt, 4) * 0.18, 0, 0.3)
     col = col * (1 - ao)[..., None]
-    g = np.where(warp, 0.46, 0.30) * (1 + 0.12 * fib) * (0.55 + 0.45 * top)
-    g = lerp(g, 0.58, resin * 0.7)
+    g = np.where(warp, 0.34, 0.28) * (1 + 0.12 * fib) * (0.6 + 0.4 * top)
+    g = lerp(g, 0.5, resin * 0.6)
     g = g * (1 - 0.6 * haze)
-    return col, g, nrm, {"wrap_v": True, "vs": 1.0, "phase_u": 32, "phase_v": 32}
+    # the twill repeats every 4 tows; the wrap edge sits on a tow boundary at that phase
+    return col, g, nrm, {"wrap_v": True, "vs": 1.0, "phase_u": 4 * N // tows, "phase_v": 4 * N // tows}
+
+
+def cells(shape, key, cell, x, y, wrap_x=True):
+    """Jittered-grid cellular noise at texel coordinates (x, y): (id, f1, f2, count), the integer id of the nearest
+    seed's cell, the distances to the nearest and the second-nearest seed, and the number of ids. One seed per grid
+    cell of ~`cell` texels (or (cell_x, cell_y)); the grid wraps in y over the shape, and in x too if wrap_x.
+    Without wrap_x, x may run 0 .. width and the cells simply end at x = 0 and x = width (two spare seed columns
+    lie beyond them)."""
+    h, w = shape
+    cxx, cyy = cell if isinstance(cell, tuple) else (cell, cell)
+    ny = max(1, int(round(h / cyy))); nx = max(1, int(round(w / cxx)))
+    cy, cx = h / ny, w / nx
+    jit = rng(key).uniform(0.0, 1.0, (ny, nx + 2, 2))
+    gx = np.floor(x / cx).astype(int); gy = np.floor(y / cy).astype(int)
+    f1 = np.full(np.shape(x), 1e9); f2 = np.full(np.shape(x), 1e9); cid = np.zeros(np.shape(x), int)
+    for oy in (-1, 0, 1):
+        for ox in (-1, 0, 1):
+            cxi, cyi = gx + ox, gy + oy
+            ry = cyi % ny
+            col = cxi % nx + 1 if wrap_x else np.clip(cxi + 1, 0, nx + 1)
+            d = np.hypot(x - (cxi + jit[ry, col, 0]) * cx, y - (cyi + jit[ry, col, 1]) * cy)
+            idv = ry * (nx + 2) + col
+            closer = d < f1
+            f2 = np.where(closer, f1, np.minimum(f2, d))
+            cid = np.where(closer, idv, cid)
+            f1 = np.where(closer, d, f1)
+    return cid, f1, f2, ny * (nx + 2)
 
 
 def tex_foil():
-    """Gold MLI on hydrogen lines. U = around the pipe, V = arc length / circumference (square texels).
-    Crinkle, a lapped seam along V, a tape wrap across U."""
+    """Gold MLI on hydrogen lines. U = around the pipe, V = arc length / circumference (square texels). Pale gold
+    film crumpled into large planar facets (each facet catches the light as a unit, with crisp creases between
+    them) and finer crinkle, one lapped seam along V and a tape wrap across U.
+
+    The blanket wraps once around with an overlap: its visible end edge lies at su(v), the outer flap covers the
+    W texels before it, and its start edge is hidden under the flap. The facets are laid out in the coordinate
+    `up` measured from the visible edge, unwrapped in U, so the crumple pattern is continuous everywhere except
+    across the visible edge, and every height term is periodic in U (round 2: the old lap mask stepped at u = 0,
+    a second, straight seam on every foil line)."""
     N = 512
     sh = (N, N)
     jj, ii = np.indices(sh)
-    wu = 6 * fnoise(sh, "foil.wu", 200, 30, 1.2); wv = 6 * fnoise(sh, "foil.wv", 200, 30, 1.2)
-    n1 = sample(fnoise(sh, "foil.c1", 180, 22, 1.0, ev=1.4), ii + wu, jj + wv)
-    n2 = sample(fnoise(sh, "foil.c2", 70, 10, 1.0), ii + wu * 0.5, jj + wv * 0.5)
-    n3 = fnoise(sh, "foil.c3", 20, 3, 0.8)
-    crinkle = 3.6 * np.abs(n1) - 1.6 * np.abs(n2) + 0.3 * np.abs(n3)
-    # lapped seam along V: the outer layer (u < seam) lies on the inner one
     su = 0.37 * N + 2.5 * fnoise1(1, N, "foil.seam", 120, 6, 1.0)[0][jj]
-    du = ii + 0.5 - su
-    outer = smoothstep(1.5, -1.5, du)
-    under = np.roll(crinkle, (N // 3, N // 5), (0, 1))
-    hgt = lerp(under, crinkle, outer) + 1.6 * outer + 0.8 * np.exp(-(du / 2.5) ** 2) * (du < 0)
-    # tape wrap across U (constant V band)
+    up = (ii + 0.5 - su) % N                            # 0 just after the visible edge .. N just before it
+    W = 0.13 * N                                        # overlap width (the flap)
+    flap = smoothstep(N - W - 10, N - W + 10, up) * smoothstep(N, N - 1.5, up)
+
+    # facets: cellular noise in (up, v), periodic in V, cut at the visible edge; mildly warped so the cells are
+    # irregular polygons
+    wu = 7 * fnoise(sh, "foil.wu", 200, 30, 1.2); wv = 7 * fnoise(sh, "foil.wv", 200, 30, 1.2)
+    xs, ys = up + wu, jj + 0.5 + wv
+    # three overlapping scales of facets; their intersections give polygons of many sizes and shapes. The
+    # largest are stretched around the pipe (wrapping wrinkles), the middle ones along it.
+    R = rng("foil.facets")
+    big, b1, b2, nb = cells(sh, "foil.big", (N / 3.6, N / 6), xs, ys, wrap_x=False)
+    med, m1, m2, nm_ = cells(sh, "foil.med", (N / 16, N / 11), xs + 0.4 * wv, ys, wrap_x=False)
+    sml, s1, s2, ns = cells(sh, "foil.sml", N / 40, xs + 0.3 * wu, ys + 0.3 * wv, wrap_x=False)
+    tb = R.normal(0, 0.17, (nb, 2)); tm = R.normal(0, 0.13, (nm_, 2)); ts = R.normal(0, 0.07, (ns, 2))
+    shade_b = R.normal(0, 1, nb); shade_m = R.normal(0, 1, nm_); gl_b = R.uniform(0, 1, nb)
+    crease = np.maximum(np.maximum(np.exp(-((b2 - b1) / 1.0) ** 2), np.exp(-((m2 - m1) / 0.9) ** 2)),
+                        0.5 * np.exp(-((s2 - s1) / 0.8) ** 2))
+    n3 = fnoise(sh, "foil.c3", 18, 2.5, 0.8)            # fine crinkle
+
+    # height (texels): fine crinkle, the flap (a film thickness, a soft rise over the hidden start edge, a crisp
+    # visible edge that curls up a little), the tape
+    lip = 0.7 * np.exp(-((N - up) / 2.5) ** 2) * (up > N / 2)
+    hgt = 0.35 * np.abs(n3) + 1.6 * flap + lip
     vt0, vt1 = 0.58 * N, 0.665 * N
     tv = jj + 0.5 + 1.2 * fnoise1(1, N, "foil.tape", 80, 4, 1.0)[0][ii]
     tape = smoothstep(vt0 - 1, vt0 + 1, tv) * smoothstep(vt1 + 1, vt1 - 1, tv)
     twr = fnoise(sh, "foil.twr", 40, 3, 0.8, ev=4)
     hgt = lerp(hgt, 0.25 * hgt + 2.4 + 0.35 * twr, tape)
-    nrm = normal_map(hgt, strength=1.0)
+    dx = (np.roll(hgt, -1, 1) - np.roll(hgt, 1, 1)) * 0.5
+    dy = (np.roll(hgt, -1, 0) - np.roll(hgt, 1, 0)) * 0.5
+    flat = 1 - 0.8 * tape                               # the tape presses the crumple flat
+    tilt = (tb[big] + tm[med] + ts[sml]) * flat[..., None]
+    nrm = np.stack([-0.7 * dx + tilt[..., 0], -0.7 * dy + tilt[..., 1], np.ones(sh)], -1)
+    nrm /= np.linalg.norm(nrm, axis=-1, keepdims=True)
 
-    cvar = fnoise(sh, "foil.cvar", 200, 10, 1.0)
-    gold = lerp(rgb(0.82, 0.62, 0.27), rgb(0.76, 0.52, 0.20), smoothstep(-1.5, 1.5, cvar))
-    col = gold * (1 + 0.06 * n2 + 0.04 * n3)[..., None]
-    shadow = np.exp(-(du / 3.0) ** 2) * (du > 0)
+    cvar = fnoise(sh, "foil.cvar", 220, 12, 1.0)
+    gold = lerp(rgb(0.80, 0.70, 0.46), rgb(0.72, 0.60, 0.36), smoothstep(-1.5, 1.5, cvar))
+    k = 1 + 0.012 * shade_b[big] + 0.012 * shade_m[med] + 0.015 * n3 - 0.05 * crease * flat
+    col = gold * k[..., None]
+    shadow = np.exp(-(up / 3.0) ** 2)                   # just past the visible edge, under the curled lip
     col = col * (1 - 0.35 * shadow)[..., None]
-    kapton = rgb(0.72, 0.47, 0.18) * (1 + 0.05 * twr)[..., None]
+    kapton = rgb(0.70, 0.50, 0.24) * (1 + 0.05 * twr)[..., None]
     col = lerp(col, kapton, tape)
     dirt = smudges(sh, "foil.dirt", 10, 8, 30, 2.0)
-    col = lerp(col, rgb(0.40, 0.32, 0.18), dirt * 0.45)
-    g = 0.80 - 0.10 * np.abs(n3) + 0.05 * n2
-    g = lerp(g, 0.62, tape)
+    col = lerp(col, rgb(0.42, 0.36, 0.24), dirt * 0.3)
+    g = 0.78 + 0.08 * (gl_b[big] - 0.5) - 0.10 * np.abs(n3) - 0.10 * crease * flat
+    g = lerp(g, 0.6, tape)
     g = g * (1 - 0.5 * dirt) * (1 - 0.3 * shadow)
     return col, g, nrm, {"wrap_v": True, "vs": 1.0}
 
@@ -660,18 +872,21 @@ def tex_hotduct():
     bead_r = 4.2
     bead = np.sqrt(np.clip(1 - (duw / bead_r) ** 2, 0, 1))
     ripple = np.sin(2 * math.pi * (jj + 0.25 * duw ** 2 / bead_r) / 4.0)
-    haz = np.exp(-(np.abs(duw) / 20) ** 1.3)
+    haz = np.exp(-(np.abs(duw) / 12) ** 1.3)
     hgt = 1.6 * wave + 0.12 * mid + 0.04 * grain + 1.7 * bead + 0.18 * ripple * bead
     nrm = normal_map(hgt, strength=1.0)
 
+    # round 2: dark sooty Inconel with sparse, muted bluing (fuel-rich GG exhaust), not rainbow camouflage; the
+    # per-propellant tint (EngineMaterials.HotDuct) darkens kerolox further
     heat = 0.30 + 0.07 * big + 0.05 * mid + 0.04 * streak + 0.12 * smoothstep(0.0, 2.4, big + 0.3 * mid)
     heat = np.maximum(heat, 0.16 + 0.80 * haz + 0.03 * mid)
     tint = ramp(np.clip(heat, 0, 1), HEAT_STOPS)
-    bare = rgb(0.56, 0.56, 0.57) * (1 + 0.03 * grain)[..., None]
+    tint = lerp(tint, tint.mean(-1, keepdims=True), 0.35) * 0.85
+    bare = rgb(0.46, 0.46, 0.47) * (1 + 0.03 * grain)[..., None]
     col = lerp(bare, tint, smoothstep(0.02, 0.14, heat)) * (1 + 0.035 * mid + 0.025 * streak + 0.02 * grain)[..., None]
-    col = lerp(col, rgb(0.37, 0.36, 0.37) * (1 + 0.1 * ripple)[..., None], bead * 0.75)
-    soot = 0.35 * smoothstep(0.3, 2.4, fnoise(sh, "hd.soot", 200, 12, 1.1, ev=2.5) + 0.3 * streak)
-    col = lerp(col, rgb(0.16, 0.15, 0.14), soot)
+    col = lerp(col, rgb(0.33, 0.32, 0.33) * (1 + 0.1 * ripple)[..., None], bead * 0.75)
+    soot = 0.55 * smoothstep(0.0, 2.0, fnoise(sh, "hd.soot", 260, 20, 1.2, ev=4) + 0.3 * streak)
+    col = lerp(col, rgb(0.14, 0.13, 0.12), soot)
     g = 0.46 - 0.12 * smoothstep(0.75, 1.0, heat) + 0.05 * mid
     g = lerp(g, 0.32, bead)
     g = g * (1 - 0.75 * soot)
@@ -696,21 +911,23 @@ def tex_lines():
     for _ in range(12):
         r = R.uniform(1.0, 3.0); dpt = R.uniform(0.08, 0.2) * r
         stamp(dings, R.uniform(0, N), R.uniform(0, N), r, r, lambda dx, dy: -dpt * np.exp(-(dx * dx + dy * dy) / (r * r)))
-    grime = np.clip(0.25 * smoothstep(0.8, 2.2, fnoise(sh, "ln.grime", 260, 12, 1.1, ev=3)), 0, 0.3)
-    hgt = 0.09 * brush + 0.04 * brush2 + 0.02 * grain + dings - 0.25 * scr
+    # round 2: worn stainless, not polished chrome; duller, less streaky gloss, a little more grime
+    grime = np.clip(0.32 * smoothstep(0.6, 2.2, fnoise(sh, "ln.grime", 260, 12, 1.1, ev=3)), 0, 0.4)
+    hgt = 0.07 * brush + 0.04 * brush2 + 0.02 * grain + dings - 0.25 * scr
     nrm = normal_map(hgt)
-    k = 1 + 0.03 * mott + 0.06 * brush + 0.03 * brush2 + 0.01 * grain
+    k = 1 + 0.035 * mott + 0.04 * brush + 0.025 * brush2 + 0.01 * grain
     col = rgb(0.50, 0.505, 0.515) * k[..., None] + hue[..., None] * rgb(0.008, 0.003, -0.008)
-    col = col * (1 - 0.05 * smud)[..., None]
-    col = lerp(col, rgb(0.32, 0.30, 0.28), grime)
+    col = col * (1 - 0.07 * smud)[..., None]
+    col = lerp(col, rgb(0.30, 0.285, 0.265), grime)
     col = col + (0.07 * scr)[..., None]
-    g = 0.56 + 0.15 * brush + 0.05 * brush2 + 0.04 * mott - 0.14 * smud + 0.22 * scr
+    g = 0.42 + 0.08 * brush + 0.04 * brush2 + 0.04 * mott - 0.12 * smud + 0.2 * scr
     g = g * (1 - 0.7 * grime)
     return col, g, nrm, {"wrap_v": True, "vs": 1.0}
 
 
-BUILDERS = {"regen": tex_regen, "steel": tex_steel, "bolts": tex_bolts, "soot": tex_soot, "niobium": tex_niobium,
-            "carbon": tex_carbon, "foil": tex_foil, "hotduct": tex_hotduct, "lines": tex_lines}
+BUILDERS = {"regen": tex_regen, "regen_k": tex_regen_k, "jacket": tex_jacket, "steel": tex_steel, "bolts": tex_bolts,
+            "soot": tex_soot, "niobium": tex_niobium, "carbon": tex_carbon, "foil": tex_foil, "hotduct": tex_hotduct,
+            "lines": tex_lines}
 
 
 # ============================================================================================== PNG output
@@ -786,19 +1003,49 @@ def seam_stats(img, axis, phase=0):
     return edge, ref, edge / max(ref, 1e-9)
 
 
-def check(name, alb, nm, meta, worst):
+def edge_line_stats(img, axis, phase=0):
+    """Mean signed value of every column (axis 1: the lines across U) or row (axis 0), per channel, and how far
+    the two edge lines stand out from the interior lines: a step that both edge lines share (a height step at the
+    wrap tilts both edge columns of the normal map the same way, so their difference stays small) shows here.
+    With a structural period, line 0 is compared with lines k*phase and the last line with lines k*phase - 1.
+    Returns (r, z): r = |edge - interior median| / the largest interior deviation (> 1: more extreme than every
+    interior line), z = the same over the robust spread (1.4826 MAD); both the worst over channels and edges."""
+    a = img.astype(np.float64)
+    if axis == 0: a = a.transpose(1, 0, 2)
+    m = a.mean(axis=0)                                                # [lines, channels]
+    p = phase or 1
+    groups = ((m[0], m[p::p] if p > 1 else m[1:-1]), (m[-1], m[p - 1:-1:p] if p > 1 else m[1:-1]))
+    r = z = 0.0
+    for e, grp in groups:
+        med = np.median(grp, axis=0)
+        dev = np.abs(grp - med)
+        d = np.abs(e - med)
+        r_c = d / np.maximum(dev.max(axis=0), 0.5)                    # floors: half an 8-bit level
+        z_c = d / np.maximum(1.4826 * np.median(dev, axis=0), 0.25)
+        bad = np.argmax(np.minimum(r_c, z_c / 5))                     # the channel closest to failing both
+        if min(r_c[bad], z_c[bad] / 5) > min(r, z / 5): r, z = float(r_c[bad]), float(z_c[bad])
+    return r, z
+
+
+SEAM_RATIO_MAX = 1.5            # wrap-edge |diff| over the interior's
+EDGE_R_MAX, EDGE_Z_MAX = 1.25, 6.0   # an edge line fails when it beats both
+
+
+def check(name, alb, nm, meta, worst, fails):
     lines = []
     for label, img in (("albedo", alb), ("normal", nm)):
         sc = img.shape[1] / alb.shape[1]
         pu = int(meta.get("phase_u", 0) * sc); pv = int(meta.get("phase_v", 0) * sc)
-        eu, iu, ru = seam_stats(img, 1, pu)
-        s = f"  {name:8s} {label:6s} {img.shape[1]}x{img.shape[0]}  U edge {eu:5.2f} / interior {iu:5.2f} = {ru:4.2f}"
-        worst.append(ru)
-        if meta["wrap_v"]:
-            ev, iv, rv = seam_stats(img, 0, pv)
-            s += f"   V edge {ev:5.2f} / interior {iv:5.2f} = {rv:4.2f}"
-            worst.append(rv)
-        else: s += "   V clamp (not checked)"
+        axes = [("U", 1, pu)] + ([("V", 0, pv)] if meta["wrap_v"] else [])
+        s = f"  {name:8s} {label:6s} {img.shape[1]}x{img.shape[0]}"
+        for ax, axis, ph in axes:
+            e, i, ratio = seam_stats(img, axis, ph)
+            r, z = edge_line_stats(img, axis, ph)
+            worst.append(ratio)
+            bad = ratio > SEAM_RATIO_MAX or (r > EDGE_R_MAX and z > EDGE_Z_MAX)
+            if bad: fails.append(f"{name} {label} {ax}")
+            s += f"  {ax} edge {e:5.2f} / interior {i:5.2f} = {ratio:4.2f}, edge line r {r:4.2f} z {z:4.1f}{' FAIL' if bad else ''}"
+        if not meta["wrap_v"]: s += "  V clamp"
         lines.append(s)
     n = nm.astype(float) / 255 * 2 - 1
     lines.append(f"  {name:8s} albedo mean RGB {alb[..., :3].reshape(-1, 3).mean(0).round(1)}  gloss mean {alb[..., 3].mean():.1f}"
@@ -870,24 +1117,51 @@ def write_sheet(path, name, alb, nm, vs=1.0):
 def build(o):
     os.makedirs(o["out"], exist_ok=True)
     if o["sheets"]: os.makedirs(o["sheets"], exist_ok=True)
-    report, worst = [], []
+    report, worst, fails = [], [], []
     t_all = time.time()
-    for name in o["only"]:
+    normals = {}    # encoded normal maps built in this run, for the SHARED_NORMAL check
+    for name in sorted(o["only"], key=lambda n: n in SHARED_NORMAL):    # fallback surfaces first
         t0 = time.time()
         col, g, nrm, meta = BUILDERS[name]()
         alb, nm = encode(col, g, nrm)
-        for suffix, img in (("", alb), ("_n", nm)):
+        normals[name] = nm
+        if name in SHARED_NORMAL:
+            shared_normal_check(name, nm, normals, o["out"])
+            if os.path.exists(os.path.join(o["out"], name + "_n.png")):
+                print(f"[surfaces] WARNING {name}_n.png in {o['out']} is stale (not written any more): the plugin would "
+                      f"load it instead of {SHARED_NORMAL[name]}_n.png, delete it")
+        # regen_k shares regen's relief (only the soot differs): no regen_k_n.png, the plugin falls back to regen_n
+        for suffix, img in (("", alb),) + ((("_n", nm),) if name not in SHARED_NORMAL else ()):
             path = os.path.join(o["out"], name + suffix + ".png")
             write_png(path, img)
             if not np.array_equal(read_png(path), img): raise SystemExit("PNG round trip failed: " + path)
-        report += check(name, alb, nm, meta, worst)
+        report += check(name, alb, nm, meta, worst, fails)
         if o["sheets"]: write_sheet(os.path.join(o["sheets"], name + "_sheet.png"), name, alb, nm, meta.get("vs", 1.0))
-        kb = sum(os.path.getsize(os.path.join(o["out"], name + s)) for s in (".png", "_n.png")) / 1024
+        kb = sum(os.path.getsize(os.path.join(o["out"], name + s)) for s in (".png", "_n.png") if os.path.exists(os.path.join(o["out"], name + s))) / 1024
         print(f"[surfaces] {name:8s} {alb.shape[1]}x{alb.shape[0]} / {nm.shape[1]}x{nm.shape[0]}  {kb:7.0f} KB  {time.time() - t0:5.1f} s", flush=True)
     print("[surfaces] seam check, mean |diff| of 8-bit values across the wrap edge / between interior neighbours"
-          " (same phase for tubes and tows); ~1 = seamless:")
+          " (same phase for tubes and tows), ~1 = seamless, fails above", SEAM_RATIO_MAX, "; edge line: how far the"
+          " mean of an edge column/row stands out from the interior ones (r > 1: beyond every interior line, z: in"
+          " robust sigmas), fails above r", EDGE_R_MAX, "and z", EDGE_Z_MAX)
     for line in report: print(line)
     print(f"[surfaces] worst seam ratio {max(worst):.2f}; done in {time.time() - t_all:.1f} s -> {o['out']}")
+    if fails: raise SystemExit("[surfaces] SEAM CHECK FAILED: " + ", ".join(fails))
+
+
+def shared_normal_check(name, nm, normals, out):
+    """A SHARED_NORMAL surface ships no _n.png: in game (and in the --render previews) it is lit with its fallback's
+    normal map, so its own relief must still be exactly that one. Compared with the fallback built in this run, or
+    else with the fallback's _n.png already in the output directory; a mismatch fails the build."""
+    fb = SHARED_NORMAL[name]
+    path = os.path.join(out, fb + "_n.png")
+    ref = normals.get(fb)
+    if ref is None and os.path.exists(path): ref = read_png(path)
+    if ref is None:
+        print(f"[surfaces] note: {name} uses {fb}_n.png, which is neither built here nor in {out}: relief not checked")
+    elif ref.shape != nm.shape or not np.array_equal(ref, nm):
+        raise SystemExit(f"[surfaces] {name}'s relief no longer matches {fb}_n.png, which the game uses for it: rebuild "
+                         f"{fb} too, or give {name} its own normal map (remove it from SHARED_NORMAL and from "
+                         f"EngineMaterials.FallbackSurface)")
 
 
 def main():
@@ -900,29 +1174,51 @@ def main():
 
 # ============================================================================================== Blender previews
 
-# Material settings the way the plugin used them before this pass (EngineMaterials.Make: tint, _Shininess,
-# _SpecColor), so the preview approximates KSP/Bumped Specular: Lambert diffuse of albedo x tint plus a
-# Blinn-Phong lobe of specColor x gloss (alpha) with exponent shininess x 128.
+# Material settings mirroring EngineMaterials (tint, _Shininess, _SpecColor) with the round-2 values from the
+# visual critique (regen/jacket tints and dimmer near-neutral specular, duller lines, darker niobium, sharper foil,
+# per-propellant hot duct), so the preview approximates KSP/Bumped Specular: Lambert diffuse of albedo x tint plus
+# a Blinn-Phong lobe of specColor x gloss (alpha) with exponent shininess x 128. Key -> (texture, tint, shininess,
+# specColor). The game renders in gamma space and Cycles in linear, so judge colour in game; these are for detail,
+# scale and seams.
+def _regen_spec(t, k=0.48):
+    return tuple(k * (1 + c) / 2 for c in t)        # k * Lerp(white, tint, 0.5)
+
+
+_KERO, _METH, _HYDRO = (0.78, 0.66, 0.55), (0.86, 0.83, 0.80), (0.92, 0.92, 0.92)
+_JKERO, _JMETH = (0.68, 0.60, 0.53), (0.84, 0.81, 0.78)
 PREVIEW_MATS = {
-    "steel": ((1, 1, 1), 0.3, (0.66, 0.66, 0.68)),
-    "machine": ((0.5, 0.51, 0.55), 0.3, (0.55, 0.55, 0.57)),
-    "bolts": ((1, 1, 1), 0.36, (0.72, 0.72, 0.74)),
-    "regen": ((1, 1, 1), 0.32, (0.86, 0.76, 0.64)),
-    "regen_kerolox": ((1, 0.88, 0.76), 0.32, (0.86, 0.669, 0.486)),
-    "soot_hydrolox": ((0.42, 0.32, 0.26), 0.3, (0.16, 0.16, 0.16)),
-    "soot_kerolox": ((0.07, 0.065, 0.06), 0.3, (0.16, 0.16, 0.16)),
-    "niobium": ((1, 1, 1), 0.13, (0.42, 0.41, 0.45)),
-    "carbon": ((1, 1, 1), 0.2, (0.4, 0.4, 0.42)),
-    "foil": ((1, 1, 1), 0.2, (1.0, 0.86, 0.56)),
-    "hotduct": ((1, 1, 1), 0.26, (0.58, 0.56, 0.55)),
-    "lines": ((1, 1, 1), 0.45, (0.85, 0.85, 0.86)),
+    "steel": ("steel", (1, 1, 1), 0.3, (0.66, 0.66, 0.68)),
+    "bellsteel_kerolox": ("steel", (0.72, 0.62, 0.54), 0.3, (0.45, 0.45, 0.46)),
+    "bolts": ("bolts", (1, 1, 1), 0.36, (0.72, 0.72, 0.74)),
+    "regen_hydrolox": ("regen", _HYDRO, 0.45, _regen_spec(_HYDRO)),
+    "regen_methalox": ("regen", _METH, 0.45, _regen_spec(_METH)),
+    "regen_kerolox": ("regen", _KERO, 0.45, _regen_spec(_KERO)),
+    "regen_k": ("regen_k", _KERO, 0.45, _regen_spec(_KERO)),
+    "jacket_kerolox": ("jacket", _JKERO, 0.35, _regen_spec(_JKERO, 0.4)),
+    "jacket_methalox": ("jacket", _JMETH, 0.35, _regen_spec(_JMETH, 0.4)),
+    "soot_hydrolox": ("soot", (0.42, 0.32, 0.26), 0.3, (0.16, 0.16, 0.16)),
+    "soot_methalox": ("soot", (0.2, 0.18, 0.16), 0.3, (0.16, 0.16, 0.16)),
+    "soot_kerolox": ("soot", (0.07, 0.065, 0.06), 0.3, (0.16, 0.16, 0.16)),
+    "niobium": ("niobium", (1, 1, 1), 0.25, (0.35, 0.35, 0.37)),
+    "carbon": ("carbon", (1, 1, 1), 0.2, (0.3, 0.3, 0.31)),
+    "foil": ("foil", (1, 1, 1), 0.6, (1.0, 0.86, 0.56)),
+    "hotduct_kerolox": ("hotduct", (0.62, 0.58, 0.55), 0.26, (0.40, 0.39, 0.38)),
+    "lines": ("lines", (0.9, 0.9, 0.91), 0.45, (0.52, 0.52, 0.53)),
 }
+
+# Shot list (--shots a,b renders a subset; names without .png)
+SHOTS = ["engine_niobium", "throat_close", "bell_close", "flange_close", "inside",
+         "engine_regen_k", "exit_regen_k", "chamber_regen_k", "far_regen_k", "mid_regen_k",
+         "engine_jacket", "throat_jacket", "chamber_jacket", "far_jacket", "engine_jacket_methalox",
+         "cutaway_soot_hydrolox", "cutaway_soot_kerolox",
+         "engine_carbon", "ext_carbon_close", "ext_close_regenjoint", "pipes", "pipes_close"]
 
 
 def render_previews(o):
     import bpy
     from mathutils import Vector
     surf, out = o["out"], o["render"]
+    want = set(o.get("shots") or SHOTS)
     os.makedirs(out, exist_ok=True)
     bpy.ops.wm.read_factory_settings(use_empty=True)
     sc = bpy.context.scene
@@ -950,15 +1246,18 @@ def render_previews(o):
 
     def image(name, non_color):
         if name not in images:
-            im = bpy.data.images.load(os.path.join(surf, name + ".png"))
+            path = os.path.join(surf, name + ".png")
+            if not os.path.exists(path):
+                raise SystemExit(f"[render] {path} is missing: build the surfaces first (drop --no-build, or --out DIR "
+                                 f"where they were written)")
+            im = bpy.data.images.load(path)
             if non_color: im.colorspace_settings.name = "Non-Color"
             else: im.alpha_mode = "CHANNEL_PACKED"
             images[name] = im
         return images[name]
 
     def material(key, clamp_v=False):
-        tex = key.split("_")[0]
-        tint, shin, spec = PREVIEW_MATS[key]
+        tex, tint, shin, spec = PREVIEW_MATS[key]
         m = bpy.data.materials.new(key)
         m.use_nodes = True
         nt = m.node_tree
@@ -973,7 +1272,8 @@ def render_previews(o):
             comb = N("ShaderNodeCombineXYZ"); L(fr.outputs[0], comb.inputs[0]); L(cl.outputs[0], comb.inputs[1])
             vec = comb.outputs[0]
         ti = N("ShaderNodeTexImage"); ti.image = image(tex, False); L(vec, ti.inputs[0])
-        tn = N("ShaderNodeTexImage"); tn.image = image(tex + "_n", True); L(vec, tn.inputs[0])
+        # a SHARED_NORMAL surface has no _n.png: the plugin lights it with its fallback's normal map, and so do we
+        tn = N("ShaderNodeTexImage"); tn.image = image(SHARED_NORMAL.get(tex, tex) + "_n", True); L(vec, tn.inputs[0])
         if clamp_v: ti.extension = tn.extension = "EXTEND"
         nm = N("ShaderNodeNormalMap"); nm.space = "TANGENT"; nm.uv_map = "UVMap"; L(tn.outputs["Color"], nm.inputs["Color"])
         mul = N("ShaderNodeMix"); mul.data_type = "RGBA"; mul.blend_type = "MULTIPLY"; mul.inputs["Factor"].default_value = 1
@@ -1014,7 +1314,7 @@ def render_previews(o):
         sc.collection.objects.link(ob)
         return ob
 
-    def lathe(name, prof, material_, u_tiles=1.0, v_len=1.0, v_off=0.0, inward=False, ring=192, sweep=1.0):
+    def lathe(name, prof, material_, u_tiles=1.0, v_len=1.0, v_off=0.0, inward=False, ring=256, sweep=1.0):
         """EngineGeometry/MeshBuilder.Lathe mapping: U = u_tiles around, V = v_off + arc length / v_len.
         sweep < 1 revolves only that fraction of a turn (cutaways)."""
         prof = np.asarray(prof, float)
@@ -1080,80 +1380,124 @@ def render_previews(o):
         lathe(name + "_rim", line(r + t, z_top, r + t, z_bot), mat("bolts", True), bolts, h)
         lathe(name + "_bot", line(r + t, z_bot, r * 0.995, z_bot), mat(steel_key), 8, 0.6)
 
-    def build_engine(ext_key, regen_key, soot_key):
+    def clear():
         for ob in list(bpy.data.objects):
             if ob.type == "MESH": bpy.data.objects.remove(ob)
+
+    def build_engine(wall_key, soot_key, ext_key=None, eps_regen=10.0, eps_ext=35.0, band_key="steel", chamber_key=None):
+        """EngineGeometry's layout: steel dome and injector flange; the tube wall (or jacket) runs from the
+        flange down the chamber (V 1 -> 0.5), the convergent (0.5 -> 0) and the bell (0 -> 1 at the regen end);
+        tube count from the regen-end circumference (~20 mm tubes, >= 3.5 mm at the throat). chamber_key: the
+        chamber and convergent material when it differs from the bell's (kerolox: plain regen up top, regen_k on
+        the bell, as EngineMaterials does)."""
+        chamber_key = chamber_key or wall_key
+        clear()
         rt, rc, lc = 0.12, 0.21, 0.30
-        tubes = min(max(round(2 * math.pi * rc / 0.035 * 2 / 16) * 16, 24), 240)
-        tiles = tubes / 16
+        r_end = rt * math.sqrt(eps_regen)
+        tiles = min(max(round(2 * math.pi * r_end / 0.020 / TUBES), 2), 8)
+        tiles = max(2, min(tiles, math.floor(2 * math.pi * rt / 0.0035 / TUBES)))
         lathe("dome", [(rc * 0.45 + (rc - rc * 0.45) * math.sin(t), lc + 0.07 + 0.08 * math.cos(t)) for t in np.linspace(0, math.pi / 2, 13)], mat("steel"), 4, 0.6)
         flange("inj", rc, lc + 0.07, lc + 0.025, 0.02)
-        lathe("chamber", line(rc, lc + 0.025, rc, 0.0, 4), mat("steel"), max(1, round(2 * math.pi * rc / 0.6)), 0.6)
+        lathe("chamber", line(rc, lc + 0.025, rc, 0.0, 4), mat(chamber_key, True), tiles, -2 * (lc + 0.025), 1.0)
+        for zb in (0.08, 0.2):                                   # the two chamber stiffener bands
+            t = 0.006; h = 0.03
+            lathe("cband%.2f" % zb, [(rc, zb + h / 2 + 0.004), (rc + t, zb + h / 2), (rc + t, zb - h / 2), (rc, zb - h / 2 - 0.004)], mat(band_key), 2, 0.6)
         r_arc = 2.5 * rt - 1.5 * rt * math.sin(math.radians(60))
         cone = max(rc - r_arc, 0) / math.tan(math.radians(30))
         zt = -cone - 0.75 * rt
         conv = [(rc, 0.0)] + [(2.5 * rt + 1.5 * rt * math.sin(th), zt - 1.5 * rt * math.cos(th))
                               for th in np.radians(np.linspace(-120, -90, 13))]
-        lathe("conv", conv, mat(regen_key, True), tiles, -2 * arc_len(conv), 0.5)
-        re = rt * math.sqrt(10)
-        bell = bezier_bell(rt, zt, re, 0.8 * (re - rt) / math.tan(math.radians(15)))
-        lathe("regen", bell, mat(regen_key, True), tiles, arc_len(bell))
+        lathe("conv", conv, mat(chamber_key, True), tiles, -2 * arc_len(conv), 0.5)
+        bell = bezier_bell(rt, zt, r_end, 0.8 * (r_end - rt) / math.tan(math.radians(15)))
+        lathe("regen", bell, mat(wall_key, True), tiles, arc_len(bell))
         z_end = bell[-1][1]
         inner = [(r - 0.004, z) for r, z in bell][::-1]
-        lathe("soot", inner, mat(soot_key), 8, max(0.3, re), inward=True)
+        lathe("soot", inner, mat(soot_key), 8, max(0.3, r_end), inward=True)
         lathe("throat_cap", line(rt - 0.004, zt, 0.001, zt), mat(soot_key), 1, 1)   # faces down the bell
-        # the joint flange sits on the regen end; the extension continues to eps 35
-        flange("joint", re, z_end + 0.022, z_end - 0.012, 0.016)
-        r2 = rt * math.sqrt(35)
-        ext = bezier_bell(re, z_end, r2, (r2 - re) / math.tan(math.radians(9)), 9.5, 6.0, 40)
-        circ = 2 * math.pi * r2
-        lathe("ext", ext, mat(ext_key), max(1, round(circ / 0.8)), 0.8)
-        lathe("ext_in", [(r - 0.004, z) for r, z in ext], mat(ext_key), max(1, round(circ / 0.8)), 0.8, inward=True)
-        return zt, z_end, ext[-1][1]
+        z_exit = z_end
+        if ext_key:
+            # the joint flange sits on the regen end; the extension continues
+            flange("joint", r_end, z_end + 0.022, z_end - 0.012, 0.016)
+            r2 = rt * math.sqrt(eps_ext)
+            ext = bezier_bell(r_end, z_end, r2, (r2 - r_end) / math.tan(math.radians(9)), 9.5, 6.0, 40)
+            circ = 2 * math.pi * r2
+            lathe("ext", ext, mat(ext_key), max(1, round(circ / 0.8)), 0.8)
+            lathe("ext_in", [(r - 0.004, z) for r, z in ext], mat(ext_key), max(1, round(circ / 0.8)), 0.8, inward=True)
+            z_exit = ext[-1][1]
+        else:
+            lathe("lip", [(r_end, z_end), (r_end + 0.006, z_end + 0.002), (r_end + 0.006, z_end + 0.03), (r_end, z_end + 0.034)], mat(band_key), 4, 0.6)
+        print(f"[render] engine {wall_key}: {tiles * TUBES} tubes, throat z {zt:.3f}, regen end z {z_end:.3f}, exit z {z_exit:.3f}", flush=True)
+        return zt, z_end, z_exit
 
-    def shoot(path, loc, target, lens=50, sun_rot=(52, 0, 35)):
+    def shoot(name, loc, target, lens=50, sun_rot=(52, 0, 35)):
+        if name not in want: return
         cam.location = Vector(loc)
         cam.data.lens = lens
         cam.rotation_euler = (Vector(target) - cam.location).to_track_quat("-Z", "Y").to_euler()
         sun.rotation_euler = tuple(math.radians(a) for a in sun_rot)
-        sc.render.filepath = os.path.join(out, path)
+        sc.render.filepath = os.path.join(out, name + ".png")
         t0 = time.time()
         bpy.ops.render.render(write_still=True)
-        print(f"[render] {path} {time.time() - t0:.1f} s", flush=True)
+        print(f"[render] {name}.png {time.time() - t0:.1f} s", flush=True)
 
-    zt, z_end, z_exit = build_engine("niobium", "regen", "soot_hydrolox")
-    shoot("engine_niobium.png", (2.6, -2.2, -0.2), (0, 0, -0.75), 40)
-    shoot("throat_close.png", (0.55, -0.45, zt + 0.05), (0, 0, zt - 0.05), 50)
-    shoot("bell_close.png", (0.75, -0.55, z_end + 0.25), (0.15, 0, z_end + 0.05), 50, (40, 0, 60))
-    shoot("flange_close.png", (0.42, -0.3, 0.42), (0.1, 0, 0.3), 50)
-    shoot("inside.png", (0.25, -0.2, z_exit - 1.6), (0, 0, zt), 35, (150, 0, 30))   # sun shining up into the bell
-    for soot_key, regen_key in (("soot_hydrolox", "regen"), ("soot_kerolox", "regen_kerolox")):
+    def any_of(*names):
+        return any(n in want for n in names)
+
+    if any_of("engine_niobium", "throat_close", "bell_close", "flange_close", "inside"):
+        zt, z_end, z_exit = build_engine("regen_hydrolox", "soot_hydrolox", "niobium")
+        shoot("engine_niobium", (2.6, -2.2, -0.2), (0, 0, -0.75), 40)
+        shoot("throat_close", (0.55, -0.45, zt + 0.05), (0, 0, zt - 0.05), 50)
+        shoot("bell_close", (0.75, -0.55, z_end + 0.25), (0.15, 0, z_end + 0.05), 50, (40, 0, 60))
+        shoot("flange_close", (0.42, -0.3, 0.42), (0.1, 0, 0.3), 50)
+        shoot("inside", (0.25, -0.2, z_exit - 1.6), (0, 0, zt), 35, (150, 0, 30))   # sun shining up into the bell
+    # kerolox sea-level tube wall (KeroloxGG-like, all-regen bell to eps 16, 160 tubes): fired exterior soot
+    if any_of("engine_regen_k", "exit_regen_k", "chamber_regen_k", "far_regen_k", "mid_regen_k"):
+        zt, z_end, z_exit = build_engine("regen_k", "soot_kerolox", None, 16.0, band_key="bellsteel_kerolox", chamber_key="regen_kerolox")
+        zc = 0.5 * (0.45 + z_exit)
+        shoot("engine_regen_k", (2.4, -2.0, zc + 0.3), (0, 0, zc), 40)
+        shoot("exit_regen_k", (0.95, -0.75, z_exit + 0.3), (0.2, 0, z_exit + 0.12), 50, (40, 0, 60))
+        shoot("chamber_regen_k", (0.6, -0.45, 0.3), (0.05, 0, 0.12), 50, (40, 0, 60))
+        shoot("mid_regen_k", (4.3, -3.6, zc + 0.5), (0, 0, zc), 50)       # ~2.5-3 px per tube at the exit
+        shoot("far_regen_k", (8.6, -7.2, zc + 1.0), (0, 0, zc), 50)       # ~1.3 px per tube
+    # staged-combustion style channel wall (jacket), kerolox and methalox
+    if any_of("engine_jacket", "throat_jacket", "chamber_jacket", "far_jacket"):
+        zt, z_end, z_exit = build_engine("jacket_kerolox", "soot_kerolox", None, 20.0, band_key="bellsteel_kerolox")
+        zc = 0.5 * (0.45 + z_exit)
+        shoot("engine_jacket", (2.5, -2.1, zc + 0.3), (0, 0, zc), 40)
+        shoot("throat_jacket", (0.6, -0.5, zt + 0.1), (0, 0, zt - 0.08), 50, (40, 0, 60))
+        shoot("chamber_jacket", (0.6, -0.45, 0.3), (0.05, 0, 0.12), 50, (40, 0, 60))
+        shoot("far_jacket", (8.6, -7.2, zc + 1.0), (0, 0, zc), 50)
+    if any_of("engine_jacket_methalox"):
+        zt, z_end, z_exit = build_engine("jacket_methalox", "soot_methalox", None, 20.0)
+        zc = 0.5 * (0.45 + z_exit)
+        shoot("engine_jacket_methalox", (2.5, -2.1, zc + 0.3), (0, 0, zc), 40, (40, 0, 60))
+    for soot_key, regen_key in (("soot_hydrolox", "regen_hydrolox"), ("soot_kerolox", "regen_k")):
+        if "cutaway_" + soot_key not in want: continue
         # cutaway of an all-regen bell (half a turn) to show the inside wall, lit from the open side
-        for ob in list(bpy.data.objects):
-            if ob.type == "MESH": bpy.data.objects.remove(ob)
+        clear()
         rt = 0.12
         re = rt * math.sqrt(16)
         bell = bezier_bell(rt, 0.0, re, 0.8 * (re - rt) / math.tan(math.radians(15)))
-        tiles = 5
-        lathe("regen_half", bell, mat(regen_key, True), tiles, arc_len(bell), sweep=0.5)
+        lathe("regen_half", bell, mat(regen_key, True), 5, arc_len(bell), sweep=0.5)
         inner = [(r - 0.006, z) for r, z in bell][::-1]
         lathe("soot_half", inner, mat(soot_key), 8, max(0.3, re), inward=True, sweep=0.5)
-        shoot(f"cutaway_{soot_key}.png", (-1.5, -0.9, -0.35), (0.12, 0, -0.62), 45, (60, 0, -110))
-    build_engine("carbon", "regen_kerolox", "soot_kerolox")
-    shoot("engine_carbon_kerolox.png", (2.6, -2.2, -0.2), (0, 0, -0.75), 40)
-    shoot("ext_carbon_close.png", (1.05, -0.8, z_exit + 0.45), (0.35, 0, z_exit + 0.15), 50, (40, 0, 60))
-    shoot("ext_close_regenjoint.png", (0.9, -0.7, z_end + 0.05), (0.25, 0, z_end - 0.15), 50, (40, 0, 60))
-    for ob in list(bpy.data.objects):
-        if ob.type == "MESH": bpy.data.objects.remove(ob)
-    for k, (key, r) in enumerate((("foil", 0.035), ("hotduct", 0.05), ("lines", 0.03))):
-        y = (k - 1) * 0.22
-        pts = [(-0.55 + 0.02 * i, y, 0.2) for i in range(20)]
-        cx, cz, R = -0.17, -0.05, 0.25
-        pts += [(cx + R * math.sin(a), y, cz + R * math.cos(a)) for a in np.linspace(0, math.pi / 2, 32)][1:]
-        pts += [(cx + R, y, cz - 0.02 * i) for i in range(1, 16)]
-        pipe(key, pts, r, mat(key))
-    shoot("pipes.png", (0.9, -1.2, 0.55), (-0.05, 0, -0.02), 50, (45, 0, 25))
-    shoot("pipes_close.png", (0.35, -0.55, 0.32), (0.0, 0, 0.1), 50, (45, 0, 25))
+        shoot("cutaway_" + soot_key, (-1.5, -0.9, -0.35), (0.12, 0, -0.62), 45, (60, 0, -110))
+    if any_of("engine_carbon", "ext_carbon_close", "ext_close_regenjoint"):
+        zt, z_end, z_exit = build_engine("regen_k", "soot_kerolox", "carbon", band_key="bellsteel_kerolox", chamber_key="regen_kerolox")
+        shoot("engine_carbon", (2.6, -2.2, -0.2), (0, 0, -0.75), 40)
+        shoot("ext_carbon_close", (1.05, -0.8, z_exit + 0.45), (0.35, 0, z_exit + 0.15), 50, (40, 0, 60))
+        shoot("ext_close_regenjoint", (0.9, -0.7, z_end + 0.05), (0.25, 0, z_end - 0.15), 50, (40, 0, 60))
+    if any_of("pipes", "pipes_close"):
+        clear()
+        for k, (key, r) in enumerate((("foil", 0.035), ("hotduct_kerolox", 0.05), ("lines", 0.03))):
+            y = (k - 1) * 0.22
+            pts = [(-0.55 + 0.02 * i, y, 0.2) for i in range(20)]
+            cx, cz, R = -0.17, -0.05, 0.25
+            pts += [(cx + R * math.sin(a), y, cz + R * math.cos(a)) for a in np.linspace(0, math.pi / 2, 32)][1:]
+            pts += [(cx + R, y, cz - 0.02 * i) for i in range(1, 16)]
+            pipe(key, pts, r, mat(key))
+        shoot("pipes", (0.9, -1.2, 0.55), (-0.05, 0, -0.02), 50, (45, 0, 25))
+        shoot("pipes_close", (0.35, -0.55, 0.32), (0.0, 0, 0.1), 50, (45, 0, 25))
     print("[render] done ->", out)
 
 

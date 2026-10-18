@@ -134,6 +134,102 @@ Every piece falls back to the previous primitives if its file is missing.
 
 **Tests:** `visual.kit_assets` now checks all eight pieces, their key anchors and the DXT1 atlas. Visual 7/7, sandbox 24/24.
 
+## Realism pass (higher poly, wear, BDB-level target)
+
+This answers the user's request for higher-poly, more realistic models with worn, test-fired textures, at the level of BDB, Tantares and Artemis Construction Kit. It was done in two build rounds by parallel agents working against a written contract, [ASSETS.md](ASSETS.md). Each round was followed by an adversarial code review (findings checked by independent skeptics) and a visual critique of in-game screenshots.
+
+**Kit pieces (`tools/blender/build_kit.py`):**
+- Every piece is remodelled with filleted profiles and bevelled edges. Added details: hex bolts with washers, weld beads, cast ribs and gussets, harnesses with P-clips, sensors, connectors and data plates.
+- Triangle budgets: up to about 43k per pump, about 15k per preburner or gas generator.
+- Twelve procedural wear materials are baked into a 2048² atlas: colour × AO, gloss in alpha, and a tangent normal map.
+  - The wear includes cavity grime, worn edges, drips, dust, soot, heat tint, chipped paint, scratches and cast grain.
+  - The upside-down staged-combustion pumps get their own `_inv` bakes, so the drips fall the right way.
+- Exports are `.pem` v2 (MikkTSpace tangents) plus decimated `.lod1.pem` files.
+- An export-time tangent check runs on every export; `tools/blender/check_kit.py` checks the shipped files.
+- Safe partial rebuilds: `--only` refuses to overwrite the shipped atlas, and `--export-only` works from a hand-edited `kit.blend`.
+
+**Surfaces (`tools/blender/build_surfaces.py`, new):**
+- Eleven tiling worn surfaces are generated offline with numpy: regen tubes, the kerolox `regen_k` with fired soot, the channel-wall `jacket`, steel, hex bolts, soot, niobium, carbon-carbon, MLI foil, hot duct and lines.
+- Each has albedo + gloss and its own normal map (`regen_k` shares the regen normal map).
+- Builds are deterministic and fail on any seam-check breach.
+
+**Geometry (`EngineGeometry`):**
+- Filleted and welded profiles everywhere, and a rolled exit lip.
+- A 96-point Rao contour at LOD0, with 64–192 ring segments.
+- **Wall construction per cycle:**
+  - tube walls for pressure-fed, expander, and Early/Mid gas generators;
+  - a smooth channel-wall jacket for staged combustion, full flow and Late gas generators;
+  - hydrogen engines keep tubes on the bell, RS-25 style.
+- The cooled wall now runs up the chamber to the injector flange (no more steel "keg").
+- Tube counts follow the regen-end circumference (about 20 mm tubes, 96–448 per bell).
+- Wide hat-section bands.
+
+**Kit placement (`KitBuilder`):**
+- Fat outboard gimbal actuators that stretch to length (template-vertex stretch zones), with outriggers and bell lugs.
+- A full-size staged-combustion powerhead: upside-down pumps with preburners, fat hot-gas ducts onto the dome, inlet U-ducts and struts.
+- Discharge lines at 30 m/s with reducers, and coaxial valves on straight runs.
+- The gas-generator exhaust duct runs on the free side down to the exit, with clamps.
+- Smaller bare-metal pressure bottles with hangers.
+- P-clamps, brackets and chamber cable runs.
+- Everything stays below the mount plate.
+
+**Materials and glow:**
+- Retuned under KSP lighting: dark bronze kerolox walls, neutral specular, worn stainless lines, dark silicide niobium, a finer carbon weave, sooty hot ducts, and lighter castings with dark accents.
+- The glow no longer saturates. The radiative extension cools quickly, and its glowing band recedes toward the joint.
+
+**Performance and engineering:**
+- **LODs:** three levels in a `LODGroup`, with thresholds 0.25 / 0.03 (raw; KSP's lodBias of 2 halves them).
+- **Shared mesh cache:** reference-counted render meshes, so symmetry, clusters and LMP clients build once.
+- **Flight:** LOD0 is deferred through a queue (`Lod0Pending`). The prefab builds LOD1 only. Flight meshes drop their CPU copy when no mesh-reading mod is loaded.
+- **Builders:** pooled `MeshBuilder`s, so drags create no per-rebuild garbage.
+- **FAR:** a `forceUseColliders` patch.
+- **Fixes:**
+  - a crash for expansion ratios just above the regen limit;
+  - a `GameEvents` hook that registered a static method.
+- **Texture memory:** about 34 MiB with every file loaded (DXT5). Sessions without Late-tech or channel-wall engines load less.
+
+**Verification (in game):**
+
+| Run | Result |
+|---|---|
+| sandbox (A) | 25/25, including the new `mesh.cache` check: identical engines share meshes; changing one splits them |
+| visual (B) | 7/7: all pieces and surfaces load; a low sun (~24°) so materials are seen in direct light; orbit shots from four headings, plus flight-distance shots |
+| career (B) | 6/6 |
+| LMP two-client | identical engine meshes, kit and stats on both clients |
+
+**Round 3:** fixes from a second adversarial review.
+- **Mesh copies:**
+  - The KSPCF drag-cube patch and Firefly were silently copying the shared meshes; both are now restored and the copies destroyed.
+  - The sandbox `mesh.cache` check now also runs in ksp_test_B (no FAR, KSPCF installed) and asserts there are no copies.
+- **Kit:**
+  - Centripetal splines, so lines no longer overshoot.
+  - A gimballed bell-kit mesh, with static kit clearing the bell's 10° swept envelope.
+  - A balanced 4-or-3-strut thrust frame.
+  - The staged-combustion fuel suction duct.
+  - Methalox expander lines without hydrogen foil.
+- **Housekeeping and materials:**
+  - The cache sweep is driven from the persistent addon.
+  - Textures are warmed during loading (about 0.4 s).
+  - `regen_k` is used only on bells without an extension.
+- **Pipeline safety:** atomic exports, refusal paths, `-t 1` reproducibility, variant drift checks.
+- **Final in-game results:**
+
+  | Run | Result |
+  |---|---|
+  | sandbox A (FAR) | 25/25 |
+  | sandbox B (no FAR) | 25/25 |
+  | visual | 7/7 |
+  | career | 6/6 |
+  | LMP two clients | identical |
+
+**Known follow-ups:**
+- Actuators are static, so at full gimbal the rod eye separates from the bell lug by a few centimetres. Fixing it needs actuators aimed every frame.
+- Optional 1:2 tube bifurcation on high-expansion all-regen bells.
+- A Merlin-Vac-style exhaust torus on extension engines.
+- A compact vertex layout.
+- Deferring LOD0 for distant vessels.
+- Checking with the Deferred and TexturesUnlimited mods present in ksp_mp.
+
 ## Evidence
 
 [tests/ksp/evidence/phase3/](tests/ksp/evidence/phase3/): results files, and screenshots:

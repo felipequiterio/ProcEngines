@@ -12,6 +12,11 @@ namespace ProcEngines
     /// tube (V growing along the profile or path) that is w = +1; surfaces whose V runs backwards or whose normal
     /// faces the other way get w = -1, so every normal map reads with the OpenGL convention (green = +V)
     /// everywhere. Authored pieces keep their file tangents (rotated with the piece).
+    ///
+    /// Garbage: a builder from <see cref="Pooled"/> keeps its buffers between builds (Reset keeps the capacity), and
+    /// the primitives work in per-builder scratch buffers and shared, immutable sine tables, so a rebuild through a
+    /// pooled builder allocates nothing once the buffers have grown to size. Build copies the data into the Unity
+    /// mesh (Mesh.Set* copy), so a builder can be reset and refilled right after.
     /// </summary>
     public sealed class MeshBuilder
     {
@@ -20,20 +25,74 @@ namespace ProcEngines
         readonly List<Vector2> uv;
         readonly List<int>[] tris;
 
+        // scratch, reused by the primitives (never alive across two public calls)
+        readonly List<Vector3> sweepC = new List<Vector3>(64), sweepA = new List<Vector3>(64), sweepB = new List<Vector3>(64);
+        readonly List<float> sweepR = new List<float>(64), sweepSlope = new List<float>(64), tubeS = new List<float>(64);
+        readonly float[] turnAx = new float[6], turnRa = new float[6], turnNa = new float[6], turnNr = new float[6];
+        readonly float[] zHi = new float[10], zLo = new float[10], zDelta = new float[10], zK = new float[10];
+        Vector3[] tubeDense = new Vector3[64];
+        float[] tubeCum = new float[64], tubeKappa = new float[64];
+
         public MeshBuilder(int materials) : this(materials, 1024) { }
 
-        /// <param name="vertexCapacity">Expected vertex count, to preallocate the buffers (they still grow).</param>
+        /// <param name="vertexCapacity">Expected vertex count, to preallocate the vertex buffers (they still grow). The
+        /// triangle lists start small and grow (doubling) to what each material needs, so a submesh that stays small
+        /// never holds a share of the whole mesh.</param>
         public MeshBuilder(int materials, int vertexCapacity)
         {
             int cap = Math.Max(vertexCapacity, 16);
             v = new List<Vector3>(cap); n = new List<Vector3>(cap); tg = new List<Vector4>(cap); uv = new List<Vector2>(cap);
             tris = new List<int>[Math.Max(materials, 1)];
-            for (int i = 0; i < tris.Length; i++) tris[i] = new List<int>(cap * 6 / tris.Length + 16);
+            for (int i = 0; i < tris.Length; i++) tris[i] = new List<int>(Math.Min(cap * 6 / tris.Length, 4096) + 16);
         }
 
         public int VertexCount => v.Count;
 
+        /// <summary>Number of submeshes (materials) this builder writes.</summary>
+        public int MaterialCount => tris.Length;
+
+        /// <summary>Empty every buffer but keep its capacity, so the next fill reuses the memory.</summary>
+        public void Reset()
+        {
+            v.Clear(); n.Clear(); tg.Clear(); uv.Clear();
+            for (int i = 0; i < tris.Length; i++) tris[i].Clear();
+        }
+
+        static readonly Dictionary<long, MeshBuilder> pool = new Dictionary<long, MeshBuilder>();
+
+        /// <summary>
+        /// A reset builder that is kept and reused across calls (Unity main thread only), so rebuilding a mesh doesn't
+        /// reallocate its vertex and index buffers every time. One builder per (slot, materials): it stays valid until
+        /// the next Pooled call with the same pair, so callers that fill two meshes at once use two slots (KitBuilder:
+        /// 0 = LOD0, 1 = LOD1, 4 / 5 = their bell kits; EngineGeometry.Lathe: 2 and 3). `vertexCapacity` (optional)
+        /// pre-sizes the buffers; keep it modest, since a pooled builder holds its largest size until ClearPool.
+        /// </summary>
+        public static MeshBuilder Pooled(int materials, int slot, int vertexCapacity = 0)
+        {
+            materials = Math.Max(materials, 1);
+            long key = ((long)slot << 32) | (uint)materials;
+            if (pool.TryGetValue(key, out MeshBuilder mb))
+            {
+                mb.Reset();
+                if (vertexCapacity > 0) mb.Reserve(vertexCapacity);
+                return mb;
+            }
+            mb = new MeshBuilder(materials, Math.Max(vertexCapacity, 1024));
+            pool[key] = mb;
+            return mb;
+        }
+
+        /// <summary>Drop every pooled builder (their memory goes to the GC), e.g. on a scene change.</summary>
+        public static void ClearPool() => pool.Clear();
+
         List<int> Tris(int mat) => tris[mat < 0 ? 0 : Math.Min(mat, tris.Length - 1)];
+
+        /// <summary>Move the vertices from index `from` on by `d` (normals and tangents are unchanged), e.g. into the
+        /// frame of the transform the mesh hangs under.</summary>
+        public void Translate(Vector3 d, int from = 0)
+        {
+            for (int i = Math.Max(from, 0); i < v.Count; i++) v[i] += d;
+        }
 
         void Reserve(int moreVertices)
         {
@@ -41,6 +100,12 @@ namespace ProcEngines
             if (v.Capacity >= need) return;
             int cap = Math.Max(need, v.Capacity * 2);
             v.Capacity = cap; n.Capacity = cap; tg.Capacity = cap; uv.Capacity = cap;
+        }
+
+        static T[] Grow<T>(ref T[] a, int size)
+        {
+            if (a.Length < size) a = new T[Math.Max(size, a.Length * 2)];
+            return a;
         }
 
         static void Reserve(List<int> t, int more)
@@ -71,15 +136,35 @@ namespace ProcEngines
                 for (int k = from; k + 2 < t.Count; k += 3) { int x = t[k + 1]; t[k + 1] = t[k + 2]; t[k + 2] = x; }
         }
 
+        sealed class RingTable
+        {
+            public readonly float[] Cs, Sn;
+            public RingTable(int sides)
+            {
+                Cs = new float[sides + 1]; Sn = new float[sides + 1];
+                for (int j = 0; j < sides; j++)
+                {
+                    float phi = 2 * Mathf.PI * j / sides;
+                    Cs[j] = Mathf.Cos(phi); Sn[j] = Mathf.Sin(phi);
+                }
+                Cs[sides] = 1; Sn[sides] = 0;   // the seam column repeats column 0 exactly
+            }
+        }
+
+        // shared and never written after creation (a race could only build an equal table twice)
+        static readonly RingTable[] ringTables = new RingTable[1025];
+
+        /// <summary>cos/sin of the ring angles (sides + 1 entries, the last repeating the first). The arrays are shared:
+        /// read only.</summary>
         static void Ring(int sides, out float[] cs, out float[] sn)
         {
-            cs = new float[sides + 1]; sn = new float[sides + 1];
-            for (int j = 0; j < sides; j++)
+            RingTable r = sides < ringTables.Length ? ringTables[sides] : null;
+            if (r == null)
             {
-                float phi = 2 * Mathf.PI * j / sides;
-                cs[j] = Mathf.Cos(phi); sn[j] = Mathf.Sin(phi);
+                r = new RingTable(sides);
+                if (sides < ringTables.Length) ringTables[sides] = r;
             }
-            cs[sides] = 1; sn[sides] = 0;   // the seam column repeats column 0 exactly
+            cs = r.Cs; sn = r.Sn;
         }
 
         // ------------------------------------------------------------------ lathe
@@ -141,8 +226,9 @@ namespace ProcEngines
         // ------------------------------------------------------------------ swept primitives
 
         /// <summary>Generic swept ring strip: rings[i] centre, radius, frame axes (a x b = forward). `slopes` (dr/ds)
-        /// tilts the normals of a rippled surface (bellows). V is arc length in circumferences (square texels).</summary>
-        void Sweep(IList<Vector3> centres, IList<float> radii, IList<Vector3> ax, IList<Vector3> bx, int sides, int mat, bool capStart, bool capEnd, IList<float> slopes = null)
+        /// tilts the normals of a rippled surface (bellows). V is the centre-line length over the first ring's
+        /// circumference (square texels on a tube; Sphere sets its own V).</summary>
+        void Sweep(List<Vector3> centres, List<float> radii, List<Vector3> ax, List<Vector3> bx, int sides, int mat, bool capStart, bool capEnd, List<float> slopes = null)
         {
             int count = centres.Count;
             if (count < 2) return;
@@ -201,6 +287,7 @@ namespace ProcEngines
             }
             List<int> t = Tris(mat);
             int from = t.Count;
+            Reserve(t, sides * 3);
             for (int j = 0; j < sides; j++) { t.Add(start); t.Add(start + 1 + j); t.Add(start + 2 + j); }
             FixWinding(t, from);
         }
@@ -258,10 +345,11 @@ namespace ProcEngines
         void BevelledDisc(Vector3 o, Vector3 dir, float h, float R, float rIn, float bevel, int sides, int mat)
         {
             float b = Mathf.Min(bevel, 0.45f * h, 0.45f * (R - rIn));
-            var ax = new[] { 0, 0, b, h - b, h, h };
-            var ra = new[] { rIn, R - b, R, R, R - b, rIn };
-            var na = new[] { -1f, -1f, 0, 0, 1, 1 };
-            var nr = new[] { 0f, 0, 1, 1, 0, 0 };
+            float[] ax = turnAx, ra = turnRa, na = turnNa, nr = turnNr;
+            ax[0] = 0; ax[1] = 0; ax[2] = b; ax[3] = h - b; ax[4] = h; ax[5] = h;
+            ra[0] = rIn; ra[1] = R - b; ra[2] = R; ra[3] = R; ra[4] = R - b; ra[5] = rIn;
+            na[0] = -1; na[1] = -1; na[2] = 0; na[3] = 0; na[4] = 1; na[5] = 1;
+            nr[0] = 0; nr[1] = 0; nr[2] = 1; nr[3] = 1; nr[4] = 0; nr[5] = 0;
             Turned(o, dir, ax, ra, na, nr, 6, sides, mat);
         }
 
@@ -272,10 +360,11 @@ namespace ProcEngines
             Basis(dir, out Vector3 a, out Vector3 b);
             dir.Normalize();
             // side, rounded top edge, centre: 3 rings of 7 vertices per head
-            var ax = new[] { -0.2f * hb, hb, hb };
-            var ra = new[] { rb, rb * 0.85f, 0 };
-            var na = new[] { 0f, 0.8f, 1 };
-            var nr = new[] { 1f, 0.6f, 0 };
+            float[] ax = turnAx, ra = turnRa, na = turnNa, nr = turnNr;
+            ax[0] = -0.2f * hb; ax[1] = hb; ax[2] = hb;
+            ra[0] = rb; ra[1] = rb * 0.85f; ra[2] = 0;
+            na[0] = 0; na[1] = 0.8f; na[2] = 1;
+            nr[0] = 1; nr[1] = 0.6f; nr[2] = 0;
             for (int k = 0; k < count; k++)
             {
                 float phi = 2 * Mathf.PI * (k + 0.5f) / count;
@@ -293,78 +382,127 @@ namespace ProcEngines
             if (!caps)
             {
                 Basis(d, out Vector3 a, out Vector3 b);
-                Sweep(new[] { p0, p1 }, new[] { r0, r1 }, new[] { a, a }, new[] { b, b }, sides, mat, false, false);
+                ClearSweep();
+                sweepC.Add(p0); sweepC.Add(p1); sweepR.Add(r0); sweepR.Add(r1);
+                sweepA.Add(a); sweepA.Add(a); sweepB.Add(b); sweepB.Add(b);
+                Sweep(sweepC, sweepR, sweepA, sweepB, sides, mat, false, false);
                 return;
             }
             float bev = Mathf.Min(0.07f * Mathf.Max(r0, r1), 0.2f * L);
             float k = (r1 - r0) / L;   // dr/da along the side
             float sl = 1 / Mathf.Sqrt(1 + k * k);
             float sideNa = -k * sl, sideNr = sl;   // side normal (axial, radial)
-            var ax = new[] { 0, 0, bev, L - bev, L, L };
-            var ra = new[] { 0, Mathf.Max(r0 - bev, 0), r0 + k * bev, r1 - k * bev, Mathf.Max(r1 - bev, 0), 0 };
-            var na = new[] { -1f, -1f, sideNa, sideNa, 1, 1 };
-            var nr = new[] { 0f, 0, sideNr, sideNr, 0, 0 };
+            float[] ax = turnAx, ra = turnRa, na = turnNa, nr = turnNr;
+            ax[0] = 0; ax[1] = 0; ax[2] = bev; ax[3] = L - bev; ax[4] = L; ax[5] = L;
+            ra[0] = 0; ra[1] = Mathf.Max(r0 - bev, 0); ra[2] = r0 + k * bev; ra[3] = r1 - k * bev; ra[4] = Mathf.Max(r1 - bev, 0); ra[5] = 0;
+            na[0] = -1; na[1] = -1; na[2] = sideNa; na[3] = sideNa; na[4] = 1; na[5] = 1;
+            nr[0] = 0; nr[1] = 0; nr[2] = sideNr; nr[3] = sideNr; nr[4] = 0; nr[5] = 0;
             Turned(p0, d, ax, ra, na, nr, 6, sides, mat);
+        }
+
+        void ClearSweep()
+        {
+            sweepC.Clear(); sweepR.Clear(); sweepA.Clear(); sweepB.Clear(); sweepSlope.Clear();
         }
 
         public void Cylinder(Vector3 p0, Vector3 p1, float r, int mat, int sides = 14) => Frustum(p0, p1, r, r, mat, sides);
 
+        /// <summary>UV sphere around Y. U = 0..1 around; V = 0.5 * (polar angle / pi), i.e. surface arc length over the
+        /// equator's circumference, 0 at the top pole, so the texels are square at the equator.</summary>
         public void Sphere(Vector3 c, float r, int mat, int sides = 14)
         {
             int rings = Math.Max(8, sides / 2);
-            var cs = new Vector3[rings + 1]; var rs = new float[rings + 1]; var ax = new Vector3[rings + 1]; var bx = new Vector3[rings + 1];
+            ClearSweep();
             for (int i = 0; i <= rings; i++)
             {
                 float th = Mathf.PI * i / rings;
-                cs[i] = c + Vector3.up * (r * Mathf.Cos(th)); rs[i] = Mathf.Max(r * Mathf.Sin(th), 1e-4f); ax[i] = Vector3.right; bx[i] = Vector3.forward;
+                sweepC.Add(c + Vector3.up * (r * Mathf.Cos(th))); sweepR.Add(Mathf.Max(r * Mathf.Sin(th), 1e-4f));
+                sweepA.Add(Vector3.right); sweepB.Add(Vector3.forward);
             }
-            // normals of a sphere are radial, not the ring direction: fix after the sweep (the tangents stay valid)
-            int start = v.Count;
-            Sweep(cs, rs, ax, bx, sides, mat, false, false);
-            for (int i = start; i < v.Count; i++) n[i] = (v[i] - c).normalized;
+            int start = v.Count, ring = sides + 1;
+            Sweep(sweepC, sweepR, sweepA, sweepB, sides, mat, false, false);
+            // normals of a sphere are radial, not the ring direction; and Sweep's V (centre spacing over the pole
+            // ring's tiny circumference) would repeat the texture hundreds of times pole to pole. V still grows
+            // with the ring index, so Sweep's tangents (w) stay valid.
+            for (int i = 0; i <= rings; i++)
+            {
+                float vv = 0.5f * i / rings;
+                for (int j = 0; j <= sides; j++)
+                {
+                    int k = start + i * ring + j;
+                    n[k] = (v[k] - c).normalized;
+                    uv[k] = new Vector2((float)j / sides, vv);
+                }
+            }
         }
 
         public void Torus(Vector3 c, Vector3 axis, float R, float r, int mat, int segs = 20, int sides = 8)
         {
             Basis(axis, out Vector3 a, out Vector3 b);
             Vector3 up = axis.normalized;
-            var cs = new Vector3[segs + 1]; var rs = new float[segs + 1]; var ax = new Vector3[segs + 1]; var bx = new Vector3[segs + 1];
+            ClearSweep();
             for (int i = 0; i <= segs; i++)
             {
                 float th = 2 * Mathf.PI * i / segs;
                 Vector3 radial = i == segs ? a : a * Mathf.Cos(th) + b * Mathf.Sin(th);
-                cs[i] = c + radial * R; rs[i] = r; ax[i] = radial; bx[i] = up;
+                sweepC.Add(c + radial * R); sweepR.Add(r); sweepA.Add(radial); sweepB.Add(up);
             }
-            Sweep(cs, rs, ax, bx, sides, mat, false, false);
+            Sweep(sweepC, sweepR, sweepA, sweepB, sides, mat, false, false);
         }
 
         // ------------------------------------------------------------------ tubes
 
-        /// <summary>Pipe along a smoothed path (Catmull-Rom through the points, resampled by arc length with extra
-        /// rings in tight bends, parallel-transported frames). Optional bolted, bevelled flanges at both ends and a
-        /// convoluted bellows section (fractions of the length) with collars at its ends.</summary>
+        /// <summary>Samples per span of the tube centre line (Tube and anything that follows its path, e.g.
+        /// KitBuilder's clamps, sample <see cref="SplinePoint"/> at k / SplineSamples, k = 0 .. SplineSamples - 1).</summary>
+        public const int SplineSamples = 16;
+
+        /// <summary>
+        /// Point at parameter t (0..1) on span i (pts[i] to pts[i + 1]) of the centripetal Catmull-Rom spline through
+        /// `pts` (knot steps sqrt(chord), Barry-Goldman, as Hermite tangents). Unlike the uniform spline it never
+        /// overshoots a short span next to a long one, never cusps or loops inside a span, and collinear points give an
+        /// exact straight run. The end spans reflect their neighbour (a repeated point counts as missing), so a tube
+        /// leaves its first point along the first chord.
+        /// </summary>
+        public static Vector3 SplinePoint(IList<Vector3> pts, int i, float t)
+        {
+            int n = pts.Count;
+            Vector3 p1 = pts[i], p2 = pts[i + 1];
+            float c1 = (p2 - p1).magnitude;
+            if (c1 < 1e-7f) return p1;
+            Vector3 p0 = i > 0 ? pts[i - 1] : p1, p3 = i + 2 < n ? pts[i + 2] : p2;
+            float c0 = (p1 - p0).magnitude, c2 = (p3 - p2).magnitude;
+            if (c0 < 1e-7f) { p0 = 2 * p1 - p2; c0 = c1; }
+            if (c2 < 1e-7f) { p3 = 2 * p2 - p1; c2 = c1; }
+            float d0 = Mathf.Sqrt(c0), d1 = Mathf.Sqrt(c1), d2 = Mathf.Sqrt(c2);
+            // tangents at p1 and p2 per knot unit, scaled to the span's parameter (d1)
+            Vector3 m1 = ((p1 - p0) / d0 - (p2 - p0) / (d0 + d1) + (p2 - p1) / d1) * d1;
+            Vector3 m2 = ((p2 - p1) / d1 - (p3 - p1) / (d1 + d2) + (p3 - p2) / d2) * d1;
+            float t2 = t * t, t3 = t2 * t;
+            return (2 * t3 - 3 * t2 + 1) * p1 + (t3 - 2 * t2 + t) * m1 + (3 * t2 - 2 * t3) * p2 + (t3 - t2) * m2;
+        }
+
+        /// <summary>Pipe along a smoothed path (centripetal Catmull-Rom through the points, <see cref="SplinePoint"/>,
+        /// resampled by arc length with extra rings in tight bends, parallel-transported frames). Optional bolted,
+        /// bevelled flanges at both ends and a convoluted bellows section (fractions of the length) with collars at its
+        /// ends.</summary>
         public void Tube(IList<Vector3> pts, float r, int mat, int sides = 10, int flangeMat = -1, float bellowsFrom = -1, float bellowsTo = -1)
         {
             if (pts == null || pts.Count < 2 || sides < 3) return;
-            const int perSpan = 16;
+            const int perSpan = SplineSamples;
             int nd = (pts.Count - 1) * perSpan + 1;
-            var dense = new Vector3[nd];
+            Vector3[] dense = Grow(ref tubeDense, nd);
             for (int i = 0; i < pts.Count - 1; i++)
-            {
-                Vector3 p0 = pts[Math.Max(i - 1, 0)], p1 = pts[i], p2 = pts[i + 1], p3 = pts[Math.Min(i + 2, pts.Count - 1)];
                 for (int k = 0; k < perSpan; k++)
-                {
-                    float t = k / (float)perSpan, t2 = t * t, t3 = t2 * t;
-                    dense[i * perSpan + k] = 0.5f * (2 * p1 + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 + (-p0 + 3 * p1 - 3 * p2 + p3) * t3);
-                }
-            }
+                    dense[i * perSpan + k] = SplinePoint(pts, i, k / (float)perSpan);
             dense[nd - 1] = pts[pts.Count - 1];
-            var cum = new float[nd];
+            float[] cum = Grow(ref tubeCum, nd);
+            cum[0] = 0;
             for (int i = 1; i < nd; i++) cum[i] = cum[i - 1] + (dense[i] - dense[i - 1]).magnitude;
             float len = cum[nd - 1];
             if (len < 1e-4f) return;
             // curvature (turn angle per length) at each dense point, for the adaptive ring spacing
-            var kappa = new float[nd];
+            float[] kappa = Grow(ref tubeKappa, nd);
+            Array.Clear(kappa, 0, nd);
             for (int i = 1; i < nd - 1; i++)
             {
                 Vector3 d0 = dense[i] - dense[i - 1], d1 = dense[i + 1] - dense[i];
@@ -381,7 +519,8 @@ namespace ProcEngines
             float neck = 0.5f * pitch;   // the bellows rise smoothly from the pipe radius over half a pitch at each end
 
             // stations along the path
-            var ss = new List<float>(64);
+            List<float> ss = tubeS;
+            ss.Clear();
             int ks = 0;
             void Plain(float from, float to, bool includeFrom)
             {
@@ -406,7 +545,8 @@ namespace ProcEngines
             else { bellows = false; Plain(0, len, true); }
 
             int count = ss.Count;
-            var path = new Vector3[count];
+            ClearSweep();
+            List<Vector3> path = sweepC;
             int seg = 0;
             for (int i = 0; i < count; i++)
             {
@@ -414,10 +554,11 @@ namespace ProcEngines
                 while (seg < nd - 2 && cum[seg + 1] < s) seg++;
                 float span = cum[seg + 1] - cum[seg];
                 float f = span < 1e-9f ? 0 : (s - cum[seg]) / span;
-                path[i] = Vector3.Lerp(dense[seg], dense[seg + 1], Mathf.Clamp01(f));
+                path.Add(Vector3.Lerp(dense[seg], dense[seg + 1], Mathf.Clamp01(f)));
             }
 
-            var ax = new Vector3[count]; var bx = new Vector3[count]; var rs = new float[count]; var slopes = new float[count];
+            List<Vector3> ax = sweepA, bx = sweepB;
+            List<float> rs = sweepR, slopes = sweepSlope;
             Basis(path[1] - path[0], out Vector3 a, out Vector3 b);
             for (int i = 0; i < count; i++)
             {
@@ -425,7 +566,7 @@ namespace ProcEngines
                 Vector3 ap = a - Vector3.Dot(a, tan) * tan;   // parallel transport
                 if (ap.sqrMagnitude > 1e-12f) a = ap.normalized;
                 b = Vector3.Cross(tan, a);
-                ax[i] = a; bx[i] = b;
+                ax.Add(a); bx.Add(b);
                 if (bellows && ss[i] > b0 && ss[i] < b1)
                 {
                     // convolutions r (1.16 + 0.08 cos) under a smooth envelope rising from the pipe radius at each end
@@ -434,10 +575,10 @@ namespace ProcEngines
                     float ea = ta * ta * (3 - 2 * ta), eb = tb * tb * (3 - 2 * tb);
                     float dea = ta < 1 ? 6 * ta * (1 - ta) / neck : 0, deb = tb < 1 ? -6 * tb * (1 - tb) / neck : 0;
                     float env = ea * eb, denv = dea * eb + ea * deb, wave = 0.16f + 0.08f * Mathf.Cos(ph);
-                    rs[i] = r * (1 + env * wave);
-                    slopes[i] = r * (denv * wave - env * 0.08f * k * Mathf.Sin(ph));
+                    rs.Add(r * (1 + env * wave));
+                    slopes.Add(r * (denv * wave - env * 0.08f * k * Mathf.Sin(ph)));
                 }
-                else rs[i] = r;
+                else { rs.Add(r); slopes.Add(0); }
             }
             bool flanges = flangeMat >= 0;
             Sweep(path, rs, ax, bx, sides, mat, !flanges, !flanges, bellows ? slopes : null);
@@ -486,10 +627,9 @@ namespace ProcEngines
             // to the "end" anchor) the stretch zones (zoneN_hi above zoneN_lo, on y) grow in proportion to their
             // own length; everything below a zone moves down with it, so flanges and eyes keep their shape.
             int zc = 0;
-            float[] zHi = null, zLo = null, zDelta = null, zK = null;
+            float[] zHi = this.zHi, zLo = this.zLo, zDelta = this.zDelta, zK = this.zK;
             if (length > 0 && m.TryAnchor("end", out Vector3 endP, out _))
             {
-                zHi = new float[10]; zLo = new float[10]; zDelta = new float[10]; zK = new float[10];
                 float total = 0;
                 for (int z = 0; z < 10; z++)
                     if (m.TryAnchor(ZoneHi[z], out Vector3 hi, out _) && m.TryAnchor(ZoneLo[z], out Vector3 lo, out _) && hi.y > lo.y)

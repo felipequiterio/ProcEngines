@@ -9,3 +9,4 @@ spike/run/*.out
 tests/ksp/flags/
 *.blend1
 tools/blender/__pycache__/
+tools/blender/preview/
