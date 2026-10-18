@@ -29,6 +29,12 @@ namespace ProcEngines
     /// Top to bottom: mount plate (bolted rim), gimbal block in an open thrust-frame bay, injector dome, injector
     /// flange, chamber with stiffener bands, regen convergent, then the gimballed bell: regen tubes with hat bands,
     /// the coolant manifold, and either a bolted joint flange plus a radiative extension or a plain exit.
+    ///
+    /// Every profile is a polyline of control points with a fillet radius per corner (ProfileBuilder): outer edges
+    /// are rounded and joints carry weld fillets, so edges catch highlights instead of reading as CAD creases. The
+    /// level of detail only changes how densely curves and fillets are sampled: every position, radius and the UV
+    /// layout that other code relies on (nodes, colliders, BellRadiusAt, DomePoint, manifold, emissive ST, bolt
+    /// counts) is computed from the full-resolution contour and is identical at every level.
     /// </summary>
     public sealed class EngineGeometry
     {
@@ -38,9 +44,13 @@ namespace ProcEngines
         public const int MatRegen = 0, MatRadiative = 1, MatSoot = 2, MatBellSteel = 3, MatBellBolts = 4, BellMaterials = 5;
 
         public float YInjector, YThroat, YExit, YChamberBottom, YDomeTop, MountRadius, MountHeight, DomeHeight, GimbalRadius, MaxRadius, ChamberRadius, ThroatRadius;
+        /// <summary>Largest radius of the static (chamber) mesh: sets its ring segments.</summary>
+        public float StaticMaxRadius;
+        /// <summary>Level of detail the profile lists were sampled for (0 = full).</summary>
+        public int Lod;
         public readonly List<ProfileSegment> Static = new List<ProfileSegment>();
         public readonly List<ProfileSegment> Bell = new List<ProfileSegment>();
-        public readonly List<Vector2> BellOuter = new List<Vector2>();   // throat to exit, outer wall (r, y), for kit clearance
+        public readonly List<Vector2> BellOuter = new List<Vector2>();   // throat to exit, outer wall (r, y), for kit clearance (full resolution at every LOD)
         public float RegenEndY, RegenEndRadius;
         public bool HasExtension;
         public float ManifoldY, ManifoldRadius, ManifoldTubeRadius;
@@ -51,6 +61,13 @@ namespace ProcEngines
 
         public float DomeTopRadius;
 
+        /// <summary>Ring segments around the axis: ~2 cm facets at LOD0 (64..192), about a third of that at LOD1.</summary>
+        public static int RingSegments(float maxRadius, int lod)
+        {
+            int s0 = Mathf.Clamp(Mathf.CeilToInt(2 * Mathf.PI * Mathf.Max(maxRadius, 1e-3f) / 0.02f), 64, 192);
+            return lod <= 0 ? s0 : Mathf.Clamp(Mathf.RoundToInt(s0 / 3f), 24, 64);
+        }
+
         /// <summary>Point on the injector dome at radius r (clamped onto the dome), with its outward (r, y) normal.</summary>
         public void DomePoint(float r, out Vector2 point, out Vector2 normal)
         {
@@ -60,7 +77,7 @@ namespace ProcEngines
             normal = new Vector2(DomeHeight * Mathf.Sin(t), span * Mathf.Cos(t)).normalized;
         }
 
-        /// <summary>Outer bell radius at height y (0 above the throat).</summary>
+        /// <summary>Outer bell radius at height y (the throat radius above the throat).</summary>
         public float BellRadiusAt(float y)
         {
             for (int i = 1; i < BellOuter.Count; i++)
@@ -73,10 +90,29 @@ namespace ProcEngines
             return BellOuter.Count > 0 ? BellOuter[BellOuter.Count - 1].x : 0;
         }
 
-        /// <param name="manifoldTubeRadius">Coolant manifold pipe radius (the fuel line radius, KitBuilder.LineRadii).</param>
-        public static EngineGeometry Build(EngineDesign d, EngineStats s, TechLevel tech, float manifoldTubeRadius = 0.02f)
+        // ------------------------------------------------------------------ level of detail
+
+        /// <summary>Sampling densities per level: curve points and fillet steps.</summary>
+        struct Detail
         {
-            var g = new EngineGeometry();
+            public int Convex, Concave;          // arc steps of rounded outer edges and of weld fillets
+            public int BellPoints, InnerPoints;  // Rao bell outer contour and inner wall
+            public int Dome, Ball, Conv, Torus;
+            public bool Supports;                // extra points next to fillets on long faces (keeps flat faces flat-shaded)
+        }
+
+        static Detail DetailFor(int lod) => lod <= 0
+            ? new Detail { Convex = 3, Concave = 2, BellPoints = 96, InnerPoints = 64, Dome = 24, Ball = 20, Conv = 20, Torus = 20, Supports = true }
+            : new Detail { Convex = 1, Concave = 1, BellPoints = 32, InnerPoints = 16, Dome = 8, Ball = 8, Conv = 7, Torus = 10, Supports = false };
+
+        // ------------------------------------------------------------------ build
+
+        /// <param name="manifoldTubeRadius">Coolant manifold pipe radius (the fuel line radius, KitBuilder.LineRadii).</param>
+        /// <param name="lod">0 = full detail, 1 = the distant level (fewer curve points, chamfers instead of fillets).</param>
+        public static EngineGeometry Build(EngineDesign d, EngineStats s, TechLevel tech, float manifoldTubeRadius = 0.02f, int lod = 0)
+        {
+            var g = new EngineGeometry { Lod = Mathf.Clamp(lod, 0, 1) };
+            Detail det = DetailFor(g.Lod);
             float rt = (float)s.ThroatRadius, rc = (float)s.ChamberRadius, lc = (float)s.ChamberLength;
             float mountR = Mathf.Max(0.7f * rc, 1.2f * rt);
             float mountH = 0.12f * rc + 0.02f;
@@ -84,105 +120,193 @@ namespace ProcEngines
             float rg = Mathf.Max(0.28f * rc, 0.6f * rt);
             float gimbalH = 0.24f * rc + 0.01f;
             g.MountRadius = mountR; g.MountHeight = mountH; g.DomeHeight = domeH; g.ChamberRadius = rc; g.ThroatRadius = rt; g.GimbalRadius = rg;
-            float steelV = Mathf.Max(0.25f, 2 * Mathf.PI * rc / 4);
-            List<ProfileSegment> st = g.Static;
 
-            // mount plate: top face, bolted rim, underside (open to the thrust-frame bay below)
-            st.Add(new ProfileSegment(Line(0, 0, mountR, 0, 4), MatSteel, 4, steelV));
-            BoltedRim(st, mountR, 0, -mountH, MatBolts);
-            st.Add(new ProfileSegment(Line(mountR, -mountH, 0.001f, -mountH, 3), MatSteel, 6, steelV));
+            // whole number of cooling tubes, a whole number of texture tiles (EngineMaterials.TubesPerTile each),
+            // constant along the length (they taper with the wall), DESIGN.md 8.4
+            int tubeTileCount = Mathf.Clamp(Mathf.RoundToInt(2 * Mathf.PI * rc / 0.035f * 2 / EngineMaterials.TubesPerTile), 2, 15);
+            g.TubeCount = tubeTileCount * EngineMaterials.TubesPerTile;
+            float tubeTiles = tubeTileCount;
 
-            // gimbal block: bolted flange, neck, spherical bearing, neck, base flange onto the dome
-            float y = -mountH, fl = 0.16f * gimbalH, fr = rg * 1.12f;
-            BoltedRim(st, fr, y, y - fl, MatBolts);
-            st.Add(new ProfileSegment(Line(fr, y - fl, rg * 0.62f, y - fl, 1), MatSteel, 4, steelV));
+            Style steel = Style.Steel(MatSteel), bolts = Style.Bolts(MatBolts);
+            var pb = new ProfileBuilder(det);
+
+            // mount plate: top face (the stack interface: only a small edge radius), bolted rim, underside (open to
+            // the thrust-frame bay below); the underside ends inside the gimbal block's top flange
+            float y = -mountH, fl = 0.2f * gimbalH, fr = rg * 1.12f, rn = rg * 0.62f;
+            pb.Move(new Vector2(0, 0));
+            pb.Line(new Vector2(mountR, 0), steel, 0.12f * mountH);
+            pb.Line(new Vector2(mountR, -mountH), bolts, 0.2f * mountH);
+            pb.Line(new Vector2(fr * 0.96f, -mountH), steel);
+
+            // gimbal block: bolted flange welded under the plate, neck, spherical bearing, neck, base flange
+            // welded onto the dome
+            float neck = 0.12f * gimbalH, ball = gimbalH - 2 * fl - 2 * neck;
+            // small radii on the bolted rims (thin flanges: the bolt heads need the straight part)
+            float weldG = 0.18f * fl, edgeG = 0.15f * fl, neckR = 0.35f * neck;
+            pb.Move(new Vector2(fr + 1.4f * weldG, y + 0.12f * weldG));   // weld leg, inside the plate
+            pb.Line(new Vector2(fr, y), steel, weldG);
+            pb.Line(new Vector2(fr, y - fl), bolts, edgeG);
             y -= fl;
-            float neck = 0.14f * gimbalH, ball = gimbalH - 2 * fl - 2 * neck;
-            st.Add(new ProfileSegment(Line(rg * 0.62f, y, rg * 0.62f, y - neck, 1), MatSteel, 4, steelV));
+            pb.Line(new Vector2(rn, y), steel, neckR);
             y -= neck;
-            var arc = new List<Vector2>();
-            for (int i = 0; i <= 10; i++)
+            pb.Line(new Vector2(rn, y), steel, neckR);
+            // the bearing: an oblate ellipse through the neck radius (semi-axes rg and b)
+            float psi0 = Mathf.Acos(0.62f), bAxis = ball * 0.5f / Mathf.Sin(psi0), yBall = y - ball * 0.5f;
+            for (int i = 1; i < det.Ball; i++)
             {
-                float th = Mathf.PI * i / 10;
-                arc.Add(new Vector2(rg * 0.62f + (rg - rg * 0.62f) * Mathf.Sin(th), y - ball * 0.5f * (1 - Mathf.Cos(th))));
+                float psi = psi0 - 2 * psi0 * i / det.Ball;
+                pb.Line(new Vector2(rg * Mathf.Cos(psi), yBall + bAxis * Mathf.Sin(psi)), steel, -1);
             }
-            st.Add(new ProfileSegment(arc, MatSteel, 4, steelV));
             y -= ball;
-            st.Add(new ProfileSegment(Line(rg * 0.62f, y, rg * 0.62f, y - neck, 1), MatSteel, 4, steelV));
+            pb.Line(new Vector2(rn, y), steel, neckR);
             y -= neck;
-            st.Add(new ProfileSegment(Line(rg * 0.62f, y, fr, y, 1), MatSteel, 4, steelV));
-            BoltedRim(st, fr, y, y - fl, MatBolts);
+            pb.Line(new Vector2(rn, y), steel, neckR);
+            pb.Line(new Vector2(fr, y), steel, edgeG);
             y -= fl;
             g.YDomeTop = y;
 
-            // injector dome: flat top under the gimbal block, then a quarter ellipse out to the chamber
-            float r0 = fr * 0.95f;
+            // injector dome: a quarter ellipse from under the gimbal block out to the chamber (DomePoint is the same
+            // analytic surface); it runs into the injector flange's top face through a weld fillet
+            float r0 = fr * 0.95f, yDome = y;
             g.DomeTopRadius = r0;
-            st.Add(new ProfileSegment(Line(fr, y, r0, y, 1), MatSteel, 4, steelV));
-            var dome = new List<Vector2>();
-            for (int i = 0; i <= 12; i++)
-            {
-                float t = i / 12f * Mathf.PI / 2;
-                dome.Add(new Vector2(r0 + (rc - r0) * Mathf.Sin(t), y - domeH * (1 - Mathf.Cos(t))));
-            }
-            st.Add(new ProfileSegment(dome, MatSteel, 8, steelV));
             float yInj = y - domeH;
             g.YInjector = yInj;
+            float ft = 0.06f * rc + 0.004f, fh = 0.1f * rc + 0.008f;
+            Vector2 DomeAt(float t) => new Vector2(r0 + (rc - r0) * Mathf.Sin(t), yDome - domeH * (1 - Mathf.Cos(t)));
+            float tFrom = Mathf.Asin(Mathf.Clamp01((fr - r0) / Mathf.Max(rc - r0, 1e-4f)));
+            float tTo = Mathf.Max(Mathf.Acos(Mathf.Clamp01(fh * 0.5f / Mathf.Max(domeH, 1e-4f))), tFrom + 0.05f);
+            // the weld fillets at both ends of the dome get a guard point at a fixed distance, so their size (and the
+            // bolt rim above) never depends on how densely this level samples the dome
+            float weldI = 0.5f * ft, edgeI = 0.3f * Mathf.Min(ft, fh);
+            float Speed(float t) => Mathf.Max(new Vector2((rc - r0) * Mathf.Cos(t), domeH * Mathf.Sin(t)).magnitude, 1e-5f);
+            float tA = tFrom + 3 * weldG / Speed(tFrom), tB = tTo - 3 * weldI / Speed(tTo);
+            if (tB - tA < 0.1f * (tTo - tFrom)) { tA = tFrom + 0.3f * (tTo - tFrom); tB = tTo - 0.3f * (tTo - tFrom); }
+            pb.Line(DomeAt(tFrom), bolts, weldG);
+            for (int i = 0; i <= det.Dome - 2; i++) pb.Line(DomeAt(tA + (tB - tA) * i / (det.Dome - 2)), steel, -1);
 
             // injector flange where the dome meets the chamber
-            float ft = 0.06f * rc + 0.004f, fh = 0.1f * rc + 0.008f;
-            Flange(st, rc, rc, yInj + fh * 0.5f, yInj - fh * 0.5f, ft, MatSteel, MatBolts, steelV);
+            pb.Line(DomeAt(tTo), steel, weldI);
+            pb.Line(new Vector2(rc + ft, yInj + fh * 0.5f), steel, edgeI);
+            pb.Line(new Vector2(rc + ft, yInj - fh * 0.5f), bolts, edgeI);
+            pb.Line(new Vector2(rc, yInj - fh * 0.5f), steel, weldI);
 
-            // whole number of cooling tubes, a multiple of the texture's tubes per tile, constant along the length
-            // (they taper with the wall), DESIGN.md 8.4
-            g.TubeCount = Mathf.Clamp(Mathf.RoundToInt(2 * Mathf.PI * rc / 0.035f * 2 / EngineMaterials.TubesPerTile) * EngineMaterials.TubesPerTile, 24, 240);
-            float tubeTiles = g.TubeCount / (float)EngineMaterials.TubesPerTile;
-
-            // chamber cylinder: steel jacket over the regen liner, with stiffener bands on long chambers
+            // chamber: steel jacket over the regen liner, with stiffener bands on long chambers
             float yConvStart = yInj - lc;
             g.YChamberBottom = yConvStart;
-            st.Add(new ProfileSegment(Line(rc, yInj - fh * 0.5f, rc, yConvStart, 4), MatSteel, 8, steelV));
             if (lc > 1.1f * rc)
                 for (int k = 1; k <= 2; k++)
                 {
-                    float yb = yInj - lc * k / 3f, bh = 0.06f * rc + 0.005f;
-                    Band(st, rc, rc, yb + bh * 0.5f, yb - bh * 0.5f, 0.025f * rc + 0.002f, MatSteel, steelV);
+                    float yb = yInj - lc * k / 3f, bh = 0.06f * rc + 0.005f, bt = 0.025f * rc + 0.002f;
+                    pb.Line(new Vector2(rc, yb + bh * 0.5f), steel, 0.6f * bt);
+                    pb.Line(new Vector2(rc + bt, yb + bh * 0.5f), steel, 0.35f * bt);
+                    pb.Line(new Vector2(rc + bt, yb - bh * 0.5f), steel, 0.35f * bt);
+                    pb.Line(new Vector2(rc, yb - bh * 0.5f), steel, 0.6f * bt);
                 }
 
-            // convergent: 30-degree cone, then a 1.5 Rt arc into the throat (regen tubes; heat coordinate 0.5 -> 0)
+            // convergent: a rounded shoulder, 30-degree cone, then a 1.5 Rt arc into the throat (regen tubes; heat
+            // coordinate 0.5 -> 0 along its own arc length)
             float rArc = 2.5f * rt - 1.5f * rt * Mathf.Sin(60 * Mathf.Deg2Rad);
             float coneLen = Mathf.Max(rc - rArc, 0) / Mathf.Tan(30 * Mathf.Deg2Rad);
             float yThroat = yConvStart - coneLen - 0.75f * rt;
             g.YThroat = yThroat;
-            var conv = new List<Vector2> { new Vector2(rc, yConvStart) };
-            for (int i = 0; i <= 12; i++)
+            var conv = new Style { Mat = MatRegenStatic, Kind = Uv.ArcScaled, U = tubeTiles, V = -2, VOffset = 0.5f, Priority = 2 };
+            pb.Line(new Vector2(rc, yConvStart), steel, 0.8f * rc);
+            pb.Line(new Vector2(rArc, yThroat + 0.75f * rt), conv, -1);
+            for (int i = 1; i <= det.Conv; i++)
             {
-                float th = (-120f + 30f * i / 12f) * Mathf.Deg2Rad;
-                conv.Add(new Vector2(2.5f * rt + 1.5f * rt * Mathf.Sin(th), yThroat - 1.5f * rt * Mathf.Cos(th)));
+                float th = (-120f + 30f * i / det.Conv) * Mathf.Deg2Rad;
+                pb.Line(new Vector2(2.5f * rt + 1.5f * rt * Mathf.Sin(th), yThroat - 1.5f * rt * Mathf.Cos(th)), conv, -1);
             }
-            st.Add(new ProfileSegment(conv, MatRegenStatic, tubeTiles, -2 * ArcLength(conv), 0.5f));
+            pb.Emit(g.Static);
 
             // ---------------------------------------------------------------- bell (gimballed)
-            List<ProfileSegment> bell = g.Bell;
             var contour = new NozzleContour(d.Eps, d.LengthFraction, d.Conical);
             double regenEps = d.RadiativeExtension ? Math.Min(d.Eps, tech?.RegenEpsMax ?? 30) : d.Eps;
-            var regen = new List<Vector2>();
-            var rad = new List<Vector2>();
+            var raw = new List<Vector2>(contour.Wall.Count);
+            bool ext = false;
             foreach (WallPoint w in contour.Wall)
             {
-                var p = new Vector2((float)w.R * rt, yThroat - (float)w.X * rt);
-                g.BellOuter.Add(p);
-                if (w.R * w.R <= regenEps + 1e-6) regen.Add(p);
-                else { if (rad.Count == 0 && regen.Count > 0) rad.Add(regen[regen.Count - 1]); rad.Add(p); }
+                raw.Add(new Vector2((float)w.R * rt, yThroat - (float)w.X * rt));
+                if (w.R * w.R > regenEps + 1e-6) ext = true;
             }
-            g.HasExtension = rad.Count > 1;
-            float regenArc = ArcLength(regen);
-            bell.Add(new ProfileSegment(regen, MatRegen, tubeTiles, regenArc));
-            g.RegenEndY = regen[regen.Count - 1].y;
-            g.RegenEndRadius = regen[regen.Count - 1].x;
-            Vector2 exit = g.BellOuter[g.BellOuter.Count - 1];
+            g.HasExtension = ext;
+            Vector2 exit = raw[raw.Count - 1];
             g.YExit = exit.y;
-            float bellSteelV = Mathf.Max(0.25f, 2 * Mathf.PI * exit.x / 6);
+
+            // smooth the Rao contour (centripetal Catmull-Rom) and resample it evenly in arc length plus turning, so
+            // the throat gets its share of points; the regen / extension joint is placed exactly at regenEps
+            var dense = new List<Vector2>(raw.Count * 8 + 1);
+            var denseTan = new List<Vector2>(raw.Count * 8 + 1);
+            var cost = new List<float>(raw.Count * 8 + 1);
+            Densify(raw, 8, dense, denseTan, cost);
+            float total = cost[cost.Count - 1];
+            float cSplit = ext ? CostAtRadius(dense, cost, Mathf.Sqrt((float)regenEps) * rt) : total;
+            int n0 = d.Conical ? 56 : DetailFor(0).BellPoints;
+            var regen0 = new List<Vector2>(n0);
+            var rad0 = new List<Vector2>(n0);
+            SplitSample(dense, denseTan, cost, cSplit, total, n0, regen0, null, rad0, null);
+            g.BellOuter.AddRange(regen0);
+            for (int i = 1; i < rad0.Count; i++) g.BellOuter.Add(rad0[i]);
+            g.RegenEndY = regen0[regen0.Count - 1].y;
+            g.RegenEndRadius = regen0[regen0.Count - 1].x;
+            float extArc0 = ArcLength(rad0);
+
+            List<Vector2> regen = regen0, rad = rad0;
+            if (g.Lod > 0)
+            {
+                int n1 = d.Conical ? 20 : det.BellPoints;
+                regen = new List<Vector2>(n1); rad = new List<Vector2>(n1);
+                SplitSample(dense, denseTan, cost, cSplit, total, n1, regen, null, rad, null);
+            }
+            // inner wall: the outer contour offset along its normal by the wall thickness
+            float wall = Mathf.Max(0.012f * exit.x, 0.004f);
+            int ni = d.Conical ? Mathf.Max(12, det.InnerPoints / 2) : det.InnerPoints;
+            var innerRegen = new List<Vector2>(ni); var innerRegenTan = new List<Vector2>(ni);
+            var innerRad = new List<Vector2>(ni); var innerRadTan = new List<Vector2>(ni);
+            SplitSample(dense, denseTan, cost, cSplit, total, ni, innerRegen, innerRegenTan, innerRad, innerRadTan);
+            Offset(innerRegen, innerRegenTan, wall);
+            Offset(innerRad, innerRadTan, wall);
+            Vector2 tExit = denseTan[denseTan.Count - 1], nExit = new Vector2(-tExit.y, tExit.x);
+
+            var bellSteel = Style.Steel(MatBellSteel);
+            var bellBolts = Style.Bolts(MatBellBolts);
+            var regenStyle = new Style { Mat = MatRegen, Kind = Uv.ArcScaled, U = tubeTiles, V = 1 };   // heat coordinate 0 (throat) -> 1
+            var soot = new Style { Mat = MatSoot, Kind = Uv.Fixed, U = 8, V = Mathf.Max(0.3f, exit.x) };
+            var throatCap = new Style { Mat = MatSoot, Kind = Uv.Fixed, U = 1, V = 1 };
+            var bb = new ProfileBuilder(det);
+
+            // outer wall from the throat: regen tubes, then the extension (if any) up to its exit stiffening ring,
+            // around the rolled exit lip and back up the inside to the throat
+            bb.Move(regen[0]);
+            for (int i = 1; i < regen.Count; i++) bb.Line(regen[i], regenStyle, -1);
+            if (ext)
+            {
+                // radiative extension: physical tiling for the weave; the emissive ramp is remapped per engine. The
+                // inside runs back up to the joint with V counting down to 0 there, so both walls glow from the joint.
+                float extTiles = Mathf.Max(1, Mathf.Round(2 * Mathf.PI * exit.x / EngineMaterials.RadiativeTile));
+                var radOut = new Style { Mat = MatRadiative, Kind = Uv.Fixed, U = extTiles, V = EngineMaterials.RadiativeTile };
+                var radIn = new Style { Mat = MatRadiative, Kind = Uv.EndAtZero, U = extTiles, V = -EngineMaterials.RadiativeTile };
+                g.ExtensionEmissiveST = new Vector4(1, EngineMaterials.RadiativeTile / Mathf.Max(extArc0, 1e-3f), 0, 0);
+                float lh = Mathf.Min(wall * 3, 0.45f * (g.RegenEndY - exit.y)), lt = wall * 1.2f, yTop = exit.y + lh, weldR = Mathf.Min(0.5f * lt, 0.4f * lh);
+                for (int i = 1; i < rad.Count && rad[i].y > yTop + 1.3f * weldR; i++) bb.Line(rad[i], radOut, -1);
+                float rTop = g.BellRadiusAt(yTop);
+                bb.Line(new Vector2(rTop, yTop), radOut, weldR);
+                bb.Line(new Vector2(rTop + lt, yTop), radIn, 0.35f * lt);
+                bb.Line(new Vector2(exit.x + lt, exit.y), radIn, 0.45f * lt);
+                bb.Line(innerRad[innerRad.Count - 1], radIn, 0.45f * wall);
+                for (int i = innerRad.Count - 2; i >= 0; i--) bb.Line(innerRad[i], radIn, -1);
+            }
+            else
+            {
+                // rolled lip: the outer wall turns over into the inner wall through two quarter rounds
+                Vector2 q1 = exit + tExit * (wall * 0.5f), q2 = q1 - nExit * wall;
+                bb.Line(q1, soot, wall * 0.5f);
+                bb.Line(q2, soot, wall * 0.5f);
+                bb.Line(innerRegen[innerRegen.Count - 1], soot, -1);
+            }
+            // regen inside: sooty, up to the throat, closed by a cap
+            for (int i = innerRegen.Count - 2; i >= 0; i--) bb.Line(innerRegen[i], soot, -1);
+            bb.Line(new Vector2(0, yThroat), throatCap);
 
             // hat bands: stiffening rings on long regen bells
             float regenLen = yThroat - g.RegenEndY;
@@ -191,67 +315,147 @@ namespace ProcEngines
             for (int k = 0; k < bands; k++)
             {
                 float yb = yThroat - regenLen * (0.35f + 0.5f * (k + 0.5f) / bands);
-                Band(bell, g.BellRadiusAt(yb + bandW * 0.5f), g.BellRadiusAt(yb - bandW * 0.5f), yb + bandW * 0.5f, yb - bandW * 0.5f, bandT, MatBellSteel, bellSteelV);
+                Ring(bb, g, yb + bandW * 0.5f, yb - bandW * 0.5f, bandT, bellSteel, bellSteel);
             }
 
             // coolant manifold: at the joint above the extension flange, or just above the exit of an all-regen bell
             float mr = Mathf.Max(manifoldTubeRadius * 1.15f, 0.004f);
             g.ManifoldTubeRadius = mr;
-            float wall = Mathf.Max(0.012f * exit.x, 0.004f);
-            if (g.HasExtension)
+            if (ext)
             {
                 float rj = g.RegenEndRadius, jh = 0.05f * rj + 0.008f, jt = 0.025f * rj + 0.004f;
-                Flange(bell, g.BellRadiusAt(g.RegenEndY + jh * 0.5f), g.BellRadiusAt(g.RegenEndY - jh * 0.5f), g.RegenEndY + jh * 0.5f, g.RegenEndY - jh * 0.5f, jt, MatBellSteel, MatBellBolts, bellSteelV);
+                Ring(bb, g, g.RegenEndY + jh * 0.5f, g.RegenEndY - jh * 0.5f, jt, bellSteel, bellBolts);
                 g.ManifoldY = g.RegenEndY + jh * 0.5f + mr * 1.3f;
             }
             else g.ManifoldY = exit.y + mr * 1.6f;
             g.ManifoldRadius = g.BellRadiusAt(g.ManifoldY) + mr * 0.85f;
-            bell.Add(new ProfileSegment(Circle(g.ManifoldRadius, g.ManifoldY, mr, 12), MatBellSteel, 6, bellSteelV));
-
-            // radiative extension: physical tiling for the weave; the emissive ramp is remapped per engine
-            if (g.HasExtension)
+            // closed circle run clockwise (outward normal), starting and ending against the bell wall where the seam hides
+            bb.Move(new Vector2(g.ManifoldRadius - mr, g.ManifoldY));
+            for (int i = 1; i <= det.Torus; i++)
             {
-                float extArc = ArcLength(rad);
-                float circ = 2 * Mathf.PI * exit.x;
-                bell.Add(new ProfileSegment(rad, MatRadiative, Mathf.Max(1, Mathf.Round(circ / EngineMaterials.RadiativeTile)), EngineMaterials.RadiativeTile));
-                g.ExtensionEmissiveST = new Vector4(1, EngineMaterials.RadiativeTile / Mathf.Max(extArc, 1e-3f), 0, 0);
-                // a thin stiffening ring at the exit (its underside is the exit lip below)
-                float lh = wall * 3, lt = wall * 1.2f;
-                Band(bell, g.BellRadiusAt(exit.y + lh), exit.x, exit.y + lh, exit.y, lt, MatRadiative, EngineMaterials.RadiativeTile, false);
+                float th = Mathf.PI - 2 * Mathf.PI * i / det.Torus;
+                bb.Line(new Vector2(g.ManifoldRadius + mr * Mathf.Cos(th), g.ManifoldY + mr * Mathf.Sin(th)), bellSteel, -1);
             }
-
-            // exit lip and inside wall: the extension's inside glows with it (joint -> exit), the regen inside is sooty
-            bell.Add(new ProfileSegment(Line(exit.x + (g.HasExtension ? wall * 1.2f : 0), exit.y, exit.x - wall, exit.y, 1), g.HasExtension ? MatRadiative : MatSoot, 8, 1));
-            var innerAll = new List<Vector2>();
-            foreach (Vector2 p in g.BellOuter) innerAll.Add(new Vector2(Mathf.Max(p.x - wall, 0.001f), p.y));
-            int split = regen.Count - 1;
-            if (g.HasExtension)
-            {
-                var innerExt = innerAll.GetRange(split, innerAll.Count - split);
-                bell.Add(new ProfileSegment(innerExt, MatRadiative, Mathf.Max(1, Mathf.Round(2 * Mathf.PI * exit.x / EngineMaterials.RadiativeTile)), EngineMaterials.RadiativeTile, 0, true));
-            }
-            var innerRegen = innerAll.GetRange(0, (g.HasExtension ? split : innerAll.Count - 1) + 1);
-            innerRegen.Reverse();   // up toward the throat: the profile normal then faces the axis
-            bell.Add(new ProfileSegment(innerRegen, MatSoot, 8, Mathf.Max(0.3f, exit.x)));
-            bell.Add(new ProfileSegment(Line(innerAll[0].x, yThroat, 0, yThroat, 1), MatSoot, 1, 1));
+            bb.Emit(g.Bell);
 
             g.MaxRadius = Mathf.Max(exit.x + wall * 1.2f, rc + ft, mountR, g.ManifoldRadius + mr);
-            int mid = g.BellOuter.Count / 2;
+            g.StaticMaxRadius = Mathf.Max(rc + ft, mountR, fr);
+            // colliders: the same stations as the original coarse profile (the convergent arc at -105 degrees, the
+            // middle wall point of the Rao contour), so the physics shape doesn't depend on the render detail
+            float thC = -105f * Mathf.Deg2Rad;
             g.ColliderChamberTop = new Vector2(Mathf.Max(rc, mountR), 0);
-            g.ColliderChamberBottom = conv[conv.Count / 2];
+            g.ColliderChamberBottom = new Vector2(2.5f * rt + 1.5f * rt * Mathf.Sin(thC), yThroat - 1.5f * rt * Mathf.Cos(thC));
             g.ColliderThroat = new Vector2(rt, yThroat);
-            g.ColliderMid = g.BellOuter[mid];
+            g.ColliderMid = raw[raw.Count / 2];
             g.ColliderExit = exit;
             return g;
         }
 
-        // ------------------------------------------------------------------ profile pieces
-
-        static List<Vector2> Line(float r0, float y0, float r1, float y1, int steps)
+        /// <summary>A ring standing proud of the bell wall by t between yTop and yBottom: weld fillets where it meets
+        /// the wall (the legs start just inside the wall, which passes underneath), rounded outer edges.</summary>
+        static void Ring(ProfileBuilder pb, EngineGeometry g, float yTop, float yBottom, float t, Style face, Style side)
         {
-            var l = new List<Vector2>();
-            for (int i = 0; i <= steps; i++) { float t = (float)i / steps; l.Add(new Vector2(r0 + (r1 - r0) * t, y0 + (y1 - y0) * t)); }
-            return l;
+            float h = Mathf.Max(yTop - yBottom, 1e-4f);
+            float rT = g.BellRadiusAt(yTop), rB = g.BellRadiusAt(yBottom);
+            float weld = 0.5f * t, edge = 0.3f * Mathf.Min(t, h), leg = 1.4f * weld, inset = 0.12f * weld;
+            pb.Move(new Vector2(g.BellRadiusAt(yTop + leg) - inset, yTop + leg));
+            pb.Line(new Vector2(rT, yTop), face, weld);
+            pb.Line(new Vector2(rT + t, yTop), face, edge);
+            pb.Line(new Vector2(rB + t, yBottom), side, edge);
+            pb.Line(new Vector2(rB, yBottom), face, weld);
+            pb.Line(new Vector2(g.BellRadiusAt(yBottom - leg) - inset, yBottom - leg), face);
+        }
+
+        // ------------------------------------------------------------------ contour sampling
+
+        /// <summary>Centripetal Catmull-Rom through the points, `sub` samples per span, with unit tangents and a
+        /// cumulative sampling cost: arc length plus turning angle, each normalised to 1.</summary>
+        static void Densify(List<Vector2> raw, int sub, List<Vector2> dense, List<Vector2> tan, List<float> cost)
+        {
+            int n = raw.Count;
+            if (n < 2) { dense.Add(raw[0]); tan.Add(new Vector2(0, -1)); cost.Add(0); return; }
+            for (int i = 0; i < n - 1; i++)
+            {
+                Vector2 p0 = i > 0 ? raw[i - 1] : 2 * raw[0] - raw[1], p1 = raw[i], p2 = raw[i + 1], p3 = i + 2 < n ? raw[i + 2] : 2 * raw[n - 1] - raw[n - 2];
+                float t0 = 0, t1 = t0 + Mathf.Max(Mathf.Sqrt((p1 - p0).magnitude), 1e-5f);
+                float t2 = t1 + Mathf.Max(Mathf.Sqrt((p2 - p1).magnitude), 1e-5f), t3 = t2 + Mathf.Max(Mathf.Sqrt((p3 - p2).magnitude), 1e-5f);
+                for (int k = 0; k < sub; k++)
+                {
+                    float t = t1 + (t2 - t1) * k / sub;
+                    Vector2 a1 = (t1 - t) / (t1 - t0) * p0 + (t - t0) / (t1 - t0) * p1;
+                    Vector2 a2 = (t2 - t) / (t2 - t1) * p1 + (t - t1) / (t2 - t1) * p2;
+                    Vector2 a3 = (t3 - t) / (t3 - t2) * p2 + (t - t2) / (t3 - t2) * p3;
+                    Vector2 b1 = (t2 - t) / (t2 - t0) * a1 + (t - t0) / (t2 - t0) * a2;
+                    Vector2 b2 = (t3 - t) / (t3 - t1) * a2 + (t - t1) / (t3 - t1) * a3;
+                    dense.Add((t2 - t) / (t2 - t1) * b1 + (t - t1) / (t2 - t1) * b2);
+                }
+            }
+            dense.Add(raw[n - 1]);
+            int m = dense.Count;
+            for (int i = 0; i < m; i++)
+            {
+                Vector2 tv = dense[Math.Min(i + 1, m - 1)] - dense[Math.Max(i - 1, 0)];
+                tan.Add(tv.sqrMagnitude > 1e-14f ? tv.normalized : new Vector2(0, -1));
+            }
+            float len = 0, turn = 0;
+            for (int i = 1; i < m; i++) { len += (dense[i] - dense[i - 1]).magnitude; turn += Vector2.Angle(tan[i - 1], tan[i]); }
+            float acc = 0;
+            cost.Add(0);
+            for (int i = 1; i < m; i++)
+            {
+                acc += (dense[i] - dense[i - 1]).magnitude / Mathf.Max(len, 1e-6f) + (turn > 1e-3f ? Vector2.Angle(tan[i - 1], tan[i]) / turn : 0);
+                cost.Add(acc);
+            }
+        }
+
+        /// <summary>Sampling cost where the (monotonic) contour reaches radius r.</summary>
+        static float CostAtRadius(List<Vector2> dense, List<float> cost, float r)
+        {
+            if (r <= dense[0].x) return 0;
+            for (int i = 0; i < dense.Count - 1; i++)
+                if (dense[i + 1].x >= r)
+                {
+                    float span = dense[i + 1].x - dense[i].x;
+                    return Mathf.Lerp(cost[i], cost[i + 1], span > 1e-9f ? (r - dense[i].x) / span : 1);
+                }
+            return cost[cost.Count - 1];
+        }
+
+        /// <summary>`count` points evenly in cost between c0 and c1 (both included), with tangents if asked.</summary>
+        static void Sample(List<Vector2> dense, List<Vector2> tan, List<float> cost, float c0, float c1, int count, List<Vector2> pts, List<Vector2> tans)
+        {
+            int j = 0, last = dense.Count - 2;
+            count = Math.Max(count, 2);
+            for (int k = 0; k < count; k++)
+            {
+                float c = k == count - 1 ? c1 : c0 + (c1 - c0) * k / (count - 1);
+                while (j < last && cost[j + 1] < c) j++;
+                float span = cost[j + 1] - cost[j];
+                float f = span > 1e-9f ? Mathf.Clamp01((c - cost[j]) / span) : 0;
+                pts.Add(Vector2.Lerp(dense[j], dense[j + 1], f));
+                if (tans != null) tans.Add(Vector2.Lerp(tan[j], tan[j + 1], f).normalized);
+            }
+        }
+
+        /// <summary>Sample the contour into the regen part (throat .. split) and the extension (split .. exit),
+        /// sharing the split point; without a split everything goes to the regen part.</summary>
+        static void SplitSample(List<Vector2> dense, List<Vector2> tan, List<float> cost, float cSplit, float total, int n, List<Vector2> a, List<Vector2> aTan, List<Vector2> b, List<Vector2> bTan)
+        {
+            if (cSplit >= total - 1e-6f) { Sample(dense, tan, cost, 0, total, n, a, aTan); return; }
+            int na = Mathf.Clamp(Mathf.RoundToInt((n - 1) * cSplit / Mathf.Max(total, 1e-6f)) + 1, 4, Math.Max(n - 3, 4));
+            Sample(dense, tan, cost, 0, cSplit, na, a, aTan);
+            Sample(dense, tan, cost, cSplit, total, Math.Max(n - na + 1, 4), b, bTan);
+        }
+
+        /// <summary>Move points inward along the profile normal (the inner wall of the bell).</summary>
+        static void Offset(List<Vector2> pts, List<Vector2> tans, float wall)
+        {
+            for (int i = 0; i < pts.Count; i++)
+            {
+                Vector2 t = tans[i], nrm = new Vector2(-t.y, t.x);
+                Vector2 p = pts[i] - nrm * wall;
+                pts[i] = new Vector2(Mathf.Max(p.x, 0.001f), p.y);
+            }
         }
 
         static float ArcLength(List<Vector2> pts)
@@ -261,43 +465,176 @@ namespace ProcEngines
             return a;
         }
 
-        /// <summary>Closed circle in the profile plane, run clockwise so the lathe's profile normal faces outward (a torus).</summary>
-        static List<Vector2> Circle(float r, float y, float radius, int n)
+        // ------------------------------------------------------------------ profile builder
+
+        enum Uv { Steel, Bolts, Fixed, ArcScaled, EndAtZero }
+
+        /// <summary>Material and UV mapping of a run of profile edges. Edges sharing one Style object (and joined by
+        /// fillets or smooth points) become one smooth-shaded ProfileSegment.</summary>
+        sealed class Style
         {
-            var c = new List<Vector2>();
-            for (int i = 0; i <= n; i++)
+            public int Mat;
+            public Uv Kind;
+            public float U = 1, V = 1, VOffset;
+            /// <summary>Where styles meet at a rounded corner, the fillet goes to the higher priority side.</summary>
+            public int Priority = 1;
+
+            /// <summary>Physical tiling (ASSETS.md 5): EngineMaterials.SteelTile square, whole tiles around the
+            /// segment's largest radius.</summary>
+            public static Style Steel(int mat) => new Style { Mat = mat, Kind = Uv.Steel };
+            /// <summary>One bolt head per U repeat, ~1.6x as wide as the straight rim is high; V 0 at the top, 1 at the bottom.</summary>
+            public static Style Bolts(int mat) => new Style { Mat = mat, Kind = Uv.Bolts, Priority = 0 };
+
+            public ProfileSegment Make(List<Vector2> pts)
             {
-                float th = -2 * Mathf.PI * i / n;
-                c.Add(new Vector2(r + radius * Mathf.Cos(th), y + radius * Mathf.Sin(th)));
+                float rmax = 0;
+                for (int i = 0; i < pts.Count; i++) rmax = Mathf.Max(rmax, pts[i].x);
+                switch (Kind)
+                {
+                    case Uv.Steel:
+                        return new ProfileSegment(pts, Mat, Mathf.Max(1, Mathf.Round(2 * Mathf.PI * rmax / EngineMaterials.SteelTile)), EngineMaterials.SteelTile, VOffset);
+                    case Uv.Bolts:
+                    {
+                        float h = Mathf.Max(ArcLength(pts), 1e-3f);
+                        return new ProfileSegment(pts, Mat, Mathf.Clamp(Mathf.Round(2 * Mathf.PI * rmax / (1.6f * h)), 8, 180), h);
+                    }
+                    case Uv.ArcScaled:
+                        return new ProfileSegment(pts, Mat, U, V * Mathf.Max(ArcLength(pts), 1e-3f), VOffset);
+                    case Uv.EndAtZero:
+                        return new ProfileSegment(pts, Mat, U, V, ArcLength(pts) / Mathf.Max(Mathf.Abs(V), 1e-3f));
+                    default:
+                        return new ProfileSegment(pts, Mat, U, V, VOffset);
+                }
             }
-            return c;
         }
 
-        /// <summary>Vertical rim from y0 down to y1 at radius r with one bolt head per texture repeat (~1.6x as wide as high).</summary>
-        static void BoltedRim(List<ProfileSegment> into, float r, float y0, float y1, int boltMat)
+        /// <summary>
+        /// Polylines of control points (r, y) with a radius per corner: &gt; 0 rounds the corner with a circular
+        /// fillet of that radius (clamped to the edges), 0 keeps it sharp (a crease when it turns more than 25
+        /// degrees), &lt; 0 marks a point of a smooth curve. Edges carry a Style; a change of style splits the
+        /// segment. Fillet tangent points depend only on radii and angles, not on the step count, so every LOD has
+        /// its straight runs (and bolt rims) in the same places.
+        /// </summary>
+        sealed class ProfileBuilder
         {
-            float h = Mathf.Max(y0 - y1, 1e-3f);
-            float bolts = Mathf.Clamp(Mathf.Round(2 * Mathf.PI * r / (1.6f * h)), 8, 180);
-            into.Add(new ProfileSegment(Line(r, y0, r, y1, 1), boltMat, bolts, h));
-        }
+            const float CreaseDeg = 25f;
+            readonly Detail det;
+            readonly List<List<Vector2>> pts = new List<List<Vector2>>();
+            readonly List<List<float>> radii = new List<List<float>>();
+            readonly List<List<Style>> styles = new List<List<Style>>();
+            List<Vector2> cp;
+            List<float> cr;
+            List<Style> cs;
 
-        /// <summary>A ring standing proud of a wall by `t`: top face, side, bottom face. The wall radius is rTop at
-        /// yTop and rBottom at yBottom (it may flare).</summary>
-        static void Band(List<ProfileSegment> into, float rTop, float rBottom, float yTop, float yBottom, float t, int mat, float vLen, bool bottomFace = true)
-        {
-            into.Add(new ProfileSegment(Line(rTop * 0.995f, yTop, rTop + t, yTop, 1), mat, 8, vLen));
-            into.Add(new ProfileSegment(Line(rTop + t, yTop, rBottom + t, yBottom, 1), mat, 8, vLen));
-            if (bottomFace) into.Add(new ProfileSegment(Line(rBottom + t, yBottom, rBottom * 0.995f, yBottom, 1), mat, 8, vLen));
-        }
+            public ProfileBuilder(Detail d) { det = d; }
 
-        /// <summary>A bolted flange: like a band, with bolt heads on its rim.</summary>
-        static void Flange(List<ProfileSegment> into, float rTop, float rBottom, float yTop, float yBottom, float t, int mat, int boltMat, float vLen)
-        {
-            into.Add(new ProfileSegment(Line(rTop * 0.995f, yTop, rTop + t, yTop, 1), mat, 8, vLen));
-            float h = Mathf.Max(yTop - yBottom, 1e-3f);
-            float bolts = Mathf.Clamp(Mathf.Round(2 * Mathf.PI * (rTop + t) / (1.6f * h)), 8, 180);
-            into.Add(new ProfileSegment(Line(rTop + t, yTop, rBottom + t, yBottom, 1), boltMat, bolts, h));
-            into.Add(new ProfileSegment(Line(rBottom + t, yBottom, rBottom * 0.995f, yBottom, 1), mat, 8, vLen));
+            public void Move(Vector2 p)
+            {
+                cp = new List<Vector2>(64) { p }; cr = new List<float>(64) { 0 }; cs = new List<Style>(64);
+                pts.Add(cp); radii.Add(cr); styles.Add(cs);
+            }
+
+            /// <summary>Edge to p in style s; `radius` is the corner at p (see the class summary).</summary>
+            public void Line(Vector2 p, Style s, float radius = 0)
+            {
+                if ((p - cp[cp.Count - 1]).sqrMagnitude < 1e-14f) { cr[cr.Count - 1] = radius; return; }
+                cp.Add(p); cr.Add(radius); cs.Add(s);
+            }
+
+            public void Emit(List<ProfileSegment> into)
+            {
+                for (int k = 0; k < pts.Count; k++) EmitPath(pts[k], radii[k], styles[k], into);
+            }
+
+            void EmitPath(List<Vector2> P, List<float> R, List<Style> S, List<ProfileSegment> into)
+            {
+                int n = P.Count;
+                if (n < 2) return;
+                var dir = new Vector2[n - 1];
+                var len = new float[n - 1];
+                for (int i = 0; i < n - 1; i++) { Vector2 e = P[i + 1] - P[i]; len[i] = e.magnitude; dir[i] = len[i] > 0 ? e / len[i] : new Vector2(0, -1); }
+                // requested tangent lengths, then clamped so neighbouring fillets share an edge
+                var want = new float[n];
+                var phi = new float[n];
+                var cross = new float[n];
+                for (int i = 1; i < n - 1; i++)
+                {
+                    cross[i] = dir[i - 1].x * dir[i].y - dir[i - 1].y * dir[i].x;
+                    phi[i] = Mathf.Atan2(Mathf.Abs(cross[i]), Vector2.Dot(dir[i - 1], dir[i]));
+                    if (R[i] > 0 && phi[i] > 1e-3f && phi[i] < Mathf.PI - 1e-3f) want[i] = R[i] * Mathf.Tan(phi[i] * 0.5f);
+                }
+                var tl = new float[n];
+                for (int i = 1; i < n - 1; i++)
+                {
+                    if (want[i] <= 0) continue;
+                    float inAvail = len[i - 1] * (i - 1 > 0 && want[i - 1] > 0 ? 0.49f : 0.95f);
+                    float outAvail = len[i] * (i + 1 < n - 1 && want[i + 1] > 0 ? 0.49f : 0.95f);
+                    tl[i] = Mathf.Min(want[i], Mathf.Min(inAvail, outAvail));
+                }
+
+                var seg = new List<Vector2>(32) { P[0] };
+                for (int i = 1; i < n; i++)
+                {
+                    Style sIn = S[i - 1];
+                    if (i == n - 1) { seg.Add(P[i]); Flush(seg, sIn, into); break; }
+                    Style sOut = S[i];
+                    bool change = !ReferenceEquals(sIn, sOut);
+                    if (tl[i] <= 1e-6f)
+                    {
+                        seg.Add(P[i]);
+                        if (change || (R[i] >= 0 && phi[i] > CreaseDeg * Mathf.Deg2Rad)) { Flush(seg, sIn, into); seg = new List<Vector2>(32) { P[i] }; }
+                        continue;
+                    }
+                    Vector2 dIn = dir[i - 1], dOut = dir[i];
+                    float t = tl[i], rEff = t / Mathf.Tan(phi[i] * 0.5f);
+                    Vector2 T0 = P[i] - dIn * t, T1 = P[i] + dOut * t;
+                    // straight run left on each side, for the support points
+                    float restIn = len[i - 1] - t - (i - 1 > 0 ? tl[i - 1] : 0), restOut = len[i] - t - (i + 1 < n - 1 ? tl[i + 1] : 0);
+                    float epsIn = Mathf.Min(0.15f * t, 0.3f * restIn), epsOut = Mathf.Min(0.15f * t, 0.3f * restOut);
+                    bool toOut = change && sOut.Priority > sIn.Priority;
+                    if (change && toOut)
+                    {
+                        Vector2 s0 = T0 - dIn * epsIn;
+                        seg.Add(s0);
+                        Flush(seg, sIn, into);
+                        seg = new List<Vector2>(32) { s0 };
+                    }
+                    else if (det.Supports && restIn > 2 * t && epsIn > 1e-6f) seg.Add(T0 - dIn * epsIn);
+                    // every profile here runs with the surface on its outward (counter-clockwise normal) side, so a
+                    // counter-clockwise turn is an inside corner: a weld fillet
+                    bool ccw = cross[i] > 0;
+                    int steps = Math.Max(1, ccw ? det.Concave : det.Convex);
+                    seg.Add(T0);
+                    if (steps > 1)
+                    {
+                        Vector2 nTurn = ccw ? new Vector2(-dIn.y, dIn.x) : new Vector2(dIn.y, -dIn.x);
+                        Vector2 c = T0 + nTurn * rEff, a = T0 - c;
+                        float sweep = (ccw ? 1 : -1) * phi[i];
+                        for (int k = 1; k < steps; k++)
+                        {
+                            float ang = sweep * k / steps, ca = Mathf.Cos(ang), sa = Mathf.Sin(ang);
+                            seg.Add(c + new Vector2(a.x * ca - a.y * sa, a.x * sa + a.y * ca));
+                        }
+                    }
+                    seg.Add(T1);
+                    if (change && !toOut)
+                    {
+                        Vector2 s1 = T1 + dOut * epsOut;
+                        seg.Add(s1);
+                        Flush(seg, sIn, into);
+                        seg = new List<Vector2>(32) { s1 };
+                    }
+                    else if (det.Supports && restOut > 2 * t && epsOut > 1e-6f) seg.Add(T1 + dOut * epsOut);
+                }
+            }
+
+            static void Flush(List<Vector2> seg, Style s, List<ProfileSegment> into)
+            {
+                // drop coincident points (they would make zero-length lathe rows)
+                for (int i = seg.Count - 1; i > 0; i--)
+                    if ((seg[i] - seg[i - 1]).sqrMagnitude < 1e-14f) seg.RemoveAt(i);
+                if (seg.Count >= 2) into.Add(s.Make(seg));
+            }
         }
 
         // ------------------------------------------------------------------ mesh
@@ -305,7 +642,9 @@ namespace ProcEngines
         /// <summary>Revolve profile segments around Y into one mesh, one submesh per material (MeshBuilder.Lathe).</summary>
         public static void Lathe(Mesh mesh, List<ProfileSegment> segments, int materialCount, int ringSegments, float yOffset)
         {
-            var mb = new MeshBuilder(materialCount);
+            int rows = 0;
+            for (int i = 0; i < segments.Count; i++) rows += segments[i].Points.Count;
+            var mb = new MeshBuilder(materialCount, rows * (ringSegments + 1));
             mb.Lathe(segments, ringSegments, yOffset);
             mb.Build(mesh);
         }

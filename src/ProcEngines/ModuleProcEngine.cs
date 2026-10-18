@@ -17,6 +17,11 @@ namespace ProcEngines
     public class ModuleProcEngine : PartModule, IPartMassModifier, IPartCostModifier
     {
         public const string RootName = "peRoot", GimbalName = "peGimbal", ThrustName = "thrustTransform", ExhaustName = "peGGExhaust";
+        // renderers: LOD0 keeps the original names (tests look them up), LOD1 is the distant level (ASSETS.md 6)
+        public const string ChamberName = "peChamber", BellName = "peBell", KitName = "peKit",
+            ChamberLodName = "peChamberLod1", BellLodName = "peBellLod1", KitLodName = "peKitLod1";
+        /// <summary>LODGroup screen-relative heights: LOD0 above, LOD1 above, LOD2 (kit culled) down to 0.</summary>
+        public const float Lod0Height = 0.12f, Lod1Height = 0.015f;
 
         // Prefab defaults (part cfg); the live design is held in `design`.
         [KSPField] public string propellant = "Kerolox";
@@ -40,12 +45,16 @@ namespace ProcEngines
         /// <summary>Flight: the design exceeds the researched tech (launched past the editor's pre-flight check); the engine won't run.</summary>
         public bool TechLocked { get; private set; }
         public List<string> FlightViolations { get; private set; } = new List<string>();
+        /// <summary>Design-driven mesh rebuilds (at most 10 Hz while dragging); the LOD0 refinement on release is
+        /// counted in SlowRebuilds.</summary>
         public int MeshRebuilds, SlowRebuilds;
         public double LastBuildMs;
         public event Action DesignApplied;
 
         Transform root, gimbalT, thrustT, exhaustT;
-        MeshFilter staticMF, bellMF, kitMF;
+        MeshFilter staticMF, bellMF, kitMF, staticLodMF, bellLodMF, kitLodMF;
+        MeshRenderer bellR, bellLodR, kitR, kitLodR;
+        LODGroup lodGroup;
         string radiativeTech, materialKey;
         float glow;
         bool glowApplied;
@@ -58,6 +67,7 @@ namespace ProcEngines
         readonly List<MeshCollider> colliders = new List<MeshCollider>();
         EngineGeometry geometry;
         bool designDirty, meshDirty, slowDirty, ownMeshes, nodesPending;
+        readonly List<Mesh> ownedMeshes = new List<Mesh>();   // made by this part (not the prefab's): destroyed with it
         float lastChange, lastMesh, lastCapsCheck;
 
         ModelData Data => KspData.Data;
@@ -84,7 +94,7 @@ namespace ProcEngines
                 StripPlaceholder();
                 EnsureTransforms();
                 Stats = EngineModel.Compute(Design, Data);
-                RebuildMesh();
+                RebuildMesh(true);
                 RebuildColliders();
                 SetNodes(false);
             }
@@ -138,7 +148,7 @@ namespace ProcEngines
                 Debug.LogWarning($"[ProcEngines] {part.partInfo.name}: no STATS in flight, recomputing from DESIGN");
                 Stats = EngineModel.Compute(Design, Data);
             }
-            RebuildMesh();
+            RebuildMesh(true);
             RebuildColliders();
             // Editor: stats were recomputed (possibly at another tech level than when the craft was saved), so the
             // nodes may have moved: push the attached parts on the first Update, once the craft is fully linked.
@@ -177,16 +187,17 @@ namespace ProcEngines
                 UpdateReadouts();
                 meshDirty = slowDirty = true;
             }
-            if (meshDirty && now - lastMesh >= 0.1f)   // at most 10 Hz while dragging
+            if (meshDirty && now - lastMesh >= 0.1f)   // at most 10 Hz while dragging: the distant level only, forced
             {
                 meshDirty = false;
                 lastMesh = now;
-                RebuildMesh();
+                RebuildMesh(false);
             }
-            if (slowDirty && now - lastChange >= 0.5f)   // on release + 0.5 s debounce
+            if (slowDirty && now - lastChange >= 0.5f)   // on release + 0.5 s debounce: every level, LOD switching back on
             {
                 slowDirty = false;
-                if (meshDirty) { meshDirty = false; RebuildMesh(); }
+                if (meshDirty) { meshDirty = false; RebuildMesh(true); }
+                else BuildMeshes(true);
                 RebuildColliders();
                 SetNodes(true);
                 Integrations.NotifyAero(part);
@@ -277,7 +288,7 @@ namespace ProcEngines
         /// engine so the ramp spans the extension. The uncooled GG exhaust duct glows dull red (~1100 K).</summary>
         void UpdateGlow(ModuleEnginesFX e)
         {
-            if (e == null || bellMF == null) return;
+            if (e == null || bellR == null) return;
             float target = e.EngineIgnited ? e.currentThrottle : 0;
             if (target == 0 && glow == 0)
             {
@@ -291,9 +302,15 @@ namespace ProcEngines
             GlowColor = EngineMaterials.Glow(GlowTemperature);
             DuctGlowColor = EngineMaterials.Glow(300 + glow * 800);
             if (geometry != null && geometry.HasExtension)
-                SetGlowBlock(bellMF.GetComponent<MeshRenderer>(), EngineGeometry.MatRadiative, GlowColor, geometry.ExtensionEmissiveST);
-            if (Kit != null && Kit.HasExhaust && kitMF != null)
-                SetGlowBlock(kitMF.GetComponent<MeshRenderer>(), KitBuilder.MatHot, DuctGlowColor, new Vector4(1, 1, 0, 0));
+            {
+                SetGlowBlock(bellR, EngineGeometry.MatRadiative, GlowColor, geometry.ExtensionEmissiveST);
+                SetGlowBlock(bellLodR, EngineGeometry.MatRadiative, GlowColor, geometry.ExtensionEmissiveST);
+            }
+            if (Kit != null && Kit.HasExhaust)
+            {
+                SetGlowBlock(kitR, KitBuilder.MatHot, DuctGlowColor, new Vector4(1, 1, 0, 0));
+                SetGlowBlock(kitLodR, KitBuilder.MatHot, DuctGlowColor, new Vector4(1, 1, 0, 0));
+            }
             glowApplied = true;
         }
 
@@ -301,6 +318,7 @@ namespace ProcEngines
         /// refreshed every frame while glowing.</summary>
         void SetGlowBlock(MeshRenderer mr, int index, Color c, Vector4 emissiveST)
         {
+            if (mr == null) return;
             if (glowBlock == null) glowBlock = new MaterialPropertyBlock();
             mr.GetPropertyBlock(glowBlock);
             glowBlock.SetColor(EmissiveColorId, c);
@@ -313,8 +331,10 @@ namespace ProcEngines
         {
             glowApplied = false;
             GlowColor = DuctGlowColor = Color.black;
-            if (bellMF != null) bellMF.GetComponent<MeshRenderer>().SetPropertyBlock(null, EngineGeometry.MatRadiative);
-            if (kitMF != null) kitMF.GetComponent<MeshRenderer>().SetPropertyBlock(null, KitBuilder.MatHot);
+            foreach (MeshRenderer mr in new[] { bellR, bellLodR })
+                if (mr != null) mr.SetPropertyBlock(null, EngineGeometry.MatRadiative);
+            foreach (MeshRenderer mr in new[] { kitR, kitLodR })
+                if (mr != null) mr.SetPropertyBlock(null, KitBuilder.MatHot);
         }
 
         // ------------------------------------------------------------------ engine
@@ -392,15 +412,15 @@ namespace ProcEngines
             {
                 root = new GameObject(RootName).transform;
                 root.SetParent(model, false);
-                staticMF = MakeRenderer(root, "peChamber", EngineMaterials.Static(Design?.Propellant));
-                kitMF = MakeRenderer(root, "peKit", EngineMaterials.Kit());
+                staticMF = MakeRenderer(root, ChamberName, EngineMaterials.Static(Design?.Propellant));
+                kitMF = MakeRenderer(root, KitName, EngineMaterials.Kit());
                 exhaustT = new GameObject(ExhaustName).transform;
                 exhaustT.SetParent(root, false);
                 // Gimbal pivot oriented like a stock gimbal transform (+Z down the exhaust); the bell counter-rotates.
                 gimbalT = new GameObject(GimbalName).transform;
                 gimbalT.SetParent(root, false);
                 gimbalT.localRotation = Quaternion.Euler(90f, 0f, 0f);
-                bellMF = MakeRenderer(gimbalT, "peBell", EngineMaterials.Bell("Mid", Design?.Propellant));
+                bellMF = MakeRenderer(gimbalT, BellName, EngineMaterials.Bell("Mid", Design?.Propellant));
                 bellMF.transform.localRotation = Quaternion.Euler(-90f, 0f, 0f);
                 thrustT = new GameObject(ThrustName).transform;
                 thrustT.SetParent(gimbalT, false);
@@ -415,31 +435,87 @@ namespace ProcEngines
             }
             else
             {
-                staticMF = root.Find("peChamber").GetComponent<MeshFilter>();
-                kitMF = root.Find("peKit").GetComponent<MeshFilter>();
+                staticMF = root.Find(ChamberName).GetComponent<MeshFilter>();
+                kitMF = root.Find(KitName).GetComponent<MeshFilter>();
                 exhaustT = root.Find(ExhaustName);
                 gimbalT = root.Find(GimbalName);
-                bellMF = gimbalT.Find("peBell").GetComponent<MeshFilter>();
+                bellMF = gimbalT.Find(BellName).GetComponent<MeshFilter>();
                 thrustT = gimbalT.Find(ThrustName);
             }
+            // the distant level: made with the prefab, so clones (and KSP's cached renderer lists) already have it;
+            // created here as well if an older hierarchy lacks it
+            staticLodMF = FindRenderer(root, ChamberLodName) ?? MakeRenderer(root, ChamberLodName, EngineMaterials.Static(Design?.Propellant));
+            kitLodMF = FindRenderer(root, KitLodName) ?? MakeRenderer(root, KitLodName, EngineMaterials.Kit());
+            bellLodMF = FindRenderer(gimbalT, BellLodName);
+            if (bellLodMF == null)
+            {
+                bellLodMF = MakeRenderer(gimbalT, BellLodName, EngineMaterials.Bell("Mid", Design?.Propellant));
+                bellLodMF.transform.localRotation = Quaternion.Euler(-90f, 0f, 0f);
+            }
+            bellR = bellMF.GetComponent<MeshRenderer>(); bellLodR = bellLodMF.GetComponent<MeshRenderer>();
+            kitR = kitMF.GetComponent<MeshRenderer>(); kitLodR = kitLodMF.GetComponent<MeshRenderer>();
             // Instantiate() copies serialized state only: a clone (prefab -> part, or an editor copy) starts with
             // ownMeshes = false and still shares its source's Mesh objects, so give it its own.
             bool fresh = HighLogic.LoadedScene != GameScenes.LOADING && !ownMeshes;
             if (fresh)
             {
-                staticMF.sharedMesh = new Mesh { name = "peChamber" };
-                kitMF.sharedMesh = new Mesh { name = "peKit" };
-                bellMF.sharedMesh = new Mesh { name = "peBell" };
+                staticMF.sharedMesh = Own(ChamberName);
+                kitMF.sharedMesh = Own(KitName);
+                bellMF.sharedMesh = Own(BellName);
+                staticLodMF.sharedMesh = Own(ChamberLodName);
+                kitLodMF.sharedMesh = Own(KitLodName);
+                bellLodMF.sharedMesh = Own(BellLodName);
             }
             colliders.Clear();
             for (int i = 0; i < 3; i++)
             {
                 var mc = root.Find("peCollider" + i).GetComponent<MeshCollider>();
-                if (fresh) mc.sharedMesh = new Mesh { name = "peCollider" + i };
+                if (fresh) mc.sharedMesh = Own("peCollider" + i);
                 colliders.Add(mc);
             }
             if (fresh) ownMeshes = true;
             if (part.collider == null) part.collider = colliders[0];
+            SetupLods();
+        }
+
+        static MeshFilter FindRenderer(Transform parent, string name)
+        {
+            Transform t = parent.Find(name);
+            MeshFilter mf = t != null ? t.GetComponent<MeshFilter>() : null;
+            return mf != null ? mf : null;   // Unity null (destroyed / missing) as a real null, for ??
+        }
+
+        /// <summary>One LODGroup on peRoot (ASSETS.md 6): LOD0 renderers, then the LOD1 set, then the LOD1 chamber
+        /// and bell alone (the kit culled) down to a screen height of 0, so the engine never disappears. A clone's
+        /// copied group already points at its own renderers; setting it again is harmless.</summary>
+        void SetupLods()
+        {
+            lodGroup = root.GetComponent<LODGroup>();
+            if (lodGroup == null) lodGroup = root.gameObject.AddComponent<LODGroup>();
+            Renderer chamber0 = staticMF.GetComponent<MeshRenderer>(), chamber1 = staticLodMF.GetComponent<MeshRenderer>();
+            lodGroup.fadeMode = LODFadeMode.None;
+            lodGroup.SetLODs(new[]
+            {
+                new LOD(Lod0Height, new Renderer[] { chamber0, bellR, kitR }),
+                new LOD(Lod1Height, new Renderer[] { chamber1, bellLodR, kitLodR }),
+                new LOD(0f, new Renderer[] { chamber1, bellLodR }),
+            });
+        }
+
+        Mesh Own(string name)
+        {
+            var m = new Mesh { name = name };
+            ownedMeshes.Add(m);
+            return m;
+        }
+
+        /// <summary>Meshes this part made for itself (never the prefab's or a source part's) go with it: at LOD0 they
+        /// are large, and editor deletes would otherwise leak them until the next scene change.</summary>
+        void OnDestroy()
+        {
+            for (int i = 0; i < ownedMeshes.Count; i++)
+                if (ownedMeshes[i] != null) Destroy(ownedMeshes[i]);
+            ownedMeshes.Clear();
         }
 
         MeshFilter MakeRenderer(Transform parent, string name, Material[] materials)
@@ -459,29 +535,60 @@ namespace ProcEngines
             string tech = Design.Tech ?? "Mid";
             string key = tech + "|" + Design.Propellant;
             if (materialKey == key) return;
-            bellMF.GetComponent<MeshRenderer>().sharedMaterials = EngineMaterials.Bell(tech, Design.Propellant);
-            staticMF.GetComponent<MeshRenderer>().sharedMaterials = EngineMaterials.Static(Design.Propellant);
-            kitMF.GetComponent<MeshRenderer>().sharedMaterials = EngineMaterials.Kit();
+            Material[] bell = EngineMaterials.Bell(tech, Design.Propellant), chamber = EngineMaterials.Static(Design.Propellant), kit = EngineMaterials.Kit();
+            bellR.sharedMaterials = bell;
+            bellLodR.sharedMaterials = bell;
+            staticMF.GetComponent<MeshRenderer>().sharedMaterials = chamber;
+            staticLodMF.GetComponent<MeshRenderer>().sharedMaterials = chamber;
+            kitR.sharedMaterials = kit;
+            kitLodR.sharedMaterials = kit;
             radiativeTech = tech;
             materialKey = key;
         }
 
-        public void RebuildMesh()
+        /// <param name="full">true: every level of detail, then automatic LOD switching (OnStart, the prefab, the
+        /// editor's slow path). false: the 10 Hz drag path, which rebuilds only the distant level and shows it
+        /// (ForceLOD) until the next full rebuild.</param>
+        public void RebuildMesh(bool full = true)
+        {
+            if (Stats == null) return;
+            BuildMeshes(full);
+            MeshRebuilds++;
+        }
+
+        void BuildMeshes(bool full)
         {
             if (Stats == null) return;
             TechLevel tech = Data.TechLevels.TryGetValue(Design.Tech ?? "Mid", out TechLevel t) ? t : null;
             KitBuilder.LineRadii(Design, Stats, Data, out float fuelR, out float _);
-            geometry = EngineGeometry.Build(Design, Stats, tech, fuelR);
-            int seg = Mathf.Clamp(Mathf.CeilToInt(2 * Mathf.PI * geometry.MaxRadius / 0.05f), 24, 72);
-            EngineGeometry.Lathe(staticMF.sharedMesh, geometry.Static, EngineGeometry.StaticMaterials, seg, 0f);
-            EngineGeometry.Lathe(bellMF.sharedMesh, geometry.Bell, EngineGeometry.BellMaterials, seg, geometry.YThroat);
-            Kit = KitBuilder.Build(kitMF.sharedMesh, Design, Stats, geometry, Data);
+            // every position the kit, nodes and colliders use is the same at both levels; only sampling differs
+            EngineGeometry g1 = EngineGeometry.Build(Design, Stats, tech, fuelR, 1);
+            EngineGeometry.Lathe(staticLodMF.sharedMesh, g1.Static, EngineGeometry.StaticMaterials, EngineGeometry.RingSegments(g1.StaticMaxRadius, 1), 0f);
+            EngineGeometry.Lathe(bellLodMF.sharedMesh, g1.Bell, EngineGeometry.BellMaterials, EngineGeometry.RingSegments(g1.MaxRadius, 1), g1.YThroat);
+            Kit = KitBuilder.Build(kitLodMF.sharedMesh, Design, Stats, g1, Data, 1);
+            geometry = g1;
+            if (full)
+            {
+                EngineGeometry g0 = EngineGeometry.Build(Design, Stats, tech, fuelR, 0);
+                EngineGeometry.Lathe(staticMF.sharedMesh, g0.Static, EngineGeometry.StaticMaterials, EngineGeometry.RingSegments(g0.StaticMaxRadius, 0), 0f);
+                EngineGeometry.Lathe(bellMF.sharedMesh, g0.Bell, EngineGeometry.BellMaterials, EngineGeometry.RingSegments(g0.MaxRadius, 0), g0.YThroat);
+                Kit = KitBuilder.Build(kitMF.sharedMesh, Design, Stats, g0, Data, 0);
+                geometry = g0;
+            }
             if (HighLogic.LoadedScene != GameScenes.LOADING) UpdateMaterials();
             gimbalT.localPosition = new Vector3(0, geometry.YThroat, 0);
             thrustT.localPosition = new Vector3(0, 0, geometry.YThroat - geometry.YExit);
             exhaustT.localPosition = Kit.HasExhaust ? Kit.ExhaustPosition : new Vector3(0, geometry.YExit, 0);
             exhaustT.localRotation = Quaternion.LookRotation(Vector3.down, Vector3.forward);   // +Z down the exhaust, like thrustTransform
-            MeshRebuilds++;
+            if (lodGroup != null)
+            {
+                if (full)
+                {
+                    lodGroup.ForceLOD(-1);
+                    lodGroup.RecalculateBounds();
+                }
+                else lodGroup.ForceLOD(1);
+            }
         }
 
         public void RebuildColliders()

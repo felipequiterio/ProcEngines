@@ -403,6 +403,24 @@ namespace ProcEngines.KspTests
             foreach (Part p in v.parts) if (p.Rigidbody != null) p.Rigidbody.isKinematic = true;
             CheatOptions.InfinitePropellant = true;   // stock tanks hold no LqdMethane/LqdHydrogen
             yield return new WaitForSecondsRealtime(1f);
+            // A high sun leaves the engine in the tank's shadow: move the clock to a low sun (~22 degrees) that
+            // rakes in under the tank, so the shots show the materials in direct light.
+            Vector3d up = (v.GetWorldPos3D() - v.mainBody.position).normalized;
+            double ut0 = Planetarium.GetUniversalTime(), bestUT = ut0, bestErr = double.MaxValue;
+            for (int k = 0; k < 36; k++)
+            {
+                double ut = ut0 + k * 600;
+                Planetarium.SetUniversalTime(ut);
+                yield return new WaitForFixedUpdate();
+                yield return null;
+                Vector3d toSun = (Planetarium.fetch.Sun.position - v.GetWorldPos3D()).normalized;
+                double elev = Math.Asin(Vector3d.Dot(toSun, up)) * 180 / Math.PI;
+                if (Math.Abs(elev - 22) < bestErr) { bestErr = Math.Abs(elev - 22); bestUT = ut; }
+            }
+            Planetarium.SetUniversalTime(bestUT);
+            yield return new WaitForSecondsRealtime(0.5f);
+            Vector3d sunNow = (Planetarium.fetch.Sun.position - v.GetWorldPos3D()).normalized;
+            Info("visual.sun", $"sun elevation {Math.Asin(Vector3d.Dot(sunNow, up)) * 180 / Math.PI:F1} deg at UT {bestUT:F0} (+{bestUT - ut0:F0} s)");
         }
 
         /// <summary>Orbit a transform (the bell) instead of the part origin, which sits at the top of the engine.</summary>
@@ -441,6 +459,7 @@ namespace ProcEngines.KspTests
             KitMesh dual = loaded[0], single = loaded[1], act = loaded[5];
             Check("visual.kit_assets", loaded.All(k => k != null) && KitAssets.Atlas() != null && dual.Anchors.ContainsKey("ox_out") && single.Anchors.ContainsKey("out") && act.Anchors.ContainsKey("zone1_lo"),
                 $"{string.Join(", ", pieces.Zip(loaded, (n, k) => $"{n} {k?.Positions.Length}v/{k?.Anchors.Count}a"))}; atlas {KitAssets.Atlas()?.format} {KitAssets.Atlas()?.width}px");
+            Info("visual.textures", EngineMaterials.TextureReport + "; atlas normal " + KitAssets.AtlasNormal()?.format);
             foreach (var (tag, d) in combos)
             {
                 if (HighLogic.LoadedScene != GameScenes.EDITOR) yield return EnterEditor();
@@ -450,6 +469,11 @@ namespace ProcEngines.KspTests
                 m.SetDesign(d);
                 yield return new WaitForSecondsRealtime(1.5f);
                 Info("visual." + tag, $"kit verts {m.part.transform.Find("model/peRoot/peKit").GetComponent<MeshFilter>().sharedMesh.vertexCount}, exhaust {m.Kit?.HasExhaust}, tubes {m.Stats.ExitDiameter:F2} m exit, materials {EngineMaterials.ShaderReport}");
+                {
+                    var lg = m.part.transform.Find("model/peRoot").GetComponent<LODGroup>();
+                    var mfs = m.part.transform.Find("model/peRoot").GetComponentsInChildren<MeshFilter>(true);
+                    Info("visual.lod." + tag, $"lodGroup {(lg != null ? lg.lodCount.ToString() : "none")}, lodBias {QualitySettings.lodBias}; meshes {string.Join(", ", mfs.Select(f => f.name + ":" + (f.sharedMesh != null ? f.sharedMesh.vertexCount : -1)))}; build {m.LastBuildMs:F1} ms");
+                }
                 EditorLogic.fetch.ship.SaveShip().Save(path);
                 yield return LaunchFrozen(path);
                 m = Engine(FlightGlobals.ActiveVessel.parts);
@@ -465,7 +489,24 @@ namespace ProcEngines.KspTests
                 CameraOn(bellT, size * 1.1f, 4, 240);
                 yield return new WaitForSecondsRealtime(1f);
                 yield return Shot("detail2_" + tag);
+                // orbit: four headings at a slight downward look, so at least one side is sunlit, aimed halfway
+                // between the mount and the exit so the whole engine (lip, manifold, actuators) is in frame
+                var mid = new GameObject("peCamTarget").transform;
+                mid.SetParent(m.part.transform, false);
+                AttachNode bottomNode = m.part.FindAttachNode("bottom");
+                mid.localPosition = bottomNode != null ? bottomNode.position * 0.5f : Vector3.zero;
+                foreach (int hdg in new[] { 0, 90, 180, 270 })
+                {
+                    CameraOn(mid, size * 1.3f, 10, hdg);
+                    yield return new WaitForSecondsRealtime(0.6f);
+                    yield return Shot($"orbit{hdg}_" + tag);
+                }
+                // a typical flight-camera view: further out, from below and to the side
+                CameraOn(mid, size * 3f, -15, 35);
+                yield return new WaitForSecondsRealtime(0.6f);
+                yield return Shot("flight_" + tag);
                 Camera(size * 2.0f, -6, 35, m.part);
+                Destroy(mid.gameObject);
                 var e = m.part.FindModuleImplementing<ModuleEnginesFX>();
                 FlightInputHandler.state.mainThrottle = 1f;
                 e.Activate();
