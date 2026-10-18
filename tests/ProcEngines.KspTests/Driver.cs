@@ -48,7 +48,7 @@ namespace ProcEngines.KspTests
         {
             while (HighLogic.LoadedScene != GameScenes.MAINMENU) yield return null;
             yield return new WaitForSecondsRealtime(4f);
-            IEnumerator body = script == "career" ? Career() : script == "lmpA" ? LmpA() : script == "lmpB" ? LmpB() : script == "visual" ? Visual() : script == "plumes" ? Plumes() : Sandbox();
+            IEnumerator body = script == "career" ? Career() : script == "lmpA" ? LmpA() : script == "lmpB" ? LmpB() : script == "visual" ? Visual() : script == "plumes" ? Plumes() : script == "gimbal" ? GimbalOnly() : Sandbox();
             yield return StartCoroutine(Guard(body));
             Info("end", $"{passes} passed, {fails} failed");
             results.Close();
@@ -379,9 +379,15 @@ namespace ProcEngines.KspTests
                 Check("mesh.cache", shared && split && copies.Count == 0, $"{pair.Count} engines; identical designs share meshes {shared}; after changing one, separate and intact {split}; mesh copies on [{string.Join(", ", copies)}]; far {KspData.FarPresent}");
             }
 
-            // flight: hydrolox upper-ish engine on a small stack, Waterfall + readouts from STATS
+            yield return FlightChecks();
+        }
+
+        /// <summary>The flight half of the sandbox script: a small stack launched, STATS and the engine applied, a burn.</summary>
+        IEnumerator FlightChecks()
+        {
+            // flight: kerolox engine on a small stack, Waterfall + readouts from STATS
             yield return LoadCraft(WriteCraft("PE_Flight", Stack(false)));
-            m = Engine(EditorLogic.fetch.ship.parts);
+            ModuleProcEngine m = Engine(EditorLogic.fetch.ship.parts);
             m.SetDesign(D("Kerolox", "GasGenerator", 300, 90, 14));
             yield return new WaitForSecondsRealtime(1.5f);
             string flightPath = Path.Combine(KSPUtil.ApplicationRootPath, "saves", HighLogic.SaveFolder, "Ships", "VAB", "PE_Flight.craft");
@@ -395,6 +401,16 @@ namespace ProcEngines.KspTests
             yield return new WaitForSecondsRealtime(4f);
             Vessel v = FlightGlobals.ActiveVessel;
             m = Engine(v.parts);
+            {
+                PartJoint j = m.part.attachJoint;
+                AttachNode top = m.part.FindAttachNode("top");
+                Info("flight.joint", string.Format(Inv, "{0} parts; engine joint to {1}: breakForce {2} breakTorque {3}, part breakingForce {4} breakingTorque {5}, top node size {6}, parent node size {7}; engine mass {8:F3} t, vessel {9:F3} t",
+                    v.parts.Count, m.part.parent?.partInfo?.name, j?.Joint != null ? j.Joint.breakForce : -1, j?.Joint != null ? j.Joint.breakTorque : -1, m.part.breakingForce, m.part.breakingTorque,
+                    top?.size, m.part.parent?.FindAttachNodeByPart(m.part)?.size, m.part.mass + m.part.GetResourceMass(), v.totalMass));
+            }
+            float flightT0 = Time.realtimeSinceStartup;
+            EventData<PartJoint, float>.OnEvent onBreak = (pj, f) => Info("flight.jointBreak", string.Format(Inv, "+{0:F2} s: {1} -> {2} broke at {3:F1}", Time.realtimeSinceStartup - flightT0, pj?.Child?.partInfo?.name, pj?.Parent?.partInfo?.name, f));
+            GameEvents.onPartJointBreak.Add(onBreak);
             Check("flight.stats", m.Stats.IspVac == editorStats.IspVac && m.Stats.Mass == editorStats.Mass, $"flight STATS identical to editor: Isp {m.Stats.IspVac}/{editorStats.IspVac}");
             yield return CheckApplied(m, "flight", false);
             Info("waterfall", m.WaterfallStatus);
@@ -404,37 +420,56 @@ namespace ProcEngines.KspTests
             yield return new WaitForSecondsRealtime(2f);
             Check("flight.burn", e.finalThrust > 0.5f * (float)m.Stats.ThrustSL && m.WaterfallStatus.Contains("effects"), $"finalThrust {e.finalThrust:F1} kN (SL {m.Stats.ThrustSL:F1}); waterfall {m.WaterfallStatus}");
             yield return Shot("flight_burn");
-            // the gimbal in flight: the bell moved from FixedUpdate as ModuleGimbal does (7 degrees about a diagonal),
-            // the actuators follow it. The stock module itself is tried first and only reported: in this rig it never
-            // deflects (actuation stays 0 with pitch and yaw input; see PHASE3_STATUS "Moving gimbal actuators").
-            {
-                Transform gT = m.part.transform.Find("model/peRoot/peGimbal");
-                Quaternion rest = gT.localRotation;
-                ModuleGimbal gm = m.part.FindModuleImplementing<ModuleGimbal>();
-                ActuatorsFollow(m, out float _, out float _, out float len0, out float _, out string _);
-                if (gm != null) gm.gimbalActive = true;   // staging would (OnActive); the test ignited the engine directly
-                FlightInputCallback fbw = st => { st.pitch = 1; st.yaw = 1; };
-                v.OnFlyByWire += fbw;
-                yield return new WaitForSecondsRealtime(1f);
-                Info("flight.gimbal.stock", string.Format(Inv, "ModuleGimbal with pitch and yaw input: deflection {0:F2}°, actuation {1}", Quaternion.Angle(rest, gT.localRotation), gm?.actuationLocal));
-                v.OnFlyByWire -= fbw;
-                if (gm != null) gm.enabled = false;
-                Quaternion target = Quaternion.AngleAxis(7f, new Vector3(1, 0, 1).normalized) * rest;
-                for (float tg = Time.realtimeSinceStartup; Time.realtimeSinceStartup - tg < 1f;)
-                {
-                    yield return new WaitForFixedUpdate();
-                    gT.localRotation = Quaternion.Slerp(gT.localRotation, target, 0.3f);
-                }
-                yield return null;
-                float defl = Quaternion.Angle(rest, gT.localRotation);
-                bool ok = ActuatorsFollow(m, out float sep, out float stat, out float len, out float tilt, out string info);
-                yield return Shot("flight_gimbal");
-                gT.localRotation = rest;
-                if (gm != null) gm.enabled = true;
-                Check("flight.gimbal", defl > 6.9f && ok && Mathf.Abs(len - len0) > 1e-4f,
-                    string.Format(Inv, "bell moved from FixedUpdate to {0:F2}°: eye-lug gap {1:F5} m (static {2:F4}), length {3:F4} -> {4:F4} m; {5}", defl, sep, stat, len0, len, info));
-            }
+            yield return FlightGimbal(m, v);
             FlightInputHandler.state.mainThrottle = 0f;
+            GameEvents.onPartJointBreak.Remove(onBreak);
+        }
+
+        /// <summary>The flight checks alone (sandbox game), for quick runs.</summary>
+        IEnumerator GimbalOnly()
+        {
+            yield return NewGame("procengines_gimbal", Game.Modes.SANDBOX);
+            yield return EnterEditor();
+            yield return FlightChecks();
+        }
+
+        /// <summary>
+        /// The stock gimbal, driven by control input: full pitch and yaw make ModuleGimbal turn peGimbal by the
+        /// design's range on both axes (ApplyEngine sets its per-direction ranges), the actuators follow, and the bell
+        /// returns when the input goes. The engine is shut down first: on this small stack (about 11 g at full thrust)
+        /// a full gimbal kick under thrust snaps the joints, and the engine, as debris, gets no input. The module
+        /// deflects with or without thrust. It is activated as staging would (OnActive), since the test ignited the
+        /// engine directly.
+        /// </summary>
+        IEnumerator FlightGimbal(ModuleProcEngine m, Vessel v)
+        {
+            Transform gT = m.part.transform.Find("model/peRoot/peGimbal");
+            Quaternion rest = gT.localRotation;
+            ModuleGimbal gm = m.part.FindModuleImplementing<ModuleGimbal>();
+            var e = m.part.FindModuleImplementing<ModuleEnginesFX>();
+            FlightInputHandler.state.mainThrottle = 0f;
+            e?.Shutdown();
+            yield return new WaitForSecondsRealtime(1f);
+            ActuatorsFollow(m, out float _, out float _, out float len0, out float _, out string _);
+            if (gm == null || m.part.vessel != v) { Check("flight.gimbal", false, $"ModuleGimbal {gm != null}; engine still on the active vessel {m.part.vessel == v}"); yield break; }
+            gm.OnActive();
+            FlightInputCallback fbw = st => { st.pitch = 1; st.yaw = 1; };
+            v.OnFlyByWire += fbw;
+            yield return new WaitForSecondsRealtime(1.5f);
+            float defl = Quaternion.Angle(rest, gT.localRotation);
+            bool ok = ActuatorsFollow(m, out float sep, out float stat, out float len, out float tilt, out string info);
+            Vector3 act = gm.actuationLocal;
+            yield return Shot("flight_gimbal");
+            v.OnFlyByWire -= fbw;
+            yield return new WaitForSecondsRealtime(1.5f);
+            float back = Quaternion.Angle(rest, gT.localRotation);
+            bool intact = m.part.vessel == v;
+            // full pitch and yaw: each gimbal axis gets at most the range, so the bell turns by range .. range * sqrt(2)
+            float range = (float)m.Design.GimbalRange;
+            bool ranges = gm.gimbalRangeXP == range && gm.gimbalRangeXN == range && gm.gimbalRangeYP == range && gm.gimbalRangeYN == range;
+            Check("flight.gimbal", ok && intact && ranges && defl > 0.95f * range && defl < 1.05f * range * Mathf.Sqrt(2) && back < 0.1f && Mathf.Abs(len - len0) > 1e-4f,
+                string.Format(Inv, "ModuleGimbal with full pitch and yaw: {0:F2}° (actuation {1}; design range {2}°, module ranges {3}/{4}/{5}/{6}), {7:F2}° after release; craft intact {8}; eye-lug gap {9:F5} m (static {10:F4}), length {11:F4} -> {12:F4} m; {13}",
+                    defl, act, range, gm.gimbalRangeXP, gm.gimbalRangeXN, gm.gimbalRangeYP, gm.gimbalRangeYN, back, intact, sep, stat, len0, len, info));
         }
 
         // ------------------------------------------------------------------ gimbal actuators

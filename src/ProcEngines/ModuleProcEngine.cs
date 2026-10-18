@@ -529,8 +529,15 @@ namespace ProcEngines
             engine.maxFuelFlow = maxThrust / (ispVac * g);
             engine.minFuelFlow = minThrust / (ispVac * g);
             engine.throttleMin = engine.minFuelFlow / engine.maxFuelFlow;
+            // ModuleGimbal (KSP 1.12) deflects by the per-direction ranges, which it copies from gimbalRange only in
+            // OnLoad: set all of them, so the design's range (which its mass pays for) is what the bell swings. This
+            // also overrides range patches meant for stock engines (FAR's stockEngineGimbalIncrease: x1.5).
             var gimbal = part.Modules.OfType<ModuleGimbal>().FirstOrDefault();
-            if (gimbal != null) gimbal.gimbalRange = (float)Design.GimbalRange;
+            if (gimbal != null)
+            {
+                float range = (float)Design.GimbalRange;
+                gimbal.gimbalRange = gimbal.gimbalRangeXP = gimbal.gimbalRangeXN = gimbal.gimbalRangeYP = gimbal.gimbalRangeYN = range;
+            }
         }
 
         static string F(float v) => v.ToString("R", CultureInfo.InvariantCulture);

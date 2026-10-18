@@ -258,14 +258,16 @@ The gimbal actuators now follow the bell. Before, they were part of the static k
   - clear of the bell kit away from the lug;
   - LOD0 and LOD1 renderers in the right LODGroup levels.
 - **`visual.gimbal.<design>`:** in flight, the bell held at 0 and ±10° about actuator 0's pin axis, with a close-up of the rod eye for each (`visual_gimbal{0,+10,-10}_*`). All six designs: gap 0.
-- **`flight.gimbal`** (sandbox flight): the bell moved from FixedUpdate, as ModuleGimbal does, to 7°. Gap 0 (static: 0.029 m), length 0.632 → 0.656 m.
+- **`flight.gimbal`** (sandbox flight, also the quick `gimbal` script): the stock ModuleGimbal, driven by full pitch and yaw input, turns the bell 7.07° (5° per axis, the design's range) and lets it return to 0 on release. The craft stays intact, and the actuators follow: gap 0 (static 0.029 m), length 0.632 → 0.657 m.
 - **Results:** sandbox A **32/32**, visual B **19/19**. Evidence is in [tests/ksp/evidence/actuators/](tests/ksp/evidence/actuators/): both results files, and the gimbal close-ups of three designs.
 
 **Notes:**
 - The eye is misaligned with the lug pin by up to about 8.8° when the bell swings about the actuator's radial axis, which the eye's spherical bearing takes. A real rod end allows about that much.
 - In the `visual_gimbal-10_*` shots, the gimballed bell's upper edge opens a visible gap against the static chamber at the throat. This was there before; it is a follow-up.
-- **Stock ModuleGimbal never deflects in the sandbox flight rig (pre-existing; follow-up).** With pitch and yaw input, the module is active, unlocked and its ranges are 7.5°, yet its actuation stays 0, even when its `FixedUpdate` is called directly. Its public `GimbalRotation(1, 0, 1)` returns (7.5, 7.5). The vessel's reference transform sits about 120 m from the engine. The test reports this as `flight.gimbal.stock` and drives the bell itself.
-- **`ApplyEngine` sets only `ModuleGimbal.gimbalRange` (pre-existing; follow-up).** KSP 1.12 reads `gimbalRangeXP/XN/YP/YN`, which take `gimbalRange` once at load, so the design's gimbal range never reaches the module (the A rig shows FAR's 7.5°).
+- **Gimbal in flight (fixed).** Two problems were found while testing:
+  - **The test craft broke apart.** In the sandbox flight test, the stock gimbal seemed never to deflect. In fact the test craft (a 300 kN engine on a 2.5 t stack, about 11 g) snapped its own joints the moment a full gimbal kick came under thrust, stock tank-to-probe included. The engine, now debris with no control, got no input. The test now shuts the engine down before applying gimbal input; ModuleGimbal deflects with or without thrust. A watcher reports any joint break during the flight checks (`flight.jointBreak`).
+  - **The engine part has KSP's default joint strength** (`breakingForce` / `breakingTorque` 22, like the LV-T45), and a small engine gets a size-0 top node. That is left as is; consider it if large designs shake loose in play.
+- **The design's gimbal range now reaches ModuleGimbal (fixed).** KSP 1.12 deflects by `gimbalRangeXP/XN/YP/YN`, which it copies from `gimbalRange` only in `OnLoad`, so setting `gimbalRange` had no effect. `ApplyEngine` now sets all five fields. This also overrides range patches meant for stock engines, such as FAR's ×1.5: the design's range is the one its mass pays for.
 
 ## Evidence
 
